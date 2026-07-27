@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: arc-runners
     env:
       CGO_ENABLED: 0
     steps:
