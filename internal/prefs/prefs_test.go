@@ -72,6 +72,29 @@ func TestInterpolateDefaultTemplate(t *testing.T) {
 	assert.Contains(t, got, "octocat")
 }
 
+func TestInterpolateConflictTemplate(t *testing.T) {
+	// The conflict template must guide the agent to correlate conflicts
+	// with CI failures, so it does not mistakenly assume an Actions outage.
+	got := Interpolate(defaultTemplates["conflict"], map[string]string{
+		"prLabel":       "elecnix/gh-monitor#7",
+		"failingChecks": "CI / test, CI / lint",
+	})
+	assert.Contains(t, got, "⚠️")
+	assert.Contains(t, got, "elecnix/gh-monitor#7")
+	assert.Contains(t, got, "conflict")
+	assert.Contains(t, got, "resolve the conflict first")
+	assert.Contains(t, got, "causing the failures")
+
+	// When failingChecks is empty, the template still reads cleanly.
+	gotEmpty := Interpolate(defaultTemplates["conflict"], map[string]string{
+		"prLabel":       "elecnix/gh-monitor#7",
+		"failingChecks": "",
+	})
+	assert.Contains(t, gotEmpty, "⚠️")
+	assert.Contains(t, gotEmpty, "conflict")
+	assert.NotContains(t, gotEmpty, "()")
+}
+
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string
