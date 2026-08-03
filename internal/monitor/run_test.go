@@ -104,7 +104,7 @@ func TestRun_NoChangeEmitsNothing(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
 }
 
 func TestRun_ContextCancelStops(t *testing.T) {
@@ -474,7 +474,8 @@ func TestRun_FailingChecksNoDetailWhenClean(t *testing.T) {
 }
 
 func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
-	// PR with no issues: CI passing, no comments, no conflicts → only firstPoll + new-commit.
+	// PR with no issues: CI passing, no comments, no conflicts.
+	// First poll should surface the new commit AND ci-all-green.
 	svc := &Service{API: scriptedAPI([]*PullRequest{
 		mkPR("OPEN", false, "aaaaaaa", nil),
 		mkPR("MERGED", true, "aaaaaaa", nil),
@@ -484,7 +485,7 @@ func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
 }
 
 func TestRun_FirstPollPendingCI_NoCIEvent(t *testing.T) {

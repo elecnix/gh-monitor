@@ -276,6 +276,13 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 				terminalEmitted = true
 			}
 		}
+		// On first poll the diff against an empty baseline surfaces
+		// pre-existing issues (failing checks, conflicts, threads) but
+		// never fires ci-all-green because prevHadWork is always false.
+		// Emit it explicitly when CI is already clean so the agent knows.
+		if firstPoll && !curr.Merged && curr.State != "CLOSED" && len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0 {
+			emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
+		}
 		if len(events) == 0 {
 			noChange++
 		} else {
