@@ -17,11 +17,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install gh CLI
+        # arc-runners ship neither gh nor wget. Without pipefail a failed
+        # download writes an empty keyring and apt reports the confusing
+        # "NO_PUBKEY / repository is not signed" instead of the real cause.
         run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          if ! command -v curl >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y curl
+          fi
           sudo mkdir -p -m 755 /etc/apt/keyrings
-          wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update && sudo apt-get install -y gh
+          sudo apt-get update
+          sudo apt-get install -y gh
+          gh --version
       - name: Create release if missing
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
