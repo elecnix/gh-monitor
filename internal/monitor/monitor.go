@@ -574,9 +574,13 @@ type PRStatus struct {
 	Conflict          bool             `json:"conflict"`
 	FailingChecks     []string         `json:"failing_checks"`
 	PendingChecks     []string         `json:"pending_checks"`
-	ReviewDecision    string           `json:"review_decision,omitempty"`
-	ReviewAuthor      string           `json:"review_author,omitempty"`
-	LastCommit        CommitSummary    `json:"last_commit"`
+	// SuccessfulChecks names the checks that finished without failing. It is
+	// what separates "CI passed" from "CI has not reported yet" — both leave
+	// FailingChecks and PendingChecks empty.
+	SuccessfulChecks []string      `json:"successful_checks"`
+	ReviewDecision   string        `json:"review_decision,omitempty"`
+	ReviewAuthor     string        `json:"review_author,omitempty"`
+	LastCommit       CommitSummary `json:"last_commit"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -606,6 +610,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		GeneralComments:   []GeneralComment{},
 		FailingChecks:     failingChecks(pr),
 		PendingChecks:     pendingChecks(pr),
+		SuccessfulChecks:  successfulChecks(pr),
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {
@@ -664,15 +669,30 @@ var failureConclusions = map[string]bool{
 	"FAILURE": true, "ERROR": true, "TIMED_OUT": true, "CANCELLED": true, "ACTION_REQUIRED": true,
 }
 
+// successConclusions are the terminal conclusions that count as "this check
+// passed" — SKIPPED and NEUTRAL are not failures and nothing more will happen
+// to them, so they settle the check just as SUCCESS does.
+var successConclusions = map[string]bool{
+	"SUCCESS": true, "NEUTRAL": true, "SKIPPED": true,
+}
+
+// pendingStatuses covers every CheckStatusState except COMPLETED (plus the
+// legacy STARTUP_FAILURE entry). A suite matching neither this map nor
+// failureConclusions reads as settled, so omitting a non-terminal status here
+// reports CI as passing while it is still queued.
 var pendingStatuses = map[string]bool{
-	"IN_PROGRESS": true, "QUEUED": true, "WAITING": true, "STARTUP_FAILURE": true,
+	"IN_PROGRESS": true, "QUEUED": true, "WAITING": true, "REQUESTED": true, "PENDING": true,
+	"STARTUP_FAILURE": true,
 }
 
 var failureCommitStates = map[string]bool{"FAILURE": true, "ERROR": true}
 
 var pendingCommitStates = map[string]bool{"PENDING": true, "EXPECTED": true}
 
+var successCommitStates = map[string]bool{"SUCCESS": true}
+
 func isFailureConclusion(c string) bool { return failureConclusions[c] }
+func isSuccessConclusion(c string) bool { return successConclusions[c] }
 func isPendingStatus(s string) bool     { return pendingStatuses[s] }
 
 // acknowledgedReactions are the reaction contents that acknowledge a comment.
@@ -734,6 +754,49 @@ func failingChecks(pr *PullRequest) []string {
 		if c.Status != nil {
 			for _, ctx := range c.Status.Contexts {
 				if failureCommitStates[ctx.State] {
+					add(ctx.Context)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// successfulChecks collects names of check suites/runs that finished without
+// failing, plus old-style status contexts in the SUCCESS state.
+//
+// This is the positive evidence that CI ran: failingChecks and pendingChecks
+// are both empty whether every check passed or no check has been created yet,
+// and only the former should be reported as green.
+func successfulChecks(pr *PullRequest) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for i := range pr.Commits.Nodes {
+		c := &pr.Commits.Nodes[i].Commit
+		for j := range c.CheckSuites.Nodes {
+			suite := &c.CheckSuites.Nodes[j]
+			if isSuccessConclusion(suite.Conclusion) {
+				add(suiteName(suite))
+			}
+			for _, run := range suite.CheckRuns.Nodes {
+				if isSuccessConclusion(run.Conclusion) {
+					name := run.Name
+					if name == "" {
+						name = suiteName(suite)
+					}
+					add(name)
+				}
+			}
+		}
+		if c.Status != nil {
+			for _, ctx := range c.Status.Contexts {
+				if successCommitStates[ctx.State] {
 					add(ctx.Context)
 				}
 			}

@@ -180,6 +180,52 @@ func TestSnapshot_FailingAndPendingChecks(t *testing.T) {
 	assert.ElementsMatch(t, []string{"Deploy", "buildkite"}, s.PendingChecks)
 }
 
+func TestSnapshot_PendingCoversEveryNonTerminalStatus(t *testing.T) {
+	// GitHub's CheckStatusState: COMPLETED plus these five. Anything that is
+	// not COMPLETED is still in flight and must land in PendingChecks — a suite
+	// filed as neither failing nor pending reads as green.
+	for _, status := range []string{"REQUESTED", "PENDING", "QUEUED", "WAITING", "IN_PROGRESS"} {
+		t.Run(status, func(t *testing.T) {
+			pr := &PullRequest{Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
+				CheckSuites: SuiteNodes{Nodes: []CheckSuite{{Status: status, App: AppInfo{Name: "CI"}}}},
+			}}}}}
+			s := Snapshot(pr, SnapshotOptions{})
+			assert.Equal(t, []string{"CI"}, s.PendingChecks)
+			assert.Empty(t, s.SuccessfulChecks)
+		})
+	}
+}
+
+func TestSnapshot_SuccessfulChecks(t *testing.T) {
+	pr := &PullRequest{Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
+		CheckSuites: SuiteNodes{Nodes: []CheckSuite{
+			{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "CI"}},
+			{Status: "COMPLETED", Conclusion: "SKIPPED", App: AppInfo{Name: "Optional"}},
+			{Status: "COMPLETED", Conclusion: "FAILURE", App: AppInfo{Name: "Deploy"}},
+			{Status: "COMPLETED", CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "unit", Conclusion: "SUCCESS"},
+				{Name: "lint", Conclusion: "NEUTRAL"},
+				{Name: "e2e", Conclusion: "TIMED_OUT"},
+			}}},
+		}},
+		Status: &CommitStatus{Contexts: []StatusContext{
+			{State: "SUCCESS", Context: "circleci"},
+			{State: "FAILURE", Context: "buildkite"},
+		}},
+	}}}}}
+	s := Snapshot(pr, SnapshotOptions{})
+	assert.ElementsMatch(t, []string{"CI", "Optional", "unit", "lint", "circleci"}, s.SuccessfulChecks)
+	assert.ElementsMatch(t, []string{"Deploy", "e2e", "buildkite"}, s.FailingChecks)
+	assert.Empty(t, s.PendingChecks)
+}
+
+func TestSnapshot_NoChecksMeansNoSuccess(t *testing.T) {
+	s := Snapshot(&PullRequest{Commits: CommitNodes{Nodes: []Commit{{}}}}, SnapshotOptions{})
+	assert.Empty(t, s.SuccessfulChecks)
+	assert.Empty(t, s.FailingChecks)
+	assert.Empty(t, s.PendingChecks)
+}
+
 func TestSnapshot_ReviewDecision(t *testing.T) {
 	t.Run("latest non-pending", func(t *testing.T) {
 		pr := &PullRequest{Reviews: ReviewNodes{Nodes: []Review{mkReview("APPROVED", "carol")}}}
