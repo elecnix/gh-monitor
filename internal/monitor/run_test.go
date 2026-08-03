@@ -104,7 +104,7 @@ func TestRun_NoChangeEmitsNothing(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
 }
 
 func TestRun_ContextCancelStops(t *testing.T) {
@@ -125,8 +125,9 @@ func TestRun_AlreadyMergedAtStartup(t *testing.T) {
 	var got []Notification
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
-	// On first poll, diff against empty baseline surfaces the commit + merged state.
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	// On first poll, diff against empty baseline surfaces the merged state.
+	// new-commit is skipped — the agent just pushed it.
+	assert.Equal(t, []string{firstPollType, string(EventMerged)}, typesOf(got))
 }
 
 func TestOnce_EmitsCurrentActionable(t *testing.T) {
@@ -150,7 +151,8 @@ func TestOnce_EmitsCurrentActionable(t *testing.T) {
 	assert.Contains(t, types, string(EventNewFailingChecks))
 	assert.Contains(t, types, string(EventNewUnresolvedThreads))
 	assert.Contains(t, types, string(EventNewGeneralComments))
-	assert.Contains(t, types, string(EventNewCommit))
+	// new-commit is skipped on first poll — the agent just pushed it.
+	assert.NotContains(t, types, string(EventNewCommit))
 }
 
 func TestIdleInterval(t *testing.T) {
@@ -391,11 +393,12 @@ func TestRun_EmitsExistingIssuesOnFirstPoll(t *testing.T) {
 	types := typesOf(got)
 	assert.Equal(t, firstPollType, types[0])
 	// First poll surfaces all pre-existing issues via diff against empty baseline.
+	// new-commit is skipped — the agent just pushed it.
 	assert.Contains(t, types, string(EventConflict))
 	assert.Contains(t, types, string(EventNewFailingChecks))
 	assert.Contains(t, types, string(EventNewUnresolvedThreads))
 	assert.Contains(t, types, string(EventNewGeneralComments))
-	assert.Contains(t, types, string(EventNewCommit))
+	assert.NotContains(t, types, string(EventNewCommit))
 }
 
 func TestRun_FailingChecksDetailWhenConflicted(t *testing.T) {
@@ -485,7 +488,7 @@ func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
 }
 
 func TestRun_FirstPollPendingCI_NoCIEvent(t *testing.T) {

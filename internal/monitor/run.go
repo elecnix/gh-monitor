@@ -271,6 +271,11 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		}
 		events := diff(compare, curr)
 		for _, ev := range events {
+			// The agent just created the PR and already knows about the
+			// head commit — skip it on first poll to avoid a noisy turn.
+			if firstPoll && ev.Type == EventNewCommit {
+				continue
+			}
 			emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
 			if ev.Type == EventMerged || ev.Type == EventClosed {
 				terminalEmitted = true
@@ -325,7 +330,14 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
 	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
 	for _, ev := range Diff(&PRStatus{}, curr) {
+		if ev.Type == EventNewCommit {
+			continue // agent just pushed it
+		}
 		emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
+	}
+	// ci-all-green never fires against an empty baseline — emit it explicitly.
+	if !curr.Merged && curr.State != "CLOSED" && len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0 {
+		emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
 	}
 	return nil
 }
