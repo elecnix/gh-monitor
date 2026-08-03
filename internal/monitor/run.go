@@ -599,6 +599,12 @@ func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Even
 		} else if status != nil {
 			n.FailingChecks = status.FailingChecks
 		}
+		// When the PR has merge conflicts, CI failures are often caused by
+		// the conflict rather than an Actions outage. Guide the agent to
+		// resolve the conflict first.
+		if status != nil && status.Conflict {
+			n.Detail = "The PR has merge conflicts — they may be causing these CI failures. Resolve the conflict first."
+		}
 	case EventNewUnresolvedThreads:
 		n.Detail = threadsDetail(ev.Threads)
 	case EventNewGeneralComments:

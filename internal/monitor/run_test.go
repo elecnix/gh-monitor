@@ -398,6 +398,81 @@ func TestRun_EmitsExistingIssuesOnFirstPoll(t *testing.T) {
 	assert.Contains(t, types, string(EventNewCommit))
 }
 
+func TestRun_FailingChecksDetailWhenConflicted(t *testing.T) {
+	// When a PR has BOTH merge conflicts AND failing CI, the failing-checks
+	// notification's Detail field must guide the agent to resolve the conflict
+	// first — preventing mistaken diagnosis of an Actions outage.
+	pr := &PullRequest{
+		State:     "OPEN",
+		Mergeable: "CONFLICTING",
+		Commits:   CommitNodes{Nodes: []Commit{mkCommit("abc1234def", []string{"build"})}},
+	}
+	svc := &Service{API: scriptedAPI([]*PullRequest{pr})}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	// Find the failing-checks notification.
+	var failing *Notification
+	for i := range got {
+		if got[i].Type == string(EventNewFailingChecks) {
+			failing = &got[i]
+		}
+	}
+	require.NotNil(t, failing, "expected a new-failing-checks notification")
+	assert.Contains(t, failing.Message, "build")
+	assert.Contains(t, failing.Detail, "merge conflicts")
+	assert.Contains(t, failing.Detail, "causing these CI failures")
+
+	// Find the conflict notification — it should still fire independently.
+	var conflict *Notification
+	for i := range got {
+		if got[i].Type == string(EventConflict) {
+			conflict = &got[i]
+		}
+	}
+	require.NotNil(t, conflict, "expected a conflict notification")
+}
+
+func TestRun_FailingChecksNoDetailWhenClean(t *testing.T) {
+	// When a PR has failing CI but NO conflicts, the Detail field should NOT
+	// contain conflict correlation — there is no conflict to correlate with.
+	pr := &PullRequest{
+		State:     "OPEN",
+		Mergeable: "MERGEABLE",
+		Commits:   CommitNodes{Nodes: []Commit{mkCommit("abc1234def", []string{"build"})}},
+	}
+	svc := &Service{API: scriptedAPI([]*PullRequest{pr})}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	var failing *Notification
+	for i := range got {
+		if got[i].Type == string(EventNewFailingChecks) {
+			failing = &got[i]
+		}
+	}
+	require.NotNil(t, failing, "expected a new-failing-checks notification")
+	assert.NotContains(t, failing.Detail, "merge conflicts")
+}
+
 func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
 	// PR with no issues: CI passing, no comments, no conflicts → only firstPoll + new-commit.
 	svc := &Service{API: scriptedAPI([]*PullRequest{
