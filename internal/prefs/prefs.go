@@ -40,7 +40,7 @@ type Preferences struct {
 var defaultTemplates = map[string]string{
 	"new-unresolved-threads":   "💬 {unresolvedThreads} unresolved review thread(s) on {prLabel}",
 	"new-general-comments":     "💭 {generalComments} new general comment(s) on {prLabel}",
-	"conflict":                 "⚠️  Merge conflicts detected on {prLabel}",
+	"conflict":                 "⚠️  Merge conflicts detected on {prLabel}. If CI is failing, resolve the conflict first — it may be causing the failures.",
 	"new-failing-checks":       "❌ Failing CI checks on {prLabel}: {failingChecks}",
 	"ci-all-green":             "✅ All CI checks passed on {prLabel}",
 	"review-approved":          "✅ {prLabel} was approved by {reviewAuthor}",
