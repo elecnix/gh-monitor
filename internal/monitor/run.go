@@ -271,10 +271,22 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		}
 		events := diff(compare, curr)
 		for _, ev := range events {
+			// The agent just created the PR and already knows about the
+			// head commit — skip it on first poll to avoid a noisy turn.
+			if firstPoll && ev.Type == EventNewCommit {
+				continue
+			}
 			emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
 			if ev.Type == EventMerged || ev.Type == EventClosed {
 				terminalEmitted = true
 			}
+		}
+		// On first poll the diff against an empty baseline surfaces
+		// pre-existing issues (failing checks, conflicts, threads) but
+		// never fires ci-all-green because prevHadWork is always false.
+		// Emit it explicitly when CI has already finished green.
+		if firstPoll && ciAllGreen(curr) {
+			emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
 		}
 		if len(events) == 0 {
 			noChange++
@@ -318,9 +330,27 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
 	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
 	for _, ev := range Diff(&PRStatus{}, curr) {
+		if ev.Type == EventNewCommit {
+			continue // agent just pushed it
+		}
 		emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
 	}
+	// ci-all-green never fires against an empty baseline — emit it explicitly.
+	if ciAllGreen(curr) {
+		emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
+	}
 	return nil
+}
+
+// ciAllGreen reports whether an open PR's CI has finished with every check
+// passing. It requires at least one successful check: with no checks at all —
+// the state GitHub reports for the first seconds after a push, and the
+// permanent state of a repo without CI — FailingChecks and PendingChecks are
+// empty too, and announcing green there would be a guess, not an observation.
+func ciAllGreen(s *PRStatus) bool {
+	return !s.Merged && s.State != "CLOSED" &&
+		len(s.FailingChecks) == 0 && len(s.PendingChecks) == 0 &&
+		len(s.SuccessfulChecks) > 0
 }
 
 // ---------------------------------------------------------------------------

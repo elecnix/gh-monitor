@@ -12,16 +12,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// mkCommit builds a commit whose CI has finished: the suite is COMPLETED, and
+// it concludes SUCCESS unless failing names are supplied. Mirroring a terminal
+// state matters — a suite with a blank status/conclusion is a state GitHub
+// never reports, and it would look "clean" for the wrong reason.
 func mkCommit(oid string, failing []string) Commit {
 	runs := make([]CheckRun, 0, len(failing))
 	for _, name := range failing {
 		runs = append(runs, CheckRun{Name: name, Conclusion: "FAILURE"})
 	}
+	suite := CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "CI"}, CheckRuns: RunNodes{Nodes: runs}}
+	if len(failing) > 0 {
+		// The failing runs carry the failure; leave the suite conclusion blank
+		// so the suite name doesn't also land in FailingChecks.
+		suite.Conclusion = ""
+	}
 	return Commit{Commit: CommitDetails{
 		Oid:             oid,
 		MessageHeadline: "headline",
-		CheckSuites:     SuiteNodes{Nodes: []CheckSuite{{App: AppInfo{Name: "CI"}, CheckRuns: RunNodes{Nodes: runs}}}},
+		CheckSuites:     SuiteNodes{Nodes: []CheckSuite{suite}},
 	}}
+}
+
+// mkCommitNoChecks builds a commit with no check suites at all — what GitHub
+// reports in the seconds after a push, before Actions registers the workflow.
+func mkCommitNoChecks(oid string) Commit {
+	return Commit{Commit: CommitDetails{Oid: oid, MessageHeadline: "headline"}}
+}
+
+// mkPRSuiteStatus builds an open PR whose single check suite sits in the given
+// status with no conclusion — i.e. CI is registered but has not finished.
+func mkPRSuiteStatus(status string) *PullRequest {
+	c := mkCommitNoChecks("aaaaaaa")
+	c.Commit.CheckSuites = SuiteNodes{Nodes: []CheckSuite{{Status: status, App: AppInfo{Name: "CI"}}}}
+	return &PullRequest{State: "OPEN", Commits: CommitNodes{Nodes: []Commit{c}}}
 }
 
 func mkPR(state string, merged bool, oid string, failing []string) *PullRequest {
@@ -104,7 +128,7 @@ func TestRun_NoChangeEmitsNothing(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
 }
 
 func TestRun_ContextCancelStops(t *testing.T) {
@@ -125,8 +149,9 @@ func TestRun_AlreadyMergedAtStartup(t *testing.T) {
 	var got []Notification
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
-	// On first poll, diff against empty baseline surfaces the commit + merged state.
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	// On first poll, diff against empty baseline surfaces the merged state.
+	// new-commit is skipped — the agent just pushed it.
+	assert.Equal(t, []string{firstPollType, string(EventMerged)}, typesOf(got))
 }
 
 func TestOnce_EmitsCurrentActionable(t *testing.T) {
@@ -150,7 +175,39 @@ func TestOnce_EmitsCurrentActionable(t *testing.T) {
 	assert.Contains(t, types, string(EventNewFailingChecks))
 	assert.Contains(t, types, string(EventNewUnresolvedThreads))
 	assert.Contains(t, types, string(EventNewGeneralComments))
-	assert.Contains(t, types, string(EventNewCommit))
+	// new-commit is skipped on first poll — the agent just pushed it.
+	assert.NotContains(t, types, string(EventNewCommit))
+	// CI is failing, so no green claim.
+	assert.NotContains(t, types, string(EventCIAllGreen))
+}
+
+// onceTypes runs a single --once poll against the given PR and returns the
+// notification types.
+func onceTypes(t *testing.T, pr *PullRequest) []string {
+	t.Helper()
+	svc := &Service{API: scriptedAPI([]*PullRequest{pr})}
+	var got []Notification
+	require.NoError(t, Once(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) }))
+	return typesOf(got)
+}
+
+func TestOnce_GreenCI_EmitsCIAllGreen(t *testing.T) {
+	// ci-all-green never fires from Diff against an empty baseline, so --once
+	// has to emit it explicitly when CI has finished green.
+	assert.Contains(t, onceTypes(t, mkPR("OPEN", false, "aaaaaaa", nil)), string(EventCIAllGreen))
+}
+
+func TestOnce_NoChecksYet_NoCIAllGreen(t *testing.T) {
+	pr := &PullRequest{State: "OPEN", Commits: CommitNodes{Nodes: []Commit{mkCommitNoChecks("aaaaaaa")}}}
+	assert.NotContains(t, onceTypes(t, pr), string(EventCIAllGreen))
+}
+
+func TestOnce_UnfinishedSuite_NoCIAllGreen(t *testing.T) {
+	for _, status := range []string{"REQUESTED", "PENDING", "QUEUED", "WAITING", "IN_PROGRESS"} {
+		t.Run(status, func(t *testing.T) {
+			assert.NotContains(t, onceTypes(t, mkPRSuiteStatus(status)), string(EventCIAllGreen))
+		})
+	}
 }
 
 func TestIdleInterval(t *testing.T) {
@@ -391,11 +448,12 @@ func TestRun_EmitsExistingIssuesOnFirstPoll(t *testing.T) {
 	types := typesOf(got)
 	assert.Equal(t, firstPollType, types[0])
 	// First poll surfaces all pre-existing issues via diff against empty baseline.
+	// new-commit is skipped — the agent just pushed it.
 	assert.Contains(t, types, string(EventConflict))
 	assert.Contains(t, types, string(EventNewFailingChecks))
 	assert.Contains(t, types, string(EventNewUnresolvedThreads))
 	assert.Contains(t, types, string(EventNewGeneralComments))
-	assert.Contains(t, types, string(EventNewCommit))
+	assert.NotContains(t, types, string(EventNewCommit))
 }
 
 func TestRun_FailingChecksDetailWhenConflicted(t *testing.T) {
@@ -473,8 +531,9 @@ func TestRun_FailingChecksNoDetailWhenClean(t *testing.T) {
 	assert.NotContains(t, failing.Detail, "merge conflicts")
 }
 
-func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
-	// PR with no issues: CI passing, no comments, no conflicts → only firstPoll + new-commit.
+func TestRun_FirstPollGreenCI_EmitsCIAllGreen(t *testing.T) {
+	// PR with no issues and CI finished green: first poll reports ci-all-green.
+	// new-commit is skipped — the agent just pushed it.
 	svc := &Service{API: scriptedAPI([]*PullRequest{
 		mkPR("OPEN", false, "aaaaaaa", nil),
 		mkPR("MERGED", true, "aaaaaaa", nil),
@@ -484,7 +543,44 @@ func TestRun_FirstPollCleanPR_OnlyFirstPoll(t *testing.T) {
 	err := Run(context.Background(), svc, testRunOptions(), func(n Notification) { got = append(got, n) })
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{firstPollType, string(EventNewCommit), string(EventMerged)}, typesOf(got))
+	assert.Equal(t, []string{firstPollType, string(EventCIAllGreen), string(EventMerged)}, typesOf(got))
+}
+
+// firstPollTypes runs a single poll against the given PR and returns the
+// notification types, cancelling before the loop sleeps.
+func firstPollTypes(t *testing.T, pr *PullRequest) []string {
+	t.Helper()
+	svc := &Service{API: scriptedAPI([]*PullRequest{pr})}
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+	return typesOf(got)
+}
+
+func TestRun_FirstPollNoChecksYet_NoCIAllGreen(t *testing.T) {
+	// No check suites at all — GitHub's state for the first seconds after a
+	// push, and the permanent state of a repo without CI. Absence of failures
+	// is not evidence CI passed, so stay quiet.
+	pr := &PullRequest{State: "OPEN", Commits: CommitNodes{Nodes: []Commit{mkCommitNoChecks("aaaaaaa")}}}
+	assert.NotContains(t, firstPollTypes(t, pr), string(EventCIAllGreen))
+}
+
+func TestRun_FirstPollUnfinishedSuite_NoCIAllGreen(t *testing.T) {
+	// Every non-terminal CheckStatusState must count as pending, not as green.
+	for _, status := range []string{"REQUESTED", "PENDING", "QUEUED", "WAITING", "IN_PROGRESS"} {
+		t.Run(status, func(t *testing.T) {
+			types := firstPollTypes(t, mkPRSuiteStatus(status))
+			assert.NotContains(t, types, string(EventCIAllGreen))
+			assert.NotContains(t, types, string(EventNewFailingChecks))
+		})
+	}
 }
 
 func TestRun_FirstPollPendingCI_NoCIEvent(t *testing.T) {
