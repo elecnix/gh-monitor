@@ -16,9 +16,15 @@ jobs:
     runs-on: arc-runners
     steps:
       - uses: actions/checkout@v4
+      - name: Install gh CLI
+        run: |
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update && sudo apt-get install -y gh
       - name: Create release if missing
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_name }}"
           if [ -z "$TAG" ]; then
@@ -27,18 +33,7 @@ jobs:
           if [ -z "$TAG" ]; then
             echo "Unable to determine tag name"; exit 1
           fi
-          # Check if release exists via API (gh CLI not available on arc-runners).
-          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
-          if [ "$HTTP" = "404" ]; then
-            curl -s -X POST \
-              -H "Authorization: token $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases" \
-              -d "{\"tag_name\":\"$TAG\",\"generate_release_notes\":true}"
-          fi
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
       - uses: cli/gh-extension-precompile@v2.1.0
         with:
           go_version_file: go.mod
