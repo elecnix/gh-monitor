@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Create release if missing
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.ref_name }}"
           if [ -z "$TAG" ]; then
@@ -27,7 +27,18 @@ jobs:
           if [ -z "$TAG" ]; then
             echo "Unable to determine tag name"; exit 1
           fi
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+          # Check if release exists via API (gh CLI not available on arc-runners).
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          if [ "$HTTP" = "404" ]; then
+            curl -s -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"generate_release_notes\":true}"
+          fi
       - uses: cli/gh-extension-precompile@v2.1.0
         with:
           go_version_file: go.mod
