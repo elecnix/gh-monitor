@@ -1,6 +1,6 @@
 # Using `gh-monitor` with Claude Code
 
-`gh monitor monitor` is built to be driven by [Claude Code](https://claude.com/claude-code)'s **persistent `Monitor`** tool. The command runs a poll loop and prints **one NDJSON line per genuinely-new change** on a pull request; Claude Code's `Monitor` streams each line back into the session as a notification, so the agent reacts to review comments, CI failures, conflicts, and new commits as they happen — without polling and without burning tokens between events.
+`gh monitor` is built to be driven by [Claude Code](https://claude.com/claude-code)'s **persistent `Monitor`** tool. The command runs a poll loop and prints **one NDJSON line per genuinely-new change** on a pull request; Claude Code's `Monitor` streams each line back into the session as a notification, so the agent reacts to review comments, CI failures, conflicts, and new commits as they happen — without polling and without burning tokens between events.
 
 This mirrors the behavior of the `pi-ghpr-monitor` extension for the `pi` agent, but instead of the tool injecting notifications itself, the CLI does the polling + change-detection and the Claude Code harness does the delivery.
 
@@ -10,7 +10,7 @@ Ask Claude Code to monitor a PR, and it registers a persistent monitor whose com
 
 ```
 Monitor({
-  command: "gh monitor monitor -R owner/repo 42",
+  command: "gh monitor -R owner/repo 42",
   persistent: true,
   description: "PR owner/repo#42 events",
 })

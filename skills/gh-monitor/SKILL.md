@@ -78,11 +78,9 @@ Edit or delete pending comments: `--edit-comment` / `--delete-comment` with `--c
 Monitor is the default command — just pass the PR selector directly. Continuously stream one NDJSON event per genuinely-new change until merge/close:
 
 ```sh
-gh monitor -R owner/repo <pr>                    # Default command
-gh monitor monitor -R owner/repo <pr>            # Explicit form
-gh monitor watch -R owner/repo <pr>              # Short alias
-gh monitor monitor --text -R owner/repo <pr>     # Human-readable
-gh monitor monitor --once -R owner/repo <pr>     # One-shot, then exit
+gh monitor -R owner/repo <pr>            # Default command
+gh monitor --text -R owner/repo <pr>     # Human-readable
+gh monitor --once -R owner/repo <pr>     # One-shot, then exit
 ```
 
 Flags: `--interval` (default 60s, min 10), `--timeout` (default 0 = forever), `--ignored-bots <a,b>`.
@@ -111,7 +109,7 @@ Monitor({ command: "gh monitor -R owner/repo 42", persistent: true })
 
 **Adaptive backoff:** After 3 no-change polls, interval grows exponentially (cap 5min), resets on any change. Transient errors retry with doubling backoff — the loop doesn't crash.
 
-**One-shot check:** `gh monitor monitor --once -R owner/repo <pr>` emits current actionable state and exits (replaces the removed `await` command).
+**One-shot check:** `gh monitor --once -R owner/repo <pr>` emits current actionable state and exits (replaces the removed `await` command).
 
 ### Monitor a workflow run
 
