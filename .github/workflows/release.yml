@@ -16,6 +16,12 @@ jobs:
     runs-on: arc-runners
     steps:
       - uses: actions/checkout@v4
+      - name: Install gh CLI
+        run: |
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update && sudo apt-get install -y gh
       - name: Create release if missing
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
