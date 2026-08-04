@@ -178,14 +178,13 @@ The default command — invoked as `gh monitor <selector> [flags]` without a sub
 
 ```sh
 # Default: stream events until the PR is merged/closed (NDJSON, one event per line)
-gh monitor -R owner/repo 42                    # or: gh monitor monitor 42 -R owner/repo
-gh monitor watch -R owner/repo 42              # alias for 'monitor'
+gh monitor -R owner/repo 42
 
 # Human-readable rendered messages instead of JSON
-gh monitor monitor --text -R owner/repo 42
+gh monitor --text -R owner/repo 42
 
 # One-shot: emit the current actionable state and exit
-gh monitor monitor --once -R owner/repo 42
+gh monitor --once -R owner/repo 42
 ```
 
 **Monitor flags:**

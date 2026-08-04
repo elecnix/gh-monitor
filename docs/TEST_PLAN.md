@@ -50,7 +50,7 @@ gh monitor threads view <PRRT_ID>
 gh monitor threads resolve --thread-id <PRRT_ID> --repo <username>/gh-monitor-test --pr 1
 gh monitor threads unresolve --thread-id <PRRT_ID> --repo <username>/gh-monitor-test --pr 1
 gh monitor react <PRRC_ID> --type thumbs_up
-gh monitor monitor --once --repo <username>/gh-monitor-test --pr 1
+gh monitor --once --repo <username>/gh-monitor-test --pr 1
 gh monitor review --submit --repo <username>/gh-monitor-test --pr 1 --review-id <PRR_ID> --event COMMENT --body "Test review submission"
 
 # Draft Management Commands
