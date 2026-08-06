@@ -187,6 +187,13 @@ func streamFromDaemon(ctx context.Context, socket string, req ipc.Subscribe, out
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	// Close the connection when ctx is cancelled so a blocked read (e.g. an
+	// open PR that produces no new events) unblocks instead of ignoring the
+	// cancellation — the same way the in-process loop honours SIGINT.
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
 	if err := ipc.SendSubscribe(conn, req); err != nil {
 		return fmt.Errorf("send subscribe: %w", err)
 	}

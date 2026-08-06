@@ -1,9 +1,7 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -24,8 +22,7 @@ import (
 
 // closedPR builds a CLOSED PR whose single check suite is COMPLETED/SUCCESS —
 // a real terminal CI state (see AGENTS.md). A closed PR makes the daemon
-// stream terminate naturally, so client tests get a clean EOF instead of
-// blocking on an open PR that never settles.
+// stream terminate naturally, so single-client tests get a clean EOF.
 func closedPR() *monitor.PullRequest {
 	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
 	return &monitor.PullRequest{
@@ -36,15 +33,30 @@ func closedPR() *monitor.PullRequest {
 	}
 }
 
+// openPR builds an OPEN PR with a green check suite. An open PR never
+// settles, so the daemon stream stays open — used by the two-client sharing
+// test to avoid the poller being torn down between subscribers (a flake on
+// slow CI runners where the first client's terminal stream ends before the
+// second subscribes).
+func openPR() *monitor.PullRequest {
+	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
+	return &monitor.PullRequest{
+		State:   "OPEN",
+		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
+			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
+		}}}},
+	}
+}
+
 // startTestDaemon wires a hub with a counting fake fetcher to a real Unix
-// socket, running serveClient for each connection. It returns the socket
-// path, a fetch-counter, and a cleanup func.
-func startTestDaemon(t *testing.T, ctx context.Context) (socket string, fetches *int64, cleanup func()) {
+// socket, running serveClient for each connection. prFn supplies each fetch's
+// PR payload. It returns the socket path, a fetch-counter, and a cleanup func.
+func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.PullRequest) (socket string, fetches *int64, cleanup func()) {
 	t.Helper()
 	var calls int64
 	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&calls, 1)
-		return closedPR(), nil
+		return prFn(), nil
 	}
 	h := hub.New(fetcher, time.Hour)
 
@@ -93,61 +105,97 @@ func daemonSubscribeReq() ipc.Subscribe {
 	}
 }
 
-// firstPollSeen reports whether the NDJSON stream in buf contains a
-// first-poll notification.
-func firstPollSeen(buf *strings.Builder) bool {
-	sc := bufio.NewScanner(strings.NewReader(buf.String()))
-	for sc.Scan() {
-		var n monitor.Notification
-		if err := json.Unmarshal(sc.Bytes(), &n); err == nil && n.Type == "first-poll" {
-			return true
-		}
-	}
-	return false
-}
-
 // TestDaemon_TwoClientsShareOneFetch is the end-to-end acceptance test for
 // issue #34: two `gh monitor` client processes connecting to the daemon must
 // both receive the first-poll notification while the daemon makes exactly one
 // fetch — proving the shared poller works across a real Unix socket.
+//
+// It uses an OPEN PR so neither stream ends early: a closed PR would let the
+// first client finish and tear down the poller before the second subscribes
+// (a flake on slow CI runners, observed as fetches==2).
 func TestDaemon_TwoClientsShareOneFetch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	sock, fetches, cleanup := startTestDaemon(t, ctx)
+	sock, fetches, cleanup := startTestDaemon(t, ctx, openPR)
 	t.Cleanup(cleanup)
 
-	runClient := func() (string, error) {
-		var buf strings.Builder
-		cctx, ccancel := context.WithTimeout(ctx, 3*time.Second)
-		defer ccancel()
-		err := streamFromDaemon(cctx, sock, daemonSubscribeReq(), &buf)
-		return buf.String(), err
-	}
+	runOpts := runOptsFor() // open PR identity; stream stays open until we cancel
 
-	// Two client processes connect and stream from the shared daemon.
+	// Each client streams through a collecting emit and signals when it sees
+	// first-poll. The stream stays open (open PR), so we cancel after both have
+	// seen first-poll — context.Canceled is the expected return.
+	type clientState struct {
+		mu        sync.Mutex
+		types     []string
+		firstPoll chan struct{}
+		cctx      context.Context
+		cancel    context.CancelFunc
+	}
+	newClient := func() *clientState {
+		cctx, ccancel := context.WithCancel(ctx)
+		return &clientState{
+			firstPoll: make(chan struct{}),
+			cctx:      cctx,
+			cancel:    ccancel,
+		}
+	}
+	stages := []*clientState{newClient(), newClient()}
+
 	var wg sync.WaitGroup
-	bufs := make([]string, 2)
-	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
+	for _, st := range stages {
+		st := st
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			bufs[i], errs[i] = runClient()
-		}(i)
+			var once sync.Once
+			emit := func(n monitor.Notification) {
+				st.mu.Lock()
+				st.types = append(st.types, n.Type)
+				st.mu.Unlock()
+				if n.Type == "first-poll" {
+					once.Do(func() { close(st.firstPoll) })
+				}
+			}
+			_ = streamFromDaemonAndEmit(st.cctx, sock, runOpts, emit)
+			// Returns on cancel with context.Canceled — expected.
+		}()
 	}
-	wg.Wait()
 
-	for i, err := range errs {
-		require.NoError(t, err, "client %d failed", i)
+	// Wait for both clients to see first-poll from the shared fetch.
+	for i, st := range stages {
+		select {
+		case <-st.firstPoll:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("client %d never saw first-poll", i)
+		}
 	}
-	// Both clients received the first-poll notification over the socket.
-	assert.True(t, firstPollSeen(stringsBuilderFrom(bufs[0])), "client 0 saw first-poll")
-	assert.True(t, firstPollSeen(stringsBuilderFrom(bufs[1])), "client 1 saw first-poll")
 
-	// The daemon made exactly one fetch to serve both clients.
+	// Both clients received first-poll from a single fetch.
+	for i, st := range stages {
+		st.mu.Lock()
+		saw := contains(st.types, "first-poll")
+		st.mu.Unlock()
+		assert.True(t, saw, "client %d saw first-poll", i)
+	}
 	assert.Equal(t, int64(1), atomic.LoadInt64(fetches),
 		"two daemon clients must share a single fetch")
+
+	// Cancel both clients so their streams end and the goroutines exit.
+	for _, st := range stages {
+		st.cancel()
+	}
+	wg.Wait()
+}
+
+// contains reports whether s contains v.
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // TestDaemon_FallsBackWhenSocketAbsent verifies the client path returns an
@@ -158,13 +206,6 @@ func TestDaemon_FallsBackWhenSocketAbsent(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "nope.sock")
 	err := streamFromDaemon(context.Background(), missing, daemonSubscribeReq(), &strings.Builder{})
 	assert.True(t, ipc.IsAbsent(err), "expected an absent-socket error, got %v", err)
-}
-
-// stringsBuilderFrom wraps a string as a *strings.Builder for the helper above.
-func stringsBuilderFrom(s string) *strings.Builder {
-	var b strings.Builder
-	b.WriteString(s)
-	return &b
 }
 
 // init guards against the daemon accidentally respecting a real user socket
