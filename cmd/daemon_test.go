@@ -172,3 +172,140 @@ func stringsBuilderFrom(s string) *strings.Builder {
 func init() {
 	_ = os.Unsetenv("GH_MONITOR_SOCK")
 }
+// runOptsFor is a closed-PR RunOptions whose stream terminates naturally, so
+// streamFromDaemonAndEmit returns instead of blocking forever.
+func runOptsFor() monitor.RunOptions {
+	return monitor.RunOptions{
+		Identity: resolver.Identity{Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
+		Prefs:    prefs.DefaultPreferences(),
+		Interval: 60 * time.Second,
+		Now:      time.Now,
+	}
+}
+
+// bindTestServer starts an in-process daemon (hub + accept loop) bound to
+// socket, returning the listener for cleanup. It is the test substitute for
+// the real spawnDaemon re-exec.
+func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string) net.Listener {
+	t.Helper()
+	l, err := ipc.Listen(socket)
+	require.NoError(t, err)
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
+		_ = l.Close()
+		wg.Wait()
+	})
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				defer func() { _ = c.Close() }()
+				serveClient(ctx, h, c)
+			}(conn)
+		}
+	}()
+	return l
+}
+
+// TestAutoStart_SpawnsDaemonWhenAbsent verifies the autostart wiring: when no
+// daemon is listening, streamFromDaemonAndEmit spawns one (via the injectable
+// spawnDaemonFn) and streams the first-poll from it.
+func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
+	var fetches int64
+	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+		atomic.AddInt64(&fetches, 1)
+		return closedPR(), nil
+	}
+	h := hub.New(fetcher, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	t.Cleanup(h.Stop)
+
+	shortDir, err := os.MkdirTemp("", "ghmon-autostart-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sock := filepath.Join(shortDir, "d.sock")
+
+	var spawned int64
+	orig := spawnDaemonFn
+	spawnDaemonFn = func(socket string, interval time.Duration) error {
+		atomic.AddInt64(&spawned, 1)
+		bindTestServer(t, ctx, h, socket)
+		return nil
+	}
+	t.Cleanup(func() { spawnDaemonFn = orig })
+
+	var got []string
+	emit := func(n monitor.Notification) { got = append(got, n.Type) }
+
+	err = streamFromDaemonAndEmit(ctx, sock, runOptsFor(), emit)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), atomic.LoadInt64(&spawned), "autostart spawned the daemon once")
+	assert.Contains(t, got, "first-poll", "client streamed first-poll from the autostarted daemon")
+}
+
+// TestAutoStart_SkipsSpawnWhenDaemonRunning verifies autostart does not spawn a
+// second daemon when one is already listening.
+func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
+	var fetches int64
+	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+		atomic.AddInt64(&fetches, 1)
+		return closedPR(), nil
+	}
+	h := hub.New(fetcher, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	t.Cleanup(h.Stop)
+
+	shortDir, err := os.MkdirTemp("", "ghmon-running-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sock := filepath.Join(shortDir, "d.sock")
+	bindTestServer(t, ctx, h, sock) // daemon already up
+
+	var spawned int64
+	orig := spawnDaemonFn
+	spawnDaemonFn = func(string, time.Duration) error {
+		atomic.AddInt64(&spawned, 1)
+		return nil
+	}
+	t.Cleanup(func() { spawnDaemonFn = orig })
+
+	var got []string
+	emit := func(n monitor.Notification) { got = append(got, n.Type) }
+
+	err = streamFromDaemonAndEmit(ctx, sock, runOptsFor(), emit)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when a daemon is already running")
+	assert.Contains(t, got, "first-poll")
+}
+
+// TestAutoStart_DisabledByEnv verifies that GH_MONITOR_AUTOSTART=0 suppresses
+// spawning and surfaces an absent-socket error so runMonitor falls back to
+// in-process polling.
+func TestAutoStart_DisabledByEnv(t *testing.T) {
+	t.Setenv("GH_MONITOR_AUTOSTART", "0")
+
+	shortDir, err := os.MkdirTemp("", "ghmon-disabled-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sock := filepath.Join(shortDir, "d.sock") // never bound
+
+	var spawned int64
+	orig := spawnDaemonFn
+	spawnDaemonFn = func(string, time.Duration) error {
+		atomic.AddInt64(&spawned, 1)
+		return nil
+	}
+	t.Cleanup(func() { spawnDaemonFn = orig })
+
+	emit := func(monitor.Notification) {}
+	err = streamFromDaemonAndEmit(context.Background(), sock, runOptsFor(), emit)
+	assert.True(t, ipc.IsAbsent(err), "expected an absent-socket error, got %v", err)
+	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when autostart is disabled")
+}

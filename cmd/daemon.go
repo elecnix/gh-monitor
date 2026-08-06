@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -237,4 +239,52 @@ func writeNDJSON(w io.Writer, n monitor.Notification) error {
 	}
 	_, err = w.Write([]byte("\n"))
 	return err
+}
+// spawnDaemonFn spawns a detached daemon bound to socket. It is a package
+// variable so tests can substitute an in-process server instead of re-exec'ing
+// the real binary.
+var spawnDaemonFn = spawnDaemon
+
+// daemonAutostart reports whether `gh monitor` clients should spawn a daemon
+// when none is running. Default true; opt out with GH_MONITOR_AUTOSTART=0.
+func daemonAutostart() bool {
+	return os.Getenv("GH_MONITOR_AUTOSTART") != "0"
+}
+
+// autostartDaemon spawns a daemon (if none is listening) and waits for it to
+// accept connections. It is race-safe: if several clients autostart at once,
+// ipc.Listen's liveness probe ensures only one daemon binds the socket, and
+// every client's WaitReady still succeeds against the winner.
+func autostartDaemon(ctx context.Context, socket string, interval time.Duration) error {
+	if err := spawnDaemonFn(socket, interval); err != nil {
+		return err
+	}
+	return ipc.WaitReady(ctx, socket, 8*time.Second)
+}
+
+// spawnDaemon re-executes the current binary as a detached `gh monitor daemon`
+// that outlives the client. Stdio is redirected to /dev/null and the process
+// becomes its own session leader (Setsid) so it survives the client exiting.
+func spawnDaemon(socket string, interval time.Duration) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+	devnull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", os.DevNull, err)
+	}
+	defer func() { _ = devnull.Close() }()
+
+	cmd := exec.Command(exe, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+	cmd.Stdin = devnull
+	cmd.Stdout = devnull
+	cmd.Stderr = devnull
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("spawn daemon: %w", err)
+	}
+	// Release the child so it is not reaped when this client exits.
+	_ = cmd.Process.Release()
+	return nil
 }

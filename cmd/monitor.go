@@ -217,6 +217,8 @@ func daemonSocketPath() string {
 // streamFromDaemonAndEmit connects to a running daemon, sends a subscribe
 // request for runOpts, and pipes the streamed notifications through emit
 // (honouring --text) until the daemon closes the stream or ctx is cancelled.
+// When no daemon is listening and autostart is enabled (the default), it
+// spawns one detached and waits for it to come up first.
 func streamFromDaemonAndEmit(ctx context.Context, socket string, runOpts monitor.RunOptions, emit func(monitor.Notification)) error {
 	req := ipc.Subscribe{
 		Target:   "pr",
@@ -225,6 +227,18 @@ func streamFromDaemonAndEmit(ctx context.Context, socket string, runOpts monitor
 		Interval: int(runOpts.Interval.Seconds()),
 		Timeout:  int(runOpts.Timeout.Seconds()),
 	}
+
+	// Auto-start: if no daemon is listening, spawn one detached and wait for
+	// it to accept. Best-effort — on failure fall back to in-process polling.
+	if daemonAutostart() {
+		if c, err := ipc.Dial(socket); err == nil {
+			_ = c.Close() // daemon already up; don't spawn a second one
+		} else if spawnErr := autostartDaemon(ctx, socket, runOpts.Interval); spawnErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: could not autostart daemon (%v); using in-process polling\n", spawnErr)
+			return os.ErrNotExist // so runMonitor falls back to in-process polling
+		}
+	}
+
 	pr, pw := io.Pipe()
 	go func() {
 		err := streamFromDaemon(ctx, socket, req, pw)
