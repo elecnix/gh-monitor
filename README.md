@@ -291,9 +291,11 @@ gh monitor -R owner/repo 42
 gh monitor -R owner/repo 42 --text
 ```
 
-A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` falls back to its usual in-process polling, so existing behaviour is unchanged. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
+A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` **auto-starts** one (a detached background process) and then connects, so you get shared polling without a manual `daemon` step. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
 
-The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running. `--once` and non-PR targets always use the in-process loop.
+Concurrent auto-starts are race-safe: at most one daemon binds a socket (a second `Listen` refuses to steal a live daemon's socket), so several clients starting at once share a single fetch loop rather than each spawning their own.
+
+The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (so a client falls back to in-process polling when no daemon is running instead of spawning one). `--once` and non-PR targets always use the in-process loop.
 
 ### Managing preferences
 

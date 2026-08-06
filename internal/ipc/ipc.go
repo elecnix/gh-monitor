@@ -53,10 +53,21 @@ func IsAbsent(err error) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-// Listen creates and listens on the Unix socket at path, removing any stale
-// socket file first. The caller owns the returned listener.
+// Listen creates and listens on the Unix socket at path. If a socket file
+// already exists, it probes it: a live daemon (Dial succeeds) means another
+// process owns it, so Listen returns an error and the caller backs off; a
+// stale socket (connection refused) is removed and reused. This makes
+// concurrent autostart spawners safe — at most one daemon binds the path.
 func Listen(path string) (net.Listener, error) {
-	_ = os.Remove(path) // best-effort: a stale socket from a crashed daemon
+	if _, err := os.Stat(path); err == nil {
+		// A socket file is present. Probe it before touching it.
+		if c, derr := net.Dial("unix", path); derr == nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("socket %s already in use by a live daemon", path)
+		}
+		// Stale socket from a crashed daemon — safe to reclaim.
+		_ = os.Remove(path)
+	}
 	if dir := filepath.Dir(path); dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create socket dir: %w", err)
@@ -78,6 +89,27 @@ func Dial(path string) (net.Conn, error) {
 	}
 	d := net.Dialer{Timeout: 2 * time.Second}
 	return d.Dial("unix", path)
+}
+
+// WaitReady polls the socket until a connection succeeds, the timeout elapses,
+// or ctx is cancelled. It is the companion to an autostart spawn: after a
+// client forks a daemon it waits for the daemon to bind and accept.
+func WaitReady(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if c, err := Dial(path); err == nil {
+			_ = c.Close()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("daemon socket %s did not come up within %s", path, timeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // SendSubscribe writes a single Subscribe request to w.
