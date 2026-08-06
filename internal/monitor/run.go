@@ -141,6 +141,13 @@ type RunOptions struct {
 	// Timeout stops the loop after this duration; 0 means run forever.
 	Timeout time.Duration
 
+	// EventFilter is a per-event-kind allowlist. A non-nil filter suppresses
+	// (drops) any Notification whose Type is not in the allowlist before it
+	// reaches the caller's emit callback; a nil filter (the default) emits
+	// every kind, preserving today's behaviour. Use NewEventFilter to build
+	// one programmatically or ParseEventFilter to validate caller input.
+	EventFilter *EventFilter
+
 	// Now and Sleep are injectable for tests. Now defaults to time.Now; Sleep
 	// defaults to a context-aware timer. Sleep must return the context error
 	// when the context is cancelled.
@@ -184,7 +191,12 @@ func realSleep(ctx context.Context, d time.Duration) error {
 // Run polls the target until it reaches a terminal state, the context is
 // cancelled, or the timeout elapses, emitting one Notification per
 // genuinely-new change. Dispatches based on the target type in opts.Identity.
+//
+// If opts.EventFilter is non-nil, notifications whose Type is not in the
+// allowlist are dropped before they reach emit (per-event-kind filtering for
+// orchestrator/automation callers that only care about a subset of events).
 func Run(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+	emit = filterEmit(opts.EventFilter, emit)
 	switch opts.Identity.Target {
 	case "ref", "commit":
 		return runRef(ctx, svc, opts, emit)
@@ -199,8 +211,11 @@ func Run(ctx context.Context, svc *Service, opts RunOptions, emit func(Notificat
 	}
 }
 
-// Once does a single fetch and emits the current actionable state.
+// Once does a single fetch and emits the current actionable state. If
+// opts.EventFilter is non-nil, notifications whose Type is not in the
+// allowlist are dropped before they reach emit.
 func Once(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+	emit = filterEmit(opts.EventFilter, emit)
 	switch opts.Identity.Target {
 	case "ref", "commit":
 		return onceRef(ctx, svc, opts, emit)

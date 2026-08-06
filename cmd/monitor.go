@@ -31,6 +31,8 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().IntVarP(&opts.Interval, "interval", "i", 60, "Polling interval in seconds (min 10)")
 	cmd.Flags().IntVarP(&opts.Timeout, "timeout", "t", 0, "Maximum watch time in seconds (0 = run until merged/closed)")
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
+	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
+	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
 }
@@ -46,6 +48,7 @@ type monitorOptions struct {
 	Interval    int
 	Timeout     int
 	IgnoredBots string
+	Events      string
 	Once        bool
 	Text        bool
 }
@@ -159,6 +162,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		Prefs:    p,
 		Interval: time.Duration(opts.Interval) * time.Second,
 		Timeout:  time.Duration(opts.Timeout) * time.Second,
+	}
+
+	// --events / --only-events: a per-event-kind allowlist. When set, only the
+	// listed kinds are emitted; everything else is suppressed. An unknown kind
+	// is rejected loudly so a typo doesn't silently mute what the caller wanted.
+	if strings.TrimSpace(opts.Events) != "" {
+		filter, err := monitor.ParseEventFilter(opts.Events)
+		if err != nil {
+			return err
+		}
+		runOpts.EventFilter = filter
 	}
 
 	emit := func(n monitor.Notification) {
