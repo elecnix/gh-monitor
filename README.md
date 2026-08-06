@@ -42,28 +42,29 @@ npx skills add elecnix/gh-monitor
 
 ## Commands
 
-| Command                         | Description                                                            |
-| ------------------------------- | ---------------------------------------------------------------------- |
-| _(default)_                     | Continuously watch a PR, streaming one event per change (NDJSON)       |
-| `monitor` / `watch`             | Continuously watch a PR, streaming one event per change (NDJSON)       |
-| `monitor --run-id <id>`         | Watch a single GitHub Actions workflow run until it completes (NDJSON) |
-| `monitor -R owner/repo`         | Watch a repository for new PRs and issues (NDJSON)                     |
-| `draft status`                  | Check if a pull request is a draft                                     |
-| `draft mark`                    | Mark a pull request as draft                                           |
-| `draft ready`                   | Mark a pull request as ready for review                                |
-| `draft list`                    | List all draft pull requests in the repository                         |
-| `review --start`                | Opens a pending review                                                 |
-| `review --add-comment`          | Adds inline comment (requires `PRR_…` review node ID)                  |
-| `review --edit-comment`         | Updates a comment in a pending review                                  |
-| `review --delete-comment`       | Deletes a comment from a pending review                                |
-| `review view`                   | Aggregates reviews, inline comments, and replies                       |
-| `review --submit`               | Finalizes a pending review                                             |
-| `comments reply`                | Replies to a review thread                                             |
-| `react`                         | Adds a reaction to any GitHub node (comments, reviews, etc.)           |
-| `threads list`                  | Lists review threads for the pull request                              |
-| `threads view`                  | View full conversation for specific threads by ID                      |
-| `threads resolve` / `unresolve` | Resolves or unresolves review threads                                  |
-| `prefs`                         | View and edit notification preference templates (get/set/reset/path)   |
+| Command                         | Description                                                                |
+| ------------------------------- | -------------------------------------------------------------------------- |
+| _(default)_                     | Continuously watch a PR, streaming one event per change (NDJSON)           |
+| `monitor` / `watch`             | Continuously watch a PR, streaming one event per change (NDJSON)           |
+| `monitor --run-id <id>`         | Watch a single GitHub Actions workflow run until it completes (NDJSON)     |
+| `monitor -R owner/repo`         | Watch a repository for new PRs and issues (NDJSON)                         |
+| `draft status`                  | Check if a pull request is a draft                                         |
+| `draft mark`                    | Mark a pull request as draft                                               |
+| `draft ready`                   | Mark a pull request as ready for review                                    |
+| `draft list`                    | List all draft pull requests in the repository                             |
+| `review --start`                | Opens a pending review                                                     |
+| `review --add-comment`          | Adds inline comment (requires `PRR_…` review node ID)                      |
+| `review --edit-comment`         | Updates a comment in a pending review                                      |
+| `review --delete-comment`       | Deletes a comment from a pending review                                    |
+| `review view`                   | Aggregates reviews, inline comments, and replies                           |
+| `review --submit`               | Finalizes a pending review                                                 |
+| `comments reply`                | Replies to a review thread                                                 |
+| `react`                         | Adds a reaction to any GitHub node (comments, reviews, etc.)               |
+| `threads list`                  | Lists review threads for the pull request                                  |
+| `threads view`                  | View full conversation for specific threads by ID                          |
+| `threads resolve` / `unresolve` | Resolves or unresolves review threads                                      |
+| `prefs`                         | View and edit notification preference templates (get/set/reset/path)       |
+| `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch |
 
 ### Filters
 
@@ -261,6 +262,23 @@ gh monitor -R owner/repo --timeout 3600
 ```
 
 Each event carries the item's number, title, author, and URL in the `repo_items` array. Templates for `repo-new-pr` and `repo-new-issue` are configurable via `prefs`.
+
+### Shared poller daemon
+
+By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same PR (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per PR** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
+
+```sh
+# Start the daemon (runs until SIGTERM/SIGINT)
+gh monitor daemon --interval 60
+
+# Now any number of `gh monitor` clients watching the same PR share one fetch
+gh monitor -R owner/repo 42
+gh monitor -R owner/repo 42 --text
+```
+
+A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` falls back to its usual in-process polling, so existing behaviour is unchanged. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
+
+The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running. `--once` and non-PR targets always use the in-process loop.
 
 ### Managing preferences
 
