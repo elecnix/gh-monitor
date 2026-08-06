@@ -535,3 +535,61 @@ func TestMonitorRunMutuallyExclusiveWithPR(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "mutually exclusive")
 }
+
+// TestMonitorOnceEventsFlagSuppressesUnlistedKinds confirms the --events /
+// --only-events CLI flag threads the per-event-kind allowlist through to the
+// emit boundary: with --events=new-failing-checks, the first-poll and
+// ci-all-green notifications are suppressed and only new-failing-checks is
+// emitted.
+func TestMonitorOnceEventsFlagSuppressesUnlistedKinds(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+
+	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		return assignJSON(result, openPRWithFailingCheck())
+	}}
+	apiClientFactory = func(string) ghcli.API { return fake }
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--once", "--events", "new-failing-checks"})
+	require.NoError(t, root.Execute())
+
+	var types []string
+	for _, ln := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		if ln == "" {
+			continue
+		}
+		var n map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(ln), &n), "line not valid json: %s", ln)
+		types = append(types, n["type"].(string))
+	}
+	// Only the allowlisted kind may appear.
+	for _, ty := range types {
+		assert.Equal(t, "new-failing-checks", ty, "--events must suppress unlisted kinds; got %q", ty)
+	}
+	assert.Contains(t, types, "new-failing-checks", "the allowlisted kind must still be emitted")
+	assert.NotContains(t, types, "first-poll", "first-poll is not in the allowlist and must be suppressed")
+}
+
+// TestMonitorEventsRejectsUnknownKind confirms an unknown event kind on the CLI
+// is a hard error rather than silently ignored.
+func TestMonitorEventsRejectsUnknownKind(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	apiClientFactory = func(string) ghcli.API { return &commandFakeAPI{} }
+
+	root := newRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--once", "--events", "conflict,not-a-real-kind"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not-a-real-kind")
+}
