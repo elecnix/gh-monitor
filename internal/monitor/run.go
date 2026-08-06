@@ -232,13 +232,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	diff := Diff
-	if opts.Prefs.RetriggerComments {
-		diff = DiffRetrigger
-	}
-
-	var prev *PRStatus
-	noChange := 0
+	c := NewPRConsumer(opts)
 	errBackoff := time.Duration(0)
 
 	for {
@@ -258,55 +252,11 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		errBackoff = 0
 
 		curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
-
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// issues (unresolved threads, comments, conflicts, failing checks) are
-		// surfaced immediately.  Subsequent polls diff against the real prev.
-		compare := prev
-		if firstPoll {
-			compare = &PRStatus{}
-			emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
-		}
-		events := diff(compare, curr)
-		for _, ev := range events {
-			// The agent just created the PR and already knows about the
-			// head commit — skip it on first poll to avoid a noisy turn.
-			if firstPoll && ev.Type == EventNewCommit {
-				continue
-			}
-			emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
-			if ev.Type == EventMerged || ev.Type == EventClosed {
-				terminalEmitted = true
-			}
-		}
-		// On first poll the diff against an empty baseline surfaces
-		// pre-existing issues (failing checks, conflicts, threads) but
-		// never fires ci-all-green because prevHadWork is always false.
-		// Emit it explicitly when CI has already finished green.
-		if firstPoll && ciAllGreen(curr) {
-			emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		if curr.Merged || curr.State == "CLOSED" {
-			if firstPoll && !terminalEmitted {
-				typ := EventClosed
-				if curr.Merged {
-					typ = EventMerged
-				}
-				emit(renderNotificationPR(opts, curr, string(typ), Event{Type: typ}))
-			}
+		if c.Consume(curr, emit) {
 			return nil
 		}
 
-		d := idleInterval(base, noChange)
+		d := idleInterval(base, c.noChange)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {

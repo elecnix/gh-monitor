@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/internal/ghcli"
+	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
@@ -174,6 +177,21 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 	}
 
+	// If a shared-poller daemon is running, stream from it so multiple
+	// processes watching the same PR share one fetch (issue #34). --once and
+	// non-PR targets always use the in-process loop; the daemon path is for
+	// continuous PR monitoring only.
+	if socket := daemonSocketPath(); !opts.Once && identity.Target == "pr" && socket != "" {
+		err := streamFromDaemonAndEmit(ctx, socket, runOpts, emit)
+		if err == nil {
+			return nil
+		}
+		if !ipc.IsAbsent(err) {
+			return err
+		}
+		// Socket missing: no daemon running — fall through to in-process polling.
+	}
+
 	if opts.Once {
 		return monitor.Once(ctx, svc, runOpts, emit)
 	}
@@ -185,4 +203,51 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return err
 	}
 	return nil
+}
+
+// daemonSocketPath returns the daemon socket path, or "" when the user has
+// opted out via GH_MONITOR_DAEMON=0. It honours $GH_MONITOR_SOCK for tests.
+func daemonSocketPath() string {
+	if os.Getenv("GH_MONITOR_DAEMON") == "0" {
+		return ""
+	}
+	return ipc.DefaultSocketPath()
+}
+
+// streamFromDaemonAndEmit connects to a running daemon, sends a subscribe
+// request for runOpts, and pipes the streamed notifications through emit
+// (honouring --text) until the daemon closes the stream or ctx is cancelled.
+func streamFromDaemonAndEmit(ctx context.Context, socket string, runOpts monitor.RunOptions, emit func(monitor.Notification)) error {
+	req := ipc.Subscribe{
+		Target:   "pr",
+		Identity: runOpts.Identity,
+		Prefs:    runOpts.Prefs,
+		Interval: int(runOpts.Interval.Seconds()),
+		Timeout:  int(runOpts.Timeout.Seconds()),
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		err := streamFromDaemon(ctx, socket, req, pw)
+		_ = pw.CloseWithError(err)
+	}()
+	r := bufio.NewReader(pr)
+	dec := newNDJSONDecoder(r)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, err := dec.Decode()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			// A pipe write error from a closed daemon surfaces here; treat a
+			// closed pipe as a clean end of stream.
+			if errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+			return err
+		}
+		emit(n)
+	}
 }

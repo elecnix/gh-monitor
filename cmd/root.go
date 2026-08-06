@@ -40,6 +40,7 @@ func newRootCommand() *cobra.Command {
 
 	cmd.AddCommand(newReactCommand())
 	cmd.AddCommand(newPrefsCommand())
+	cmd.AddCommand(newDaemonCommand())
 	return cmd
 }
 
