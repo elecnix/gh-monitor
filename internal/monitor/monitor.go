@@ -761,7 +761,10 @@ func suiteName(s *CheckSuite) string {
 }
 
 // extractAnnotations collects WARNING and FAILURE annotations from all
-// completed check runs across all check suites of the head commit.
+// check runs across all check suites of the head commit. The run status is
+// deliberately not checked — an in-progress run may report partial
+// annotations, but they are deduped on the next poll, so filtering on
+// status gains nothing.
 func extractAnnotations(pr *PullRequest) []AnnotationSummary {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
@@ -774,19 +777,15 @@ func extractAnnotations(pr *PullRequest) []AnnotationSummary {
 					if !isAnnotationLevel(ann.Level) {
 						continue
 					}
-					line := 0
-					if ann.Location.Start.Line != 0 {
-						line = ann.Location.Start.Line
-					}
 					s := AnnotationSummary{
 						CheckName: run.Name,
 						Path:      ann.Path,
-						Line:      line,
+						Line:      ann.Location.Start.Line,
 						Level:     ann.Level,
 						Title:     ann.Title,
 						Message:   ann.Message,
 					}
-					key := annotationKeyNoLine(s)
+					key := annotationKey(s)
 					if !seen[key] {
 						seen[key] = true
 						out = append(out, s)
@@ -796,12 +795,6 @@ func extractAnnotations(pr *PullRequest) []AnnotationSummary {
 		}
 	}
 	return out
-}
-
-// annotationKeyNoLine is a dedup key that excludes the line number, since
-// GitHub sometimes reports the same annotation on multiple lines.
-func annotationKeyNoLine(a AnnotationSummary) string {
-	return a.CheckName + "\x00" + a.Path + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
 }
 
 // failingChecks collects names of failing check suites/runs plus old-style

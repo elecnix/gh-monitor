@@ -1,5 +1,7 @@
 package monitor
 
+import "strconv"
+
 // EventType is a stable identifier for a kind of detected change.
 type EventType string
 
@@ -428,7 +430,8 @@ func diffAnnotations(prev, curr []AnnotationSummary) []AnnotationSummary {
 	return out
 }
 
-// annotationKey returns a stable dedup key for an annotation.
+// annotationKey returns a stable dedup key for an annotation: check,
+// path, line, level, title, and message combined.
 func annotationKey(a AnnotationSummary) string {
-	return a.CheckName + "\x00" + a.Path + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
+	return a.CheckName + "\x00" + a.Path + "\x00" + strconv.Itoa(a.Line) + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
 }

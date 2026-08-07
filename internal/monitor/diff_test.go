@@ -382,6 +382,27 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		events := Diff(prev, curr)
 		assert.Nil(t, findEvent(events, EventCheckAnnotations))
 	})
+
+	t.Run("same message on different lines are distinct annotations", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "lint", Path: "a.go", Line: 10, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+				{CheckName: "lint", Path: "a.go", Line: 25, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+				{CheckName: "lint", Path: "a.go", Line: 42, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "annotations identical but for line must all surface")
+		require.Len(t, e.Annotations, 3, "three distinct lines = three annotations")
+		// Verify lines are preserved correctly.
+		lines := make([]int, len(e.Annotations))
+		for i, a := range e.Annotations {
+			lines[i] = a.Line
+		}
+		assert.ElementsMatch(t, []int{10, 25, 42}, lines)
+	})
 }
 
 func TestDiff_MultipleEventsInOnePass(t *testing.T) {
