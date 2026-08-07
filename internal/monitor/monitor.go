@@ -98,7 +98,11 @@ const MONITOR_QUERY = `query MonitorPR($owner: String!, $repo: String!, $number:
                 status
                 app { name slug }
                 checkRuns(last: 10) {
-                  nodes { name conclusion status }
+                  nodes { name conclusion status
+                    annotations(first: 50) {
+                      nodes { path location { start { line } } annotationLevel title message }
+                    }
+                  }
                 }
               }
             }
@@ -230,9 +234,30 @@ type RunNodes struct {
 }
 
 type CheckRun struct {
-	Name       string `json:"name"`
-	Conclusion string `json:"conclusion"`
-	Status     string `json:"status"`
+	Name        string          `json:"name"`
+	Conclusion  string          `json:"conclusion"`
+	Status      string          `json:"status"`
+	Annotations AnnotationNodes `json:"annotations"`
+}
+
+type AnnotationNodes struct {
+	Nodes []Annotation `json:"nodes"`
+}
+
+// Annotation is a raw GraphQL check-run annotation.
+type Annotation struct {
+	Path     string             `json:"path"`
+	Location AnnotationLocation `json:"location"`
+	Level    string             `json:"annotationLevel"`
+	Title    string             `json:"title"`
+	Message  string             `json:"message"`
+}
+
+// AnnotationLocation holds the start line of an annotation.
+type AnnotationLocation struct {
+	Start struct {
+		Line int `json:"line"`
+	} `json:"start"`
 }
 
 type CommitStatus struct {
@@ -283,7 +308,11 @@ const MONITOR_REF_QUERY = `query MonitorRef($owner: String!, $repo: String!, $re
               status
               app { name slug }
               checkRuns(last: 10) {
-                nodes { name conclusion status }
+                nodes { name conclusion status
+                  annotations(first: 50) {
+                    nodes { path location { start { line } } annotationLevel title message }
+                  }
+                }
               }
             }
           }
@@ -309,7 +338,11 @@ const MONITOR_COMMIT_QUERY = `query MonitorCommit($owner: String!, $repo: String
             status
             app { name slug }
             checkRuns(last: 10) {
-              nodes { name conclusion status }
+              nodes { name conclusion status
+                annotations(first: 50) {
+                  nodes { path location { start { line } } annotationLevel title message }
+                }
+              }
             }
           }
         }
@@ -581,6 +614,9 @@ type PRStatus struct {
 	ReviewDecision   string        `json:"review_decision,omitempty"`
 	ReviewAuthor     string        `json:"review_author,omitempty"`
 	LastCommit       CommitSummary `json:"last_commit"`
+	// CheckAnnotations holds the combined annotations from all completed
+	// check runs (filtered to WARNING + FAILURE levels).
+	CheckAnnotations []AnnotationSummary `json:"check_annotations,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -611,6 +647,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		FailingChecks:     failingChecks(pr),
 		PendingChecks:     pendingChecks(pr),
 		SuccessfulChecks:  successfulChecks(pr),
+		CheckAnnotations:  extractAnnotations(pr),
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {
@@ -721,6 +758,50 @@ func suiteName(s *CheckSuite) string {
 		return s.App.Name
 	}
 	return s.App.Slug
+}
+
+// extractAnnotations collects WARNING and FAILURE annotations from all
+// completed check runs across all check suites of the head commit.
+func extractAnnotations(pr *PullRequest) []AnnotationSummary {
+	var out []AnnotationSummary
+	seen := map[string]bool{}
+	for i := range pr.Commits.Nodes {
+		c := &pr.Commits.Nodes[i].Commit
+		for j := range c.CheckSuites.Nodes {
+			suite := &c.CheckSuites.Nodes[j]
+			for _, run := range suite.CheckRuns.Nodes {
+				for _, ann := range run.Annotations.Nodes {
+					if !isAnnotationLevel(ann.Level) {
+						continue
+					}
+					line := 0
+					if ann.Location.Start.Line != 0 {
+						line = ann.Location.Start.Line
+					}
+					s := AnnotationSummary{
+						CheckName: run.Name,
+						Path:      ann.Path,
+						Line:      line,
+						Level:     ann.Level,
+						Title:     ann.Title,
+						Message:   ann.Message,
+					}
+					key := annotationKeyNoLine(s)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, s)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// annotationKeyNoLine is a dedup key that excludes the line number, since
+// GitHub sometimes reports the same annotation on multiple lines.
+func annotationKeyNoLine(a AnnotationSummary) string {
+	return a.CheckName + "\x00" + a.Path + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
 }
 
 // failingChecks collects names of failing check suites/runs plus old-style

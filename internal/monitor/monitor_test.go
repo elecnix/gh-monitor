@@ -226,6 +226,92 @@ func TestSnapshot_NoChecksMeansNoSuccess(t *testing.T) {
 	assert.Empty(t, s.PendingChecks)
 }
 
+func TestSnapshot_CheckAnnotations(t *testing.T) {
+	mkAnn := func(path, level, title, message string, line int) Annotation {
+		return Annotation{
+			Path:    path,
+			Level:   level,
+			Title:   title,
+			Message: message,
+			Location: AnnotationLocation{
+				Start: struct {
+					Line int `json:"line"`
+				}{Line: line},
+			},
+		}
+	}
+
+	t.Run("extracts warning annotation", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "advisory"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "warn-only",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnn("src/main.go", "WARNING", "deprecated API", "Foo is deprecated, use Bar", 42),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		require.Len(t, s.CheckAnnotations, 1)
+		a := s.CheckAnnotations[0]
+		assert.Equal(t, "warn-only", a.CheckName)
+		assert.Equal(t, "src/main.go", a.Path)
+		assert.Equal(t, 42, a.Line)
+		assert.Equal(t, "WARNING", a.Level)
+	})
+
+	t.Run("filters notice-level annotations", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "build",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnn(".github/cache", "NOTICE", "cache miss", "...", 0),
+								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		require.Len(t, s.CheckAnnotations, 1)
+		assert.Equal(t, "WARNING", s.CheckAnnotations[0].Level)
+	})
+
+	t.Run("empty when no annotations", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid:         "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "CI"}}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.Empty(t, s.CheckAnnotations)
+	})
+}
+
 func TestSnapshot_ReviewDecision(t *testing.T) {
 	t.Run("latest non-pending", func(t *testing.T) {
 		pr := &PullRequest{Reviews: ReviewNodes{Nodes: []Review{mkReview("APPROVED", "carol")}}}
