@@ -104,6 +104,41 @@ out of the command's stdout, and emits e.g.
 When the command wasn't a `gh pr create` (or created no PR) the pipeline prints
 nothing and the hook is a no-op.
 
+## Auto-start on `gh issue create`
+
+To be nudged to start a monitor the moment you open an issue, add a Claude Code
+[`PostToolUse` hook](https://docs.claude.com/en/docs/claude-code/hooks) that
+watches `Bash` invocations, and when one is a `gh issue create`, extracts the
+created issue URL from the command output and prints a reminder.
+
+Add this hook alongside the `gh pr create` hook in `~/.claude/settings.json`
+(or a project `.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r 'select(.tool_name==\"Bash\" and (.tool_input.command | test(\"gh issue create\"))) | .tool_response.stdout // \"\"' | grep -oE 'https://github\\.com/[^ ]+/issues/[0-9]+' | head -n1 | sed 's|^|Monitor this issue: gh monitor |'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The one-liner reads the hook's JSON payload on stdin: it fires only for a `Bash`
+call whose command contains `gh issue create`, pulls the first `.../issues/<n>`
+URL out of the command's stdout, and emits e.g.
+`Monitor this issue: gh monitor https://github.com/owner/repo/issues/42`.
+When the command wasn't a `gh issue create` (or created no issue) the pipeline
+prints nothing and the hook is a no-op.
+
 ## Relationship to `await`
 
 The `await` command has been removed. Use these `monitor` equivalents:
