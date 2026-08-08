@@ -412,6 +412,36 @@ func TestReadinessReport_FormatDegraded(t *testing.T) {
 	s := report.Format()
 	assert.Contains(t, s, "staging=degraded")
 	assert.Contains(t, s, "graphql error")
+	// Degraded report must not render open=0 — that would be a falsehood.
+	assert.NotContains(t, s, "open=0")
+	assert.Contains(t, s, "open=?")
+	assert.Contains(t, s, "ready=?")
+	assert.Contains(t, s, "not-ready=?")
+	assert.Contains(t, s, "others=?")
+	// Degraded report must not present empty buckets as a result.
+	assert.NotContains(t, s, "ready=[]")
+	assert.NotContains(t, s, "not-ready=[]")
+	assert.NotContains(t, s, "others=[]")
+}
+
+func TestReadinessReport_FormatZeroOpen(t *testing.T) {
+	// A genuine zero-open-PRs repo must still render as a real zero,
+	// distinguishable from the degraded case (open=?).
+	report := &ReadinessReport{
+		Owner:  "octocat",
+		Repo:   "empty-repo",
+		Open:   0,
+		Viewer: "viewer",
+	}
+	s := report.Format()
+	assert.Contains(t, s, "staging=success")
+	assert.Contains(t, s, "open=0")
+	assert.Contains(t, s, "ready=[]")
+	assert.Contains(t, s, "not-ready=[]")
+	assert.Contains(t, s, "others=[]")
+	// Must NOT contain degraded markers.
+	assert.NotContains(t, s, "open=?")
+	assert.NotContains(t, s, "staging=degraded")
 }
 
 func TestReadinessReport_Reconcile(t *testing.T) {

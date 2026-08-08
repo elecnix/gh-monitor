@@ -370,9 +370,15 @@ func (r *ReadinessReport) Format() string {
 			b.WriteString(truncateDegradedMsg(r.DegradedMessage, 60))
 			b.WriteString(")")
 		}
-	} else {
-		b.WriteString("staging=success")
+		// Degraded: counts are unavailable — never render them as numbers.
+		b.WriteString(" open=? ready=? not-ready=? others=?")
+		if len(r.Unknown) > 0 {
+			b.WriteString(" unknown=?")
+		}
+		return b.String()
 	}
+
+	b.WriteString("staging=success")
 
 	fmt.Fprintf(&b, " open=%d", r.Open)
 
