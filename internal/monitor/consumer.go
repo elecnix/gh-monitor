@@ -25,6 +25,15 @@ func NewPRConsumer(opts RunOptions) *PRConsumer {
 // this consumer. It drives idleInterval's backoff.
 func (c *PRConsumer) NoChange() int { return c.noChange }
 
+// RestoreBaseline sets the consumer's baseline to a previously-stored snapshot
+// so the next Consume call diffs from that restored baseline instead of an
+// empty one. This is the resume path for named instances (issue #32): a restart
+// delivers only what changed since the stored snapshot, rather than replaying
+// the full backlog or silently missing the gap.
+func (c *PRConsumer) RestoreBaseline(snapshot *PRStatus) {
+	c.prev = snapshot
+}
+
 // Consume diffs curr against the consumer's baseline and invokes emit for
 // every genuinely-new change, mirroring runPR's per-poll behaviour. It returns
 // terminal=true when the PR is merged or closed (the caller should stop

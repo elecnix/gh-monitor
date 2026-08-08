@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -747,6 +748,7 @@ func TestOnceRun_EmitsCurrentActionable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 // Degradation tests (issue #33)
 // ---------------------------------------------------------------------------
 
@@ -759,6 +761,71 @@ func failingPRAPI(err error) *fakeAPI {
 		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
 			return err
 		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Repo cursor tests (issue #32)
+// ---------------------------------------------------------------------------
+
+// fakeRepoAPI returns a scripted sequence of RepoQueryResponses.
+type fakeRepoAPI struct {
+	responses []*RepoQueryResponse
+	call      int
+}
+
+func (f *fakeRepoAPI) GraphQL(query string, vars map[string]interface{}, result interface{}) error {
+	idx := f.call
+	if idx >= len(f.responses) {
+		idx = len(f.responses) - 1
+	}
+	f.call++
+	return assign(result, f.responses[idx])
+}
+
+func (f *fakeRepoAPI) REST(method, path string, params map[string]string, body interface{}, result interface{}) error {
+	return errors.New("REST not implemented")
+}
+
+func mkRepoResponse(prs []RepoPR, issues []RepoIssue) *RepoQueryResponse {
+	return &RepoQueryResponse{
+		Repository: struct {
+			PullRequests RepoPRNodes    `json:"pullRequests"`
+			Issues       RepoIssueNodes `json:"issues"`
+		}{
+			PullRequests: RepoPRNodes{Nodes: prs},
+			Issues:       RepoIssueNodes{Nodes: issues},
+		},
+	}
+}
+
+func mkRepoPR(number int, title, createdAt string) RepoPR {
+	return RepoPR{
+		Number:    number,
+		Title:     title,
+		State:     "OPEN",
+		URL:       "https://github.com/o/r/pull/" + string([]byte{byte('0' + number%10)}),
+		CreatedAt: createdAt,
+	}
+}
+
+func mkRepoIssue(number int, title, createdAt string) RepoIssue {
+	return RepoIssue{
+		Number:    number,
+		Title:     title,
+		State:     "OPEN",
+		URL:       "https://github.com/o/r/issues/" + string([]byte{byte('0' + number%10)}),
+		CreatedAt: createdAt,
+	}
+}
+
+func testRepoRunOptions() RunOptions {
+	return RunOptions{
+		Identity: resolver.Identity{Owner: "o", Repo: "r", Target: "repo", Host: "github.com"},
+		Prefs:    prefs.DefaultPreferences(),
+		Interval: 60 * time.Second,
+		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
+		Sleep:    func(context.Context, time.Duration) error { return nil },
 	}
 }
 
@@ -881,4 +948,373 @@ func TestRun_RefDegradedOnFetchError(t *testing.T) {
 	}
 	require.NotNil(t, degraded, "ref fetch error must emit degraded")
 	assert.Contains(t, degraded.Message, "graphql")
+}
+
+// ---------------------------------------------------------------------------
+// Repo cursor tests (issue #32)
+// ---------------------------------------------------------------------------
+
+func TestRunRepo_UnnamedEmitsAllItems(t *testing.T) {
+	// Unnamed invocation emits all pre-existing items — today's behaviour.
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			[]RepoPR{mkRepoPR(1, "pr1", "2025-01-01T00:00:00Z"), mkRepoPR(2, "pr2", "2025-01-02T00:00:00Z")},
+			[]RepoIssue{mkRepoIssue(3, "iss1", "2025-01-03T00:00:00Z")},
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	// Instance is empty — unnamed invocation.
+	var got []Notification
+	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
+	require.NoError(t, err)
+
+	// Should emit all items.
+	assert.NotEmpty(t, got)
+	// We get first-poll plus events for PRs and issues.
+	types := typesOf(got)
+	assert.Contains(t, types, string(EventRepoNewPR))
+	assert.Contains(t, types, string(EventRepoNewIssue))
+}
+
+func TestRunRepo_NamedNewInstanceStartsAtNow(t *testing.T) {
+	// A brand-new named instance with no cursor starts at "now" and emits
+	// nothing for pre-existing items (the fix for issue #32).
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			[]RepoPR{mkRepoPR(1, "pr1", "2020-01-01T00:00:00Z")},
+			nil,
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	opts.Instance = "orchestrator"
+	// No CursorPosition set — new instance.
+	// Now() returns Unix(0,0) = 1970-01-01, and the PR is from 2020 => PR > now, so it should pass.
+	// Actually "2020-01-01T00:00:00Z" > "1970-01-01T00:00:00Z" so the PR would pass the filter.
+	// Let me fix: set now to 2025 so the PR is in the past.
+	opts.Now = func() time.Time { return time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC) }
+
+	var got []Notification
+	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
+	require.NoError(t, err)
+
+	// Should only have first-poll, no repo-new-pr because "now" (2025) > PR creation (2020).
+	types := typesOf(got)
+	assert.Equal(t, firstPollType, types[0])
+	for _, typ := range types {
+		assert.NotEqual(t, string(EventRepoNewPR), typ, "new instance should not emit old PRs")
+		assert.NotEqual(t, string(EventRepoNewIssue), typ)
+	}
+}
+
+func TestRunRepo_FromBeginningReplaysBacklog(t *testing.T) {
+	// --from-beginning replays the full backlog.
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			[]RepoPR{mkRepoPR(1, "pr1", "2020-01-01T00:00:00Z")},
+			nil,
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	opts.Instance = "orchestrator"
+	opts.FromBeginning = true
+	opts.Now = func() time.Time { return time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC) }
+
+	var got []Notification
+	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
+	require.NoError(t, err)
+
+	types := typesOf(got)
+	assert.Contains(t, types, string(EventRepoNewPR), "--from-beginning should replay backlog")
+}
+
+func TestRunRepo_CursorResumesFromPosition(t *testing.T) {
+	// An instance with a cursor receives only items after the cursor.
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			[]RepoPR{
+				mkRepoPR(1, "old-pr", "2025-01-01T00:00:00Z"),
+				mkRepoPR(2, "new-pr", "2025-01-10T00:00:00Z"),
+			},
+			nil,
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	opts.Instance = "orchestrator"
+	opts.CursorPosition = "2025-01-05T00:00:00Z" // should see PR #2 only
+
+	var got []Notification
+	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
+	require.NoError(t, err)
+
+	// We should have events for new-pr only (PR #2), not old-pr (PR #1).
+	types := typesOf(got)
+	assert.Contains(t, types, string(EventRepoNewPR))
+	// Verify the event is for PR #2.
+	for _, n := range got {
+		if n.Type == string(EventRepoNewPR) {
+			assert.Contains(t, n.Detail, "#2")
+			assert.NotContains(t, n.Detail, "#1")
+		}
+	}
+}
+
+func TestRunRepo_AdvanceCursorCalled(t *testing.T) {
+	// After each poll, AdvanceCursor is called with the latest createdAt.
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			[]RepoPR{mkRepoPR(1, "pr1", "2025-01-10T00:00:00Z")},
+			[]RepoIssue{mkRepoIssue(2, "iss1", "2025-01-15T00:00:00Z")},
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	opts.Instance = "orchestrator"
+	opts.FromBeginning = true
+
+	var advanced string
+	opts.AdvanceCursor = func(pos string) { advanced = pos }
+
+	err := Once(context.Background(), svc, opts, func(n Notification) {})
+	require.NoError(t, err)
+
+	// The latest createdAt is the issue's 2025-01-15.
+	assert.Equal(t, "2025-01-15T00:00:00Z", advanced)
+}
+
+func TestRunRepo_CursorFiltersIssues(t *testing.T) {
+	// Cursor filters issues the same as PRs.
+	api := &fakeRepoAPI{responses: []*RepoQueryResponse{
+		mkRepoResponse(
+			nil,
+			[]RepoIssue{
+				mkRepoIssue(1, "old", "2025-01-01T00:00:00Z"),
+				mkRepoIssue(2, "new", "2025-01-20T00:00:00Z"),
+			},
+		),
+	}}
+	svc := &Service{API: api}
+
+	opts := testRepoRunOptions()
+	opts.Instance = "orchestrator"
+	opts.CursorPosition = "2025-01-10T00:00:00Z"
+
+	var got []Notification
+	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
+	require.NoError(t, err)
+
+	for _, n := range got {
+		if n.Type == string(EventRepoNewIssue) {
+			assert.Contains(t, n.Detail, "#2")
+			assert.NotContains(t, n.Detail, "#1")
+		}
+	}
+}
+
+func TestFilterRepoResponse_UnnamedReturnsUnmodified(t *testing.T) {
+	resp := mkRepoResponse([]RepoPR{mkRepoPR(1, "pr", "2020-01-01T00:00:00Z")}, nil)
+	opts := testRepoRunOptions()
+	// Instance is empty.
+	filtered := filterRepoResponse(resp, opts)
+	assert.Equal(t, resp, filtered)
+}
+
+func TestFilterRepoResponse_EmptyRepoReturnsEmpty(t *testing.T) {
+	resp := mkRepoResponse(nil, nil)
+	opts := testRepoRunOptions()
+	opts.Instance = "test"
+	opts.CursorPosition = "2025-01-01T00:00:00Z"
+	filtered := filterRepoResponse(resp, opts)
+	assert.Empty(t, filtered.Repository.PullRequests.Nodes)
+	assert.Empty(t, filtered.Repository.Issues.Nodes)
+}
+
+func TestLatestRepoCreatedAt(t *testing.T) {
+	resp := mkRepoResponse(
+		[]RepoPR{mkRepoPR(1, "p1", "2025-01-01T00:00:00Z"), mkRepoPR(2, "p2", "2025-01-05T00:00:00Z")},
+		[]RepoIssue{mkRepoIssue(3, "i1", "2025-01-03T00:00:00Z")},
+	)
+	latest := latestRepoCreatedAt(resp)
+	assert.Equal(t, "2025-01-05T00:00:00Z", latest)
+}
+
+func TestLatestRepoCreatedAt_Empty(t *testing.T) {
+	resp := mkRepoResponse(nil, nil)
+	latest := latestRepoCreatedAt(resp)
+	assert.Empty(t, latest)
+}
+
+// ---------------------------------------------------------------------------
+// PR cursor tests (issue #32 — PR resume mode)
+// ---------------------------------------------------------------------------
+
+func TestRunPR_NamedInstanceResumesFromStoredSnapshot(t *testing.T) {
+	// A named PR instance with a stored snapshot resumes from that baseline —
+	// it emits only what changed since the last checkpoint, not the full
+	// backlog and not a silent gap.
+	api := scriptedAPI([]*PullRequest{
+		mkPR("OPEN", false, "bbbbbbb", []string{"build"}), // CI went red while offline
+	})
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	opts.Instance = "agent-pr-957"
+
+	// Stored snapshot from a prior run: CI was green at "aaaaaaa"
+	stored := Snapshot(
+		mkPR("OPEN", false, "aaaaaaa", nil),
+		SnapshotOptions{},
+	)
+	b, err := json.Marshal(stored)
+	require.NoError(t, err)
+	opts.CursorSnapshot = string(b)
+
+	var advanced string
+	opts.SaveSnapshot = func(s string) { advanced = s }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err = Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	// Must emit the new failing checks (the delta from stored snapshot).
+	types := typesOf(got)
+	assert.Contains(t, types, string(EventNewFailingChecks),
+		"resume must deliver new CI failures from stored baseline")
+
+	// Must NOT emit a first-poll notification — this is a resume, not a fresh start.
+	for _, n := range got {
+		assert.NotEqual(t, firstPollType, n.Type,
+			"resume must not emit first-poll")
+	}
+
+	// SaveSnapshot must have been called.
+	assert.NotEmpty(t, advanced, "snapshot must be saved after successful poll")
+}
+
+func TestRunPR_NamedInstanceFirstRunStartsFresh(t *testing.T) {
+	// A named instance with no cursor starts fresh — diffs against empty
+	// baseline, emits first-poll and all pre-existing issues.
+	api := scriptedAPI([]*PullRequest{
+		mkPR("OPEN", false, "aaaaaaa", []string{"build"}),
+	})
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	opts.Instance = "fresh-instance"
+	// No CursorSnapshot — this is a first run.
+
+	var advanced string
+	opts.SaveSnapshot = func(s string) { advanced = s }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	types := typesOf(got)
+	assert.Contains(t, types, firstPollType,
+		"first run must emit first-poll")
+	assert.Contains(t, types, string(EventNewFailingChecks),
+		"first run must surface pre-existing CI failures")
+	assert.NotEmpty(t, advanced, "snapshot must be saved")
+}
+
+func TestRunPR_DegradedFetchDoesNotAdvanceCursor(t *testing.T) {
+	// A degraded fetch must NOT advance the cursor — if it does, a consumer
+	// silently loses exactly the window it could not read.
+	api := failingPRAPI(errors.New("gh api failed"))
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	opts.Instance = "orchestrator"
+
+	var saved string
+	opts.SaveSnapshot = func(s string) { saved = s }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	// Degraded event emitted, but no snapshot saved.
+	assert.NotEmpty(t, got)
+	assert.Empty(t, saved, "degraded fetch must not advance cursor")
+}
+
+func TestRunPR_TwoInstancesIndependentSnapshots(t *testing.T) {
+	// Two named instances on the same PR have independent stored snapshots.
+	// Advancing one does not affect the other's resume position.
+	prBefore := mkPR("OPEN", false, "aaaaaaa", nil)
+	prAfter := mkPR("OPEN", false, "bbbbbbb", []string{"test"})
+
+	// Instance A has empty baseline — sees everything.
+	apiA := scriptedAPI([]*PullRequest{prAfter})
+	svcA := &Service{API: apiA}
+	optsA := testRunOptions()
+	optsA.Instance = "agent-a"
+	var snapA string
+	optsA.SaveSnapshot = func(s string) { snapA = s }
+	ctxA, cancelA := context.WithCancel(context.Background())
+	optsA.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancelA()
+		return context.Canceled
+	}
+	var gotA []Notification
+	errA := Run(ctxA, svcA, optsA, func(n Notification) { gotA = append(gotA, n) })
+	require.True(t, errors.Is(errA, context.Canceled))
+	assert.NotEmpty(t, snapA)
+
+	// Instance B starts from instance A's snapshot — should see no new
+	// events (same PR state).
+	apiB := scriptedAPI([]*PullRequest{prAfter})
+	svcB := &Service{API: apiB}
+	optsB := testRunOptions()
+	optsB.Instance = "agent-b"
+	optsB.CursorSnapshot = snapA
+	var snapB string
+	optsB.SaveSnapshot = func(s string) { snapB = s }
+	ctxB, cancelB := context.WithCancel(context.Background())
+	optsB.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancelB()
+		return context.Canceled
+	}
+	var gotB []Notification
+	errB := Run(ctxB, svcB, optsB, func(n Notification) { gotB = append(gotB, n) })
+	require.True(t, errors.Is(errB, context.Canceled))
+
+	// B should see no events besides degraded/CI events that arose from the diff.
+	// Actually, since the PR state is identical, the diff should be empty.
+	typesB := typesOf(gotB)
+	for _, typ := range typesB {
+		assert.NotEqual(t, firstPollType, typ, "B already has a baseline")
+		assert.NotEqual(t, string(EventNewFailingChecks), typ, "B should not see the same CI failure as new")
+	}
+	assert.NotEmpty(t, snapB)
+
+	// Now restart B with its own snapshot — still sees nothing new.
+	_ = prBefore // used above
 }

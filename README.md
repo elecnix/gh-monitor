@@ -65,6 +65,8 @@ npx skills add elecnix/gh-monitor
 | `threads resolve` / `unresolve` | Resolves or unresolves review threads                                      |
 | `prefs`                         | View and edit notification preference templates (get/set/reset/path)       |
 | `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch |
+| `instances list`                | List all named instance cursors                                            |
+| `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                  |
 
 ### Filters
 
@@ -278,6 +280,32 @@ gh monitor -R owner/repo --timeout 3600
 ```
 
 Each event carries the item's number, title, author, and URL in the `repo_items` array. Templates for `repo-new-pr` and `repo-new-issue` are configurable via `prefs`.
+
+#### Named instances with resumable cursors
+
+`--instance <name>` enables a per-instance cursor so a restart resumes from where it left off. For **repo targets**, the cursor is an item-creation timestamp — only items created after the cursor are emitted. For **PR and issue targets**, the cursor stores the last-delivered snapshot, so a restart re-diffs from that stored baseline and delivers everything that changed while offline (CI going red, reviews landing, comments arriving).
+
+Without a named instance, every restart replays the full backlog as "New PR" — correct on first run but a flood on every subsequent restart.
+
+```sh
+# Named instances: each maintains its own independent cursor
+gh monitor -R owner/repo --instance orchestrator    # resumes from its cursor
+gh monitor -R owner/repo --instance agent-pr-957    # independent cursor
+gh monitor -R owner/repo 42 --instance agent-pr-42  # PR monitoring with resume
+
+# A brand-new instance starts at "now" — no pre-existing items are emitted
+gh monitor -R owner/repo --instance fresh-watcher
+
+# Opt into the backlog with --from-beginning
+gh monitor -R owner/repo --instance fresh-watcher --from-beginning
+
+# Manage cursors: list and reset
+gh monitor instances list                # id, repo, cursor position, last seen
+gh monitor instances reset orchestrator  # replay from the beginning next run
+gh monitor instances reset --all         # delete every cursor
+```
+
+Cursors are independent — advancing one instance's cursor never affects another. The unnamed invocation (no `--instance`) keeps today's stateless behaviour exactly. Cursor files live under `~/.config/gh-monitor/instances/` and are written atomically (temp file + rename) so a crash mid-write leaves the previous state intact. Two processes using the same instance name observe last-writer-wins semantics.
 
 ### Shared poller daemon
 

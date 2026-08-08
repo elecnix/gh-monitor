@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -155,6 +156,41 @@ type RunOptions struct {
 	// ParseAnnotationLevels to validate caller input.
 	AnnotationLevels *AnnotationLevels
 
+	// Instance is the named-instance identifier (issue #32). When set, the
+	// monitor uses a per-instance cursor to filter out items it has already
+	// seen across restarts. An empty string (the default) preserves today's
+	// stateless behaviour.
+	Instance string
+
+	// FromBeginning replays the full backlog on startup — the cursor is
+	// ignored. When false and no cursor exists, a new instance starts at
+	// "now" (no pre-existing items are emitted).
+	FromBeginning bool
+
+	// CursorPosition is the ISO-8601 createdAt threshold. When non-empty and
+	// FromBeginning is false, items with createdAt <= CursorPosition are
+	// suppressed. It is set by the caller from the cursor store and advanced
+	// by the run loop via AdvanceCursor.
+	CursorPosition string
+
+	// AdvanceCursor is called after each poll with the latest createdAt among
+	// items that were emitted (or would have been emitted, absent filtering).
+	// The caller persists this to the cursor store so a restart resumes from
+	// this position. It is a no-op when nil.
+	AdvanceCursor func(position string)
+
+	// CursorSnapshot is the JSON-serialised last-known PRStatus or IssueStatus,
+	// loaded from the per-instance cursor store. When non-empty, the consumer
+	// starts from this stored baseline instead of an empty one, so a restart
+	// delivers everything that changed while offline (issue #32 PR mode).
+	CursorSnapshot string
+
+	// SaveSnapshot is called after each successful poll with a JSON-serialised
+	// PRStatus or IssueStatus. The caller persists this to the cursor store.
+	// It is NOT called on degraded (error) fetches — a cursor must not advance
+	// past events that were never actually read.
+	SaveSnapshot func(snapshotJSON string)
+
 	// Now and Sleep are injectable for tests. Now defaults to time.Now; Sleep
 	// defaults to a context-aware timer. Sleep must return the context error
 	// when the context is cancelled.
@@ -264,6 +300,17 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 	}
 
 	c := NewPRConsumer(opts)
+
+	// Restore the stored baseline for a named instance (issue #32).
+	// The first Consume diffs from this baseline instead of an empty one,
+	// so everything that changed while offline is delivered.
+	if opts.CursorSnapshot != "" {
+		var stored PRStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			c.RestoreBaseline(&stored)
+		}
+	}
+
 	errBackoff := time.Duration(0)
 
 	snapOpts := SnapshotOptions{
@@ -301,8 +348,10 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 
 		curr := Snapshot(resp.Repository.PullRequest, snapOpts)
 		if c.Consume(curr, emit) {
+			savePRSnapshot(opts, curr)
 			return nil
 		}
+		savePRSnapshot(opts, curr)
 
 		d := idleInterval(base, c.noChange)
 		if !deadline.IsZero() {
@@ -340,17 +389,30 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	}
 
 	curr := Snapshot(resp.Repository.PullRequest, snapOpts)
-	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
-	for _, ev := range Diff(&PRStatus{}, curr) {
-		if ev.Type == EventNewCommit {
+
+	// Restore stored baseline for named instance one-shot (issue #32).
+	baseline := &PRStatus{}
+	if opts.CursorSnapshot != "" {
+		var stored PRStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			baseline = &stored
+		}
+	}
+	isFirstPoll := opts.CursorSnapshot == ""
+	if isFirstPoll {
+		emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
+	}
+	for _, ev := range Diff(baseline, curr) {
+		if isFirstPoll && ev.Type == EventNewCommit {
 			continue // agent just pushed it
 		}
 		emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
 	}
 	// ci-all-green never fires against an empty baseline — emit it explicitly.
-	if ciAllGreen(curr) {
+	if isFirstPoll && ciAllGreen(curr) {
 		emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
 	}
+	savePRSnapshot(opts, curr)
 	return nil
 }
 
@@ -519,6 +581,15 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 	}
 
 	var prev *IssueStatus
+
+	// Restore the stored baseline for a named instance (issue #32).
+	if opts.CursorSnapshot != "" {
+		var stored IssueStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			prev = &stored
+		}
+	}
+
 	noChange := 0
 	errBackoff := time.Duration(0)
 
@@ -570,6 +641,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 			noChange = 0
 		}
 		prev = curr
+		saveIssueSnapshot(opts, curr)
 
 		if curr.State == "CLOSED" {
 			if firstPoll && !terminalEmitted {
@@ -600,10 +672,23 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Not
 		return err
 	}
 	curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
-	emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
-	for _, ev := range DiffIssues(&IssueStatus{}, curr) {
+
+	// Restore stored baseline for named instance one-shot (issue #32).
+	baseline := &IssueStatus{}
+	isFirstPoll := opts.CursorSnapshot == ""
+	if !isFirstPoll {
+		var stored IssueStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			baseline = &stored
+		}
+	}
+	if isFirstPoll {
+		emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
+	}
+	for _, ev := range DiffIssues(baseline, curr) {
 		emit(renderNotificationIssue(opts, curr, string(ev.Type), ev))
 	}
+	saveIssueSnapshot(opts, curr)
 	return nil
 }
 
@@ -645,6 +730,33 @@ func nextErrBackoff(cur, base time.Duration) time.Duration {
 		d = maxErrBackoff
 	}
 	return d
+}
+
+// savePRSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
+// when SaveSnapshot is nil (unnamed invocation or target not supporting
+// snapshots). Must only be called after a successful fetch.
+func savePRSnapshot(opts RunOptions, curr *PRStatus) {
+	if opts.SaveSnapshot == nil {
+		return
+	}
+	b, err := json.Marshal(curr)
+	if err != nil {
+		return
+	}
+	opts.SaveSnapshot(string(b))
+}
+
+// saveIssueSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
+// when SaveSnapshot is nil.
+func saveIssueSnapshot(opts RunOptions, curr *IssueStatus) {
+	if opts.SaveSnapshot == nil {
+		return
+	}
+	b, err := json.Marshal(curr)
+	if err != nil {
+		return
+	}
+	opts.SaveSnapshot(string(b))
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1225,10 @@ func buildVarsRun(id resolver.Identity, status *RunStatus, ev Event, interval ti
 // runRepo polls a repository for new PRs and issues, emitting events for each
 // new item. Unlike PR/issue targets, repo targets never auto-stop — they run
 // until cancelled or timed out.
+//
+// When opts.Instance is set, the loop uses the per-instance cursor to filter
+// out items it has already seen across restarts. The cursor is advanced after
+// each poll via opts.AdvanceCursor.
 func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
 	base := opts.Interval
 	if base <= 0 {
@@ -1152,11 +1268,15 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		}
 		errBackoff = 0
 
-		curr := SnapshotRepo(resp)
+		// Filter by cursor position when running as a named instance.
+		filtered := filterRepoResponse(resp, opts)
+
+		curr := SnapshotRepo(filtered)
 
 		firstPoll := prev == nil
 		// On the first poll, diff against an empty baseline so all pre-existing
-		// PRs and issues are surfaced immediately.
+		// PRs and issues are surfaced immediately — but only those that passed
+		// the cursor filter (a new instance with no cursor shows nothing).
 		compare := prev
 		if firstPoll {
 			compare = &RepoStatus{}
@@ -1172,6 +1292,16 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 			noChange = 0
 		}
 		prev = curr
+
+		// Advance the cursor to the latest createdAt among ALL items in the
+		// unfiltered response — not just those we emitted. This ensures a
+		// restart never misses items, even when the current poll was filtered
+		// to empty by an event allowlist.
+		if opts.AdvanceCursor != nil {
+			if latest := latestRepoCreatedAt(resp); latest != "" {
+				opts.AdvanceCursor(latest)
+			}
+		}
 
 		d := idleInterval(base, noChange)
 		if !deadline.IsZero() {
@@ -1194,12 +1324,96 @@ func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 	if err != nil {
 		return err
 	}
-	curr := SnapshotRepo(resp)
+	filtered := filterRepoResponse(resp, opts)
+	curr := SnapshotRepo(filtered)
 	emit(renderNotificationRepo(opts, curr, firstPollType, Event{}))
 	for _, ev := range DiffRepo(&RepoStatus{}, curr) {
 		emit(renderNotificationRepo(opts, curr, string(ev.Type), ev))
 	}
+	if opts.AdvanceCursor != nil {
+		if latest := latestRepoCreatedAt(resp); latest != "" {
+			opts.AdvanceCursor(latest)
+		}
+	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Cursor-aware repo filtering (issue #32)
+// ---------------------------------------------------------------------------
+
+// filterRepoResponse returns a copy of the response with items created at or
+// before the cursor position suppressed. When opts.Instance is empty (unnamed
+// invocation), the response is returned unmodified — today's stateless
+// behaviour is preserved exactly.
+//
+// When opts.FromBeginning is true, the cursor is ignored and everything is
+// emitted — the caller explicitly asked for the backlog.
+//
+// When opts.CursorPosition is empty and the instance is named but has no
+// cursor yet, the function clips to "now" (the current time), so a fresh
+// instance emits nothing for pre-existing items. This is the key fix for
+// issue #32: spawning a new watcher on a busy repo should not flood the
+// operator with 13 "New PR" notifications for PRs that have been open for
+// weeks.
+func filterRepoResponse(resp *RepoQueryResponse, opts RunOptions) *RepoQueryResponse {
+	if opts.Instance == "" {
+		return resp // unnamed — stateless behaviour
+	}
+
+	threshold := opts.CursorPosition
+	if threshold == "" && !opts.FromBeginning {
+		// New instance with no cursor: start at "now".
+		threshold = opts.now().UTC().Format(time.RFC3339)
+	}
+	if threshold == "" {
+		// FromBeginning with no cursor: emit everything.
+		return resp
+	}
+
+	// Shallow copy and filter nodes.
+	filtered := *resp
+	filtered.Repository.PullRequests.Nodes = filterRepoPRs(resp.Repository.PullRequests.Nodes, threshold)
+	filtered.Repository.Issues.Nodes = filterRepoIssues(resp.Repository.Issues.Nodes, threshold)
+	return &filtered
+}
+
+func filterRepoPRs(nodes []RepoPR, threshold string) []RepoPR {
+	out := make([]RepoPR, 0, len(nodes))
+	for _, p := range nodes {
+		if p.CreatedAt > threshold {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func filterRepoIssues(nodes []RepoIssue, threshold string) []RepoIssue {
+	out := make([]RepoIssue, 0, len(nodes))
+	for _, iss := range nodes {
+		if iss.CreatedAt > threshold {
+			out = append(out, iss)
+		}
+	}
+	return out
+}
+
+// latestRepoCreatedAt returns the most recent CreatedAt timestamp among all
+// PRs and issues in the response. It returns "" when the response has no
+// items, so the caller leaves the cursor unchanged.
+func latestRepoCreatedAt(resp *RepoQueryResponse) string {
+	var latest string
+	for _, p := range resp.Repository.PullRequests.Nodes {
+		if p.CreatedAt > latest {
+			latest = p.CreatedAt
+		}
+	}
+	for _, iss := range resp.Repository.Issues.Nodes {
+		if iss.CreatedAt > latest {
+			latest = iss.CreatedAt
+		}
+	}
+	return latest
 }
 
 // ---------------------------------------------------------------------------
