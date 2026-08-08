@@ -271,7 +271,8 @@ func autostartDaemon(ctx context.Context, socket string, interval time.Duration)
 
 // spawnDaemon re-executes the current binary as a detached `gh monitor daemon`
 // that outlives the client. Stdio is redirected to /dev/null and the process
-// becomes its own session leader (Setsid) so it survives the client exiting.
+// is detached from the parent terminal (setsid on Unix, CREATE_NEW_PROCESS_GROUP
+// | DETACHED_PROCESS on Windows) so it survives the client exiting.
 func spawnDaemon(socket string, interval time.Duration) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -287,7 +288,7 @@ func spawnDaemon(socket string, interval time.Duration) error {
 	cmd.Stdin = devnull
 	cmd.Stdout = devnull
 	cmd.Stderr = devnull
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn daemon: %w", err)
 	}
