@@ -612,6 +612,8 @@ func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Even
 		}
 	case EventReviewApproved, EventReviewChangesRequested, EventReviewDismissed:
 		n.ReviewAuthor = ev.ReviewAuthor
+	case EventCheckAnnotations:
+		n.Detail = annotationsDetail(ev.Annotations)
 	}
 	return n
 }
@@ -648,6 +650,20 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 	}
 	if ev.Commit != nil {
 		setCommitVars(vars, host, id, *ev.Commit)
+	}
+
+	// Annotation vars for check-annotations events.
+	if len(ev.Annotations) > 0 {
+		vars["annotationCount"] = strconv.Itoa(len(ev.Annotations))
+		names := make([]string, 0, len(ev.Annotations))
+		seen := map[string]bool{}
+		for _, a := range ev.Annotations {
+			if !seen[a.CheckName] {
+				seen[a.CheckName] = true
+				names = append(names, a.CheckName)
+			}
+		}
+		vars["annotationCheckNames"] = strings.Join(names, ", ")
 	}
 
 	return vars

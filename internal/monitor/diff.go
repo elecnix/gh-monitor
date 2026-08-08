@@ -1,5 +1,7 @@
 package monitor
 
+import "strconv"
+
 // EventType is a stable identifier for a kind of detected change.
 type EventType string
 
@@ -28,8 +30,9 @@ const (
 	EventRunCompleted  EventType = "run-completed"
 
 	// Repo monitoring events
-	EventRepoNewPR    EventType = "repo-new-pr"
-	EventRepoNewIssue EventType = "repo-new-issue"
+	EventRepoNewPR        EventType = "repo-new-pr"
+	EventRepoNewIssue     EventType = "repo-new-issue"
+	EventCheckAnnotations EventType = "check-annotations"
 )
 
 // Event describes a single genuinely-new change between two snapshots. Only the
@@ -63,6 +66,9 @@ type Event struct {
 
 	// RepoItems holds the new PRs or issues (EventRepoNewPR, EventRepoNewIssue).
 	RepoItems []RepoItemSummary `json:"repo_items,omitempty"`
+
+	// Annotations holds the check-run annotations (EventCheckAnnotations).
+	Annotations []AnnotationSummary `json:"annotations,omitempty"`
 }
 
 // Diff returns the genuinely-new changes between prev and curr.
@@ -154,6 +160,11 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 		events = append(events, Event{Type: EventMerged})
 	} else if curr.State == "CLOSED" && prev.State != "CLOSED" {
 		events = append(events, Event{Type: EventClosed})
+	}
+
+	// New check-run annotations.
+	if newAnn := diffAnnotations(prev.CheckAnnotations, curr.CheckAnnotations); len(newAnn) > 0 {
+		events = append(events, Event{Type: EventCheckAnnotations, Annotations: newAnn})
 	}
 
 	return events
@@ -370,4 +381,57 @@ func DiffRepo(prev, curr *RepoStatus) []Event {
 		}
 	}
 	return events
+}
+
+// ---------------------------------------------------------------------------
+// Annotation types and helpers
+// ---------------------------------------------------------------------------
+
+// AnnotationSummary is a distilled check-run annotation.
+type AnnotationSummary struct {
+	CheckName string `json:"check_name"`
+	Path      string `json:"path"`
+	Line      int    `json:"line"`
+	Level     string `json:"level"`
+	Title     string `json:"title"`
+	Message   string `json:"message"`
+}
+
+// annotationLevels are the annotation levels worth surfacing.
+// NOTICE is excluded by default: runners emit it for housekeeping (cache
+// misses, etc.) and it is pure noise.
+var annotationLevels = map[string]bool{
+	"WARNING": true,
+	"FAILURE": true,
+}
+
+// isAnnotationLevel reports whether the level is worth surfacing.
+func isAnnotationLevel(level string) bool {
+	return annotationLevels[level]
+}
+
+// diffAnnotations returns annotations in curr that are not in prev.
+// Annotations are matched by (check_name, path, line, level, title, message).
+// Only annotations whose level passes isAnnotationLevel are considered.
+func diffAnnotations(prev, curr []AnnotationSummary) []AnnotationSummary {
+	seen := make(map[string]bool, len(prev))
+	for _, a := range prev {
+		seen[annotationKey(a)] = true
+	}
+	var out []AnnotationSummary
+	for _, a := range curr {
+		if !isAnnotationLevel(a.Level) {
+			continue
+		}
+		if !seen[annotationKey(a)] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// annotationKey returns a stable dedup key for an annotation: check,
+// path, line, level, title, and message combined.
+func annotationKey(a AnnotationSummary) string {
+	return a.CheckName + "\x00" + a.Path + "\x00" + strconv.Itoa(a.Line) + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
 }

@@ -269,6 +269,142 @@ func TestDiffRetrigger(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Annotation tests
+// ---------------------------------------------------------------------------
+
+func TestDiff_CheckAnnotations(t *testing.T) {
+	t.Run("new annotations on completed check fire once", func(t *testing.T) {
+		prev := &PRStatus{
+			CheckAnnotations: nil,
+		}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "advisory", Path: "src/main.go", Line: 42, Level: "WARNING", Title: "use of deprecated API", Message: "Foo is deprecated, use Bar instead"},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e)
+		require.NotNil(t, e.Annotations)
+		require.Len(t, e.Annotations, 1)
+		a := e.Annotations[0]
+		assert.Equal(t, "advisory", a.CheckName)
+		assert.Equal(t, "src/main.go", a.Path)
+		assert.Equal(t, 42, a.Line)
+		assert.Equal(t, "WARNING", a.Level)
+		assert.Equal(t, "use of deprecated API", a.Title)
+		assert.Equal(t, "Foo is deprecated, use Bar instead", a.Message)
+	})
+
+	t.Run("unchanged annotations do not re-fire", func(t *testing.T) {
+		anns := []AnnotationSummary{
+			{CheckName: "advisory", Path: "src/main.go", Line: 42, Level: "WARNING", Title: "deprecated", Message: "..."},
+		}
+		prev := &PRStatus{CheckAnnotations: anns}
+		curr := &PRStatus{CheckAnnotations: anns}
+		assert.Nil(t, findEvent(Diff(prev, curr), EventCheckAnnotations))
+	})
+
+	t.Run("annotations fire independent of conclusion", func(t *testing.T) {
+		// A green check (SUCCESS) with annotations still emits.
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			FailingChecks: []string{},
+			PendingChecks: []string{},
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "advisory", Path: "x.go", Line: 1, Level: "WARNING", Title: "t", Message: "m"},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "annotations event must fire even when CI is green")
+		assert.Nil(t, findEvent(events, EventNewFailingChecks), "should not fire failing-checks for annotations")
+	})
+
+	t.Run("notice-level annotations are filtered by default", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "ci", Path: ".github/cache", Line: 0, Level: "NOTICE", Title: "cache miss", Message: "No cache found"},
+			},
+		}
+		// NOTICE-level annotations should not appear in the event.
+		events := Diff(prev, curr)
+		assert.Nil(t, findEvent(events, EventCheckAnnotations), "NOTICE-level annotations should be filtered out")
+	})
+
+	t.Run("failure-level annotations are included", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "security", Path: "auth.go", Line: 10, Level: "FAILURE", Title: "vuln", Message: "CVE-..."},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "FAILURE-level annotations should be included")
+		require.Len(t, e.Annotations, 1)
+		assert.Equal(t, "FAILURE", e.Annotations[0].Level)
+	})
+
+	t.Run("first-poll baseline is silent for annotations", func(t *testing.T) {
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "advisory", Path: "x.go", Line: 1, Level: "WARNING", Title: "t", Message: "m"},
+			},
+		}
+		assert.Empty(t, Diff(nil, curr))
+	})
+
+	t.Run("multiple annotations from different checks", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "advisory", Path: "a.go", Line: 1, Level: "WARNING", Title: "w1", Message: "m1"},
+				{CheckName: "lint", Path: "b.go", Line: 2, Level: "WARNING", Title: "w2", Message: "m2"},
+				{CheckName: "security", Path: "c.go", Line: 3, Level: "FAILURE", Title: "w3", Message: "m3"},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e)
+		require.Len(t, e.Annotations, 3)
+	})
+
+	t.Run("empty annotations list after filtering produces no event", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "ci", Path: "x", Line: 0, Level: "NOTICE", Title: "t", Message: "m"},
+			},
+		}
+		events := Diff(prev, curr)
+		assert.Nil(t, findEvent(events, EventCheckAnnotations))
+	})
+
+	t.Run("same message on different lines are distinct annotations", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "lint", Path: "a.go", Line: 10, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+				{CheckName: "lint", Path: "a.go", Line: 25, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+				{CheckName: "lint", Path: "a.go", Line: 42, Level: "WARNING", Title: "line length", Message: "line too long (120 > 100)"},
+			},
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "annotations identical but for line must all surface")
+		require.Len(t, e.Annotations, 3, "three distinct lines = three annotations")
+		// Verify lines are preserved correctly.
+		lines := make([]int, len(e.Annotations))
+		for i, a := range e.Annotations {
+			lines[i] = a.Line
+		}
+		assert.ElementsMatch(t, []int{10, 25, 42}, lines)
+	})
+}
+
 func TestDiff_MultipleEventsInOnePass(t *testing.T) {
 	prev := &PRStatus{
 		State:         "OPEN",

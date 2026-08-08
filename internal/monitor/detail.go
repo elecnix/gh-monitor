@@ -169,6 +169,19 @@ func commentsDetail(comments []GeneralComment) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// annotationsDetail renders a readable block of check-run annotations.
+func annotationsDetail(annotations []AnnotationSummary) string {
+	parts := make([]string, 0, len(annotations))
+	for _, a := range annotations {
+		loc := a.Path
+		if a.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", a.Path, a.Line)
+		}
+		parts = append(parts, fmt.Sprintf("%s [%s] %s: %s — %s", a.CheckName, a.Level, loc, a.Title, a.Message))
+	}
+	return strings.Join(parts, "\n")
+}
+
 // osc8 wraps text in an OSC-8 terminal hyperlink pointing at url.
 func osc8(url, text string) string {
 	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
