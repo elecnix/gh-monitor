@@ -293,10 +293,10 @@ func Save(baseDir string, p Preferences) error {
 	}
 	tmpName := tmp.Name()
 	// Best-effort cleanup if we bail before the rename.
-	defer os.Remove(tmpName)
+	defer func() { _ = os.Remove(tmpName) }()
 
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

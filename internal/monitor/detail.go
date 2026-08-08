@@ -142,7 +142,7 @@ func threadDetail(t ThreadSummary) string {
 	if len(t.CommentIDs) > 0 {
 		react = fmt.Sprintf("React 👍 to acknowledge: gh monitor react %s --type thumbs_up", t.CommentIDs[len(t.CommentIDs)-1])
 	}
-	b.WriteString(fmt.Sprintf("\n  Reply then resolve: gh monitor threads resolve --thread-id %s  |  %s", t.ID, react))
+	fmt.Fprintf(&b, "\n  Reply then resolve: gh monitor threads resolve --thread-id %s  |  %s", t.ID, react)
 	return b.String()
 }
 
