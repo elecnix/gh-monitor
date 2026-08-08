@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/internal/ghcli"
+	"github.com/elecnix/gh-monitor/internal/cursor"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/prefs"
@@ -36,6 +38,8 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
+	cmd.Flags().StringVar(&opts.Instance, "instance", "", "Named instance identifier for resumable cursor (issue #32)")
+	cmd.Flags().BoolVar(&opts.FromBeginning, "from-beginning", false, "Replay the full backlog, ignoring any cursor (new named instances start at 'now' by default)")
 }
 
 type monitorOptions struct {
@@ -53,6 +57,8 @@ type monitorOptions struct {
 	Annotations string
 	Once        bool
 	Text        bool
+	Instance    string
+	FromBeginning bool
 }
 
 func (o *monitorOptions) Validate() error {
@@ -160,10 +166,46 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}()
 
 	runOpts := monitor.RunOptions{
-		Identity: identity,
-		Prefs:    p,
-		Interval: time.Duration(opts.Interval) * time.Second,
-		Timeout:  time.Duration(opts.Timeout) * time.Second,
+		Identity:      identity,
+		Prefs:         p,
+		Interval:      time.Duration(opts.Interval) * time.Second,
+		Timeout:       time.Duration(opts.Timeout) * time.Second,
+		Instance:      opts.Instance,
+		FromBeginning: opts.FromBeginning,
+	}
+
+	// Wire cursor I/O for named instances (issue #32). The cursor is only
+	// meaningful for repo targets, but we thread it unconditionally — other
+	// targets ignore the fields.
+	if opts.Instance != "" {
+		prefsPath, err := prefs.ConfigPath("")
+		if err != nil {
+			return fmt.Errorf("resolve config path: %w", err)
+		}
+		cfgDir := filepath.Dir(prefsPath)
+		store, err := cursor.NewDiskStore(cfgDir)
+		if err != nil {
+			return fmt.Errorf("create cursor store: %w", err)
+		}
+		// Load the existing cursor, if any.
+		if c, err := store.Load(opts.Instance); err == nil {
+			runOpts.CursorPosition = c.Position
+		} else if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "gh-monitor: cursor load error: %v\n", err)
+		}
+		// AdvanceCursor persists the cursor after each poll.
+		runOpts.AdvanceCursor = func(position string) {
+			c := cursor.Cursor{
+				Instance: opts.Instance,
+				Owner:    identity.Owner,
+				Repo:    identity.Repo,
+				Position: position,
+				LastSeen: time.Now(),
+			}
+			if err := store.Save(c); err != nil {
+				fmt.Fprintf(os.Stderr, "gh-monitor: cursor save error: %v\n", err)
+			}
+		}
 	}
 
 	// --events / --only-events: a per-event-kind allowlist. When set, only the
