@@ -34,6 +34,9 @@ const (
 	EventRepoNewIssue     EventType = "repo-new-issue"
 	EventCheckAnnotations EventType = "check-annotations"
 
+	// Readiness view event (issue #31)
+	EventRepoReadiness EventType = "readiness"
+
 	// EventDegraded signals that an API surface (rest, graphql, or both)
 	// could not be read. The previous snapshot is retained; no inferred
 	// state replaces it. Rate-limit details are carried when known.

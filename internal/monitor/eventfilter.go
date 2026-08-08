@@ -49,6 +49,7 @@ func validEventKinds() map[string]bool {
 		EventMerged, EventClosed, EventIssueClosed, EventIssueReopened,
 		EventIssueNewComment, EventIssueMention, EventRunQueued,
 		EventRunInProgress, EventRunCompleted, EventRepoNewPR, EventRepoNewIssue,
+		EventRepoReadiness,
 	} {
 		out[string(e)] = true
 	}

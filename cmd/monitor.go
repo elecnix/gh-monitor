@@ -40,6 +40,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
 	cmd.Flags().StringVar(&opts.Instance, "instance", "", "Named instance identifier for resumable cursor (issue #32)")
 	cmd.Flags().BoolVar(&opts.FromBeginning, "from-beginning", false, "Replay the full backlog, ignoring any cursor (new named instances start at 'now' by default)")
+	cmd.Flags().StringVar(&opts.Viewer, "viewer", "", "GitHub login to classify readiness by (default: authenticated user)")
 }
 
 type monitorOptions struct {
@@ -57,8 +58,9 @@ type monitorOptions struct {
 	Annotations string
 	Once        bool
 	Text        bool
-	Instance    string
-	FromBeginning bool
+	Instance       string
+	FromBeginning  bool
+	Viewer         string
 }
 
 func (o *monitorOptions) Validate() error {
@@ -86,10 +88,9 @@ func (o *monitorOptions) Validate() error {
 	if o.RunID > 0 {
 		targets++
 	}
-	// Repo-only (--repo without any other target) is its own target kind.
+	// Repo-only (--repo without any other target) uses the readiness view.
 	repoOnly := o.Repo != "" && o.Selector == "" && o.Pull == 0 && o.Ref == "" && o.Commit == "" && o.Issue == 0 && o.RunID == 0
 	if repoOnly {
-		// Repo monitoring: valid on its own; no conflict with other targets.
 		return nil
 	}
 	if targets > 1 {
@@ -121,7 +122,8 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	} else if opts.RunID > 0 {
 		identity, err = resolver.ResolveRun(opts.RunID, opts.Repo, os.Getenv("GH_HOST"))
 	} else if opts.Repo != "" && opts.Selector == "" && opts.Ref == "" && opts.Commit == "" && opts.Issue == 0 && opts.RunID == 0 {
-		identity, err = resolver.ResolveRepo(opts.Repo, os.Getenv("GH_HOST"))
+		// Repo-only: use the readiness view instead of the old repo-monitor.
+		return runReadiness(cmd, opts)
 	} else {
 		inferPR(opts.Selector, &opts.Pull)
 		selector, normErr := resolver.NormalizeSelector(opts.Selector, opts.Pull)
@@ -300,6 +302,169 @@ func daemonSocketPath() string {
 		return ""
 	}
 	return ipc.DefaultSocketPath()
+}
+
+// ---------------------------------------------------------------------------
+// Readiness view (issue #31): repo-wide merge-readiness
+// ---------------------------------------------------------------------------
+
+// runReadiness runs the repo-wide merge-readiness view. With --once it fetches
+// once and exits; without --once it polls on the configured interval.
+func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
+	// Resolve the viewer login.
+	viewer := resolveViewer(opts.Viewer)
+
+	// Resolve owner/repo from the --repo flag.
+	owner, repo := splitRepo(opts.Repo)
+	host := os.Getenv("GH_HOST")
+	if host == "" {
+		host = "github.com"
+	}
+
+	svc := &monitor.Service{API: apiClientFactory(host)}
+	if c, ok := svc.API.(*ghcli.Client); ok {
+		svc.FailedRunLogsFn = c.FailedRunLogs
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	interval := time.Duration(opts.Interval) * time.Second
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+
+	var deadline time.Time
+	if opts.Timeout > 0 {
+		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+	}
+
+	emit := func(n monitor.Notification) {
+		if opts.Text {
+			out := cmd.OutOrStdout()
+			_, _ = fmt.Fprintln(out, n.Message)
+			return
+		}
+		if err := encodeJSON(cmd, n); err != nil {
+			fmt.Fprintf(os.Stderr, "gh-monitor: %v\n", err)
+		}
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+
+		// Fetch the ruleset once per cycle (it's cheap, and rules can change).
+		ruleset, rulesetErr := svc.FetchRequiredChecks(owner, repo)
+		if rulesetErr != nil {
+			fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", rulesetErr)
+		}
+
+		// Fetch open PRs.
+		resp, err := svc.FetchReadiness(owner, repo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gh-monitor: readiness fetch error: %v\n", err)
+			// Emit a degraded notification.
+			report := &monitor.ReadinessReport{
+				Owner:           owner,
+				Repo:            repo,
+				Viewer:          viewer,
+				Degraded:        true,
+				DegradedMessage: err.Error(),
+			}
+			emit(monitor.Notification{
+				Type:      "readiness",
+				PRLabel:   fmt.Sprintf("%s/%s", owner, repo),
+				Message:   report.Format(),
+				Timestamp: time.Now(),
+			})
+			// Back off and retry.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(interval):
+			}
+			continue
+		}
+
+		report := monitor.ClassifyPRsFull(resp.Repository.PullRequests.Nodes, viewer, ruleset)
+		report.Owner = owner
+		report.Repo = repo
+		report.Sorted()
+
+		// Reconcile counts and warn on mismatch.
+		if errMsg := report.Reconcile(); errMsg != "" {
+			fmt.Fprintf(os.Stderr, "gh-monitor: %s\n", errMsg)
+		}
+
+		emit(monitor.Notification{
+			Type:      "readiness",
+			PRLabel:   fmt.Sprintf("%s/%s", owner, repo),
+			Message:   report.Format(),
+			Timestamp: time.Now(),
+		})
+
+		if opts.Once {
+			return nil
+		}
+
+		// Sleep until next poll or deadline.
+		d := interval
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil
+			}
+			if d > remaining {
+				d = remaining
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+}
+
+// resolveViewer returns the viewer login: --viewer flag, $GH_VIEWER env var,
+// or the authenticated user from `gh api user`.
+func resolveViewer(flagViewer string) string {
+	if flagViewer != "" {
+		return flagViewer
+	}
+	if v := os.Getenv("GH_VIEWER"); v != "" {
+		return v
+	}
+	user, err := ghcli.CurrentUser()
+	if err != nil {
+		return ""
+	}
+	return user
+}
+
+// splitRepo splits "owner/repo" into its components.
+func splitRepo(repoArg string) (owner, repo string) {
+	parts := strings.SplitN(repoArg, "/", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return repoArg, ""
 }
 
 // streamFromDaemonAndEmit connects to a running daemon, sends a subscribe
