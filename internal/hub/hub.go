@@ -78,7 +78,7 @@ func (h *Hub) SubscribePR(ctx context.Context, opts monitor.RunOptions) (<-chan 
 
 	sub := &prSub{
 		consumer:   monitor.NewPRConsumer(opts),
-		snapOpts:   monitor.SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots},
+		snapOpts:   monitor.SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels},
 		snapshotCh: make(chan *monitor.PullRequest, 1),
 		out:        make(chan monitor.Notification, 16),
 		done:       make(chan struct{}),

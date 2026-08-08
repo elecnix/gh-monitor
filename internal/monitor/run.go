@@ -148,6 +148,13 @@ type RunOptions struct {
 	// one programmatically or ParseEventFilter to validate caller input.
 	EventFilter *EventFilter
 
+	// AnnotationLevels controls which check-run annotation levels are
+	// included in the snapshot. A nil value uses the default (warning +
+	// failure). An empty filter ("none") drops all annotations. Use
+	// NewAnnotationLevels to build one programmatically or
+	// ParseAnnotationLevels to validate caller input.
+	AnnotationLevels *AnnotationLevels
+
 	// Now and Sleep are injectable for tests. Now defaults to time.Now; Sleep
 	// defaults to a context-aware timer. Sleep must return the context error
 	// when the context is cancelled.
@@ -266,7 +273,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		}
 		errBackoff = 0
 
-		curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
+		curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels})
 		if c.Consume(curr, emit) {
 			return nil
 		}
@@ -292,7 +299,7 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	if err != nil {
 		return err
 	}
-	curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
+	curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels})
 	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
 	for _, ev := range Diff(&PRStatus{}, curr) {
 		if ev.Type == EventNewCommit {

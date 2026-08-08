@@ -310,6 +310,91 @@ func TestSnapshot_CheckAnnotations(t *testing.T) {
 		s := Snapshot(pr, SnapshotOptions{})
 		assert.Empty(t, s.CheckAnnotations)
 	})
+
+	t.Run("notice included when AnnotationLevels allows it", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "build",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnn("cache", "NOTICE", "cache miss", "...", 0),
+								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{AnnotationLevels: NewAnnotationLevels("notice", "warning", "failure")})
+		require.Len(t, s.CheckAnnotations, 2)
+		levels := make([]string, len(s.CheckAnnotations))
+		for i, a := range s.CheckAnnotations {
+			levels[i] = a.Level
+		}
+		assert.Contains(t, levels, "NOTICE")
+		assert.Contains(t, levels, "WARNING")
+	})
+
+	t.Run("notice still dropped by default", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "build",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnn("cache", "NOTICE", "cache miss", "...", 0),
+								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{}) // nil AnnotationLevels = default (warning+failure)
+		require.Len(t, s.CheckAnnotations, 1)
+		assert.Equal(t, "WARNING", s.CheckAnnotations[0].Level)
+	})
+
+	t.Run("none drops all annotation levels", func(t *testing.T) {
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "build",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
+								mkAnn("src/y.go", "FAILURE", "security", "CVE", 10),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{AnnotationLevels: NewAnnotationLevels()}) // empty = none
+		assert.Empty(t, s.CheckAnnotations)
+	})
 }
 
 func TestSnapshot_ReviewDecision(t *testing.T) {
