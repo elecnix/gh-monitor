@@ -147,7 +147,7 @@ func newPrefsPathCommand(opts *prefsOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintln(cmd.OutOrStdout(), p)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), p)
 			return nil
 		},
 	}

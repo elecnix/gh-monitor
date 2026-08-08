@@ -88,7 +88,7 @@ func TestPrefsSetStdin(t *testing.T) {
 	require.NoError(t, err)
 	_, err = w.WriteString(`{"retriggerComments":true}`)
 	require.NoError(t, err)
-	w.Close()
+	_ = w.Close()
 	os.Stdin = r
 	defer func() { os.Stdin = orig }()
 
