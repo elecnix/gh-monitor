@@ -322,16 +322,20 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		assert.Nil(t, findEvent(events, EventNewFailingChecks), "should not fire failing-checks for annotations")
 	})
 
-	t.Run("notice-level annotations are filtered by default", func(t *testing.T) {
+	t.Run("notice-level annotations reach diff unchanged (filtering is at snapshot time)", func(t *testing.T) {
 		prev := &PRStatus{}
 		curr := &PRStatus{
 			CheckAnnotations: []AnnotationSummary{
 				{CheckName: "ci", Path: ".github/cache", Line: 0, Level: "NOTICE", Title: "cache miss", Message: "No cache found"},
 			},
 		}
-		// NOTICE-level annotations should not appear in the event.
+		// Diff no longer filters by level — that happens at snapshot time.
+		// If a NOTICE annotation is in CheckAnnotations, diff will emit it.
 		events := Diff(prev, curr)
-		assert.Nil(t, findEvent(events, EventCheckAnnotations), "NOTICE-level annotations should be filtered out")
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "NOTICE-level annotations in CheckAnnotations must be emitted by Diff")
+		require.Len(t, e.Annotations, 1)
+		assert.Equal(t, "NOTICE", e.Annotations[0].Level)
 	})
 
 	t.Run("failure-level annotations are included", func(t *testing.T) {
@@ -372,7 +376,7 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		require.Len(t, e.Annotations, 3)
 	})
 
-	t.Run("empty annotations list after filtering produces no event", func(t *testing.T) {
+	t.Run("any annotation in CheckAnnotations produces event (filtering is at snapshot time)", func(t *testing.T) {
 		prev := &PRStatus{}
 		curr := &PRStatus{
 			CheckAnnotations: []AnnotationSummary{
@@ -380,7 +384,9 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 			},
 		}
 		events := Diff(prev, curr)
-		assert.Nil(t, findEvent(events, EventCheckAnnotations))
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e, "Diff emits whatever annotations are in CheckAnnotations")
+		assert.Equal(t, "NOTICE", e.Annotations[0].Level)
 	})
 
 	t.Run("same message on different lines are distinct annotations", func(t *testing.T) {

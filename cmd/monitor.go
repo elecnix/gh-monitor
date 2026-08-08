@@ -33,6 +33,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
 	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
 	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
+	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
 }
@@ -49,6 +50,7 @@ type monitorOptions struct {
 	Timeout     int
 	IgnoredBots string
 	Events      string
+	Annotations string
 	Once        bool
 	Text        bool
 }
@@ -175,13 +177,23 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		runOpts.EventFilter = filter
 	}
 
+	// --annotation-levels: a per-annotation-level filter applied at snapshot
+	// time. Omitted (nil) → default (warning + failure).
+	if strings.TrimSpace(opts.Annotations) != "" {
+		levels, err := monitor.ParseAnnotationLevels(opts.Annotations)
+		if err != nil {
+			return err
+		}
+		runOpts.AnnotationLevels = levels
+	}
+
 	emit := func(n monitor.Notification) {
 		if opts.Text {
 			out := cmd.OutOrStdout()
-			fmt.Fprintln(out, monitor.LinkifyText(n))
+			_, _ = fmt.Fprintln(out, monitor.LinkifyText(n))
 			if n.Detail != "" {
 				for _, line := range strings.Split(n.Detail, "\n") {
-					fmt.Fprintf(out, "  %s\n", line)
+					_, _ = fmt.Fprintf(out, "  %s\n", line)
 				}
 			}
 			return

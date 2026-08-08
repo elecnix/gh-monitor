@@ -194,6 +194,7 @@ gh monitor --once -R owner/repo 42
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
+- `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
 
@@ -209,7 +210,7 @@ gh monitor -R owner/repo 42 --events conflict,new-failing-checks,merged,closed
 gh monitor --run-id 30433642 -R owner/repo --events run-completed
 ```
 
-The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
 
 `new-unresolved-threads` and `new-general-comments` events carry a rich `detail` body — the thread/comment location, author, text, a diff excerpt centered on the anchored line, and the exact commands to reply/resolve or 👍-acknowledge — so a consumer can act without extra API calls. In `--text` mode the PR label and commit SHA are wrapped in OSC-8 hyperlinks (clickable in supporting terminals, plain text elsewhere) and any `detail` body is printed, indented, beneath the message.
 

@@ -397,22 +397,10 @@ type AnnotationSummary struct {
 	Message   string `json:"message"`
 }
 
-// annotationLevels are the annotation levels worth surfacing.
-// NOTICE is excluded by default: runners emit it for housekeeping (cache
-// misses, etc.) and it is pure noise.
-var annotationLevels = map[string]bool{
-	"WARNING": true,
-	"FAILURE": true,
-}
-
-// isAnnotationLevel reports whether the level is worth surfacing.
-func isAnnotationLevel(level string) bool {
-	return annotationLevels[level]
-}
-
 // diffAnnotations returns annotations in curr that are not in prev.
 // Annotations are matched by (check_name, path, line, level, title, message).
-// Only annotations whose level passes isAnnotationLevel are considered.
+// Level filtering is performed at snapshot time via AnnotationLevels; the
+// diff itself treats every annotation in CheckAnnotations equally.
 func diffAnnotations(prev, curr []AnnotationSummary) []AnnotationSummary {
 	seen := make(map[string]bool, len(prev))
 	for _, a := range prev {
@@ -420,9 +408,6 @@ func diffAnnotations(prev, curr []AnnotationSummary) []AnnotationSummary {
 	}
 	var out []AnnotationSummary
 	for _, a := range curr {
-		if !isAnnotationLevel(a.Level) {
-			continue
-		}
 		if !seen[annotationKey(a)] {
 			out = append(out, a)
 		}

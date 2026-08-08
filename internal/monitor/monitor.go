@@ -623,6 +623,11 @@ type PRStatus struct {
 type SnapshotOptions struct {
 	// IgnoredBots are author logins whose general comments are dropped.
 	IgnoredBots []string
+
+	// AnnotationLevels controls which check-run annotation levels are
+	// included in the snapshot. A nil value uses the default (warning +
+	// failure). An empty filter ("none") drops all annotations.
+	AnnotationLevels *AnnotationLevels
 }
 
 // Snapshot distills a raw PR payload into a PRStatus.
@@ -647,7 +652,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		FailingChecks:     failingChecks(pr),
 		PendingChecks:     pendingChecks(pr),
 		SuccessfulChecks:  successfulChecks(pr),
-		CheckAnnotations:  extractAnnotations(pr),
+		CheckAnnotations:  extractAnnotations(pr, opts.AnnotationLevels),
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {
@@ -760,12 +765,12 @@ func suiteName(s *CheckSuite) string {
 	return s.App.Slug
 }
 
-// extractAnnotations collects WARNING and FAILURE annotations from all
-// check runs across all check suites of the head commit. The run status is
+// extractAnnotations collects annotations from all check runs across all
+// check suites of the head commit, filtered by levels. The run status is
 // deliberately not checked — an in-progress run may report partial
 // annotations, but they are deduped on the next poll, so filtering on
 // status gains nothing.
-func extractAnnotations(pr *PullRequest) []AnnotationSummary {
+func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) []AnnotationSummary {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
 	for i := range pr.Commits.Nodes {
@@ -774,7 +779,7 @@ func extractAnnotations(pr *PullRequest) []AnnotationSummary {
 			suite := &c.CheckSuites.Nodes[j]
 			for _, run := range suite.CheckRuns.Nodes {
 				for _, ann := range run.Annotations.Nodes {
-					if !isAnnotationLevel(ann.Level) {
+					if !levels.Allows(ann.Level) {
 						continue
 					}
 					s := AnnotationSummary{
