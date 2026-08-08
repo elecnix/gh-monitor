@@ -15,10 +15,11 @@ import (
 // MONITOR_READINESS_QUERY fetches every open PR with its author, review state,
 // and the head commit's check suites (the same shape as MONITOR_QUERY).
 // Comments, threads, and reactions are omitted to keep the payload lean.
-const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: String!, $first: Int!) {
+const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: String!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
-    pullRequests(first: $first, states: OPEN, orderBy: {field: CREATED_AT, direction: DESC}) {
+    pullRequests(first: $first, after: $after, states: OPEN, orderBy: {field: CREATED_AT, direction: DESC}) {
       totalCount
+      pageInfo { hasNextPage endCursor }
       nodes {
         number
         state
@@ -42,7 +43,8 @@ const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: 
                   conclusion
                   status
                   app { name slug }
-                  checkRuns(last: 50) {
+                  checkRuns(last: 10) {
+                    totalCount
                     nodes { name conclusion status }
                   }
                 }
@@ -71,6 +73,13 @@ type ReadinessQueryResponse struct {
 type ReadinessPRNodes struct {
 	Nodes      []ReadinessPR `json:"nodes"`
 	TotalCount int           `json:"totalCount"`
+	PageInfo   PageInfo      `json:"pageInfo"`
+}
+
+// PageInfo is the pagination cursor from a GraphQL connection.
+type PageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
 }
 
 // ReadinessPR is a single open PR from the readiness query. It carries the
@@ -333,18 +342,79 @@ func readinessReasonFull(rp *ReadinessPR, status *PRStatus, viewer string) strin
 // Readiness service
 // ---------------------------------------------------------------------------
 
-// FetchReadiness fetches all open PRs for a repo using the readiness query.
+// readinessDefaultPageSize is the starting page size for the readiness query.
+// On repos with heavy CI (many suites/runs per commit) the first page may
+// still exceed GitHub's node budget; FetchReadiness detects the "Resource
+// limits" error and halves the page size down to a floor, adapting to the
+// repo's CI footprint rather than assuming a one-size-fits-all constant.
+const readinessDefaultPageSize = 25
+const readinessMinPageSize = 5
+
+// FetchReadiness fetches all open PRs for a repo using the readiness query,
+// paginating to keep each GraphQL request under the node budget. If the
+// first page exceeds GitHub's resource limits the page size is halved and
+// retried, adapting to repos with heavier check suites.
 func (s *Service) FetchReadiness(owner, repo string) (*ReadinessQueryResponse, error) {
-	var result ReadinessQueryResponse
-	// Fetch up to 100 open PRs (GitHub GraphQL default page size).
-	err := s.API.GraphQL(MONITOR_READINESS_QUERY, map[string]interface{}{
-		"owner": owner,
-		"repo":  repo,
-		"first": 100,
-	}, &result)
-	if err != nil {
+	pageSize := readinessDefaultPageSize
+
+	for {
+		result, err := s.fetchReadinessPaged(owner, repo, pageSize)
+		if err == nil {
+			return result, nil
+		}
+		// GitHub scores queries by maximum potential nodes, not actual
+		// nodes returned. A repo with 14 suites × 26 runs per commit
+		// needs a smaller page than one with 3 suites × 5 runs, even
+		// when the PR count is lower. On a resource-limit failure,
+		// halve the page size and retry.
+		if isResourceLimitError(err) && pageSize/2 >= readinessMinPageSize {
+			pageSize /= 2
+			continue
+		}
 		return nil, err
 	}
+}
+
+// isResourceLimitError reports whether err is GitHub's "Resource limits for
+// this query exceeded" error, indicating the query's node budget was exceeded.
+func isResourceLimitError(err error) bool {
+	return strings.Contains(err.Error(), "Resource limits")
+}
+
+// fetchReadinessPaged runs the readiness query with a fixed page size,
+// accumulating pages until all open PRs are fetched.
+func (s *Service) fetchReadinessPaged(owner, repo string, pageSize int) (*ReadinessQueryResponse, error) {
+	var result ReadinessQueryResponse
+	after := ""
+
+	for {
+		vars := map[string]interface{}{
+			"owner": owner,
+			"repo":  repo,
+			"first": pageSize,
+		}
+		if after != "" {
+			vars["after"] = after
+		}
+
+		var page ReadinessQueryResponse
+		if err := s.API.GraphQL(MONITOR_READINESS_QUERY, vars, &page); err != nil {
+			return nil, err
+		}
+
+		result.Repository.PullRequests.Nodes = append(
+			result.Repository.PullRequests.Nodes,
+			page.Repository.PullRequests.Nodes...,
+		)
+		// TotalCount is the same on every page — capture it once.
+		result.Repository.PullRequests.TotalCount = page.Repository.PullRequests.TotalCount
+
+		if !page.Repository.PullRequests.PageInfo.HasNextPage {
+			break
+		}
+		after = page.Repository.PullRequests.PageInfo.EndCursor
+	}
+
 	return &result, nil
 }
 
