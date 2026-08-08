@@ -11,6 +11,8 @@ package hub
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -24,11 +26,17 @@ import (
 // IgnoredBots are honored) before diffing against its own baseline.
 type FetchFunc func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error)
 
+// RulesetFunc returns the required status checks for a repository. It is called
+// once per poller (not per consumer) — rulesets rarely change mid-monitoring.
+// When nil, the hub does not compute AwaitingChecks (the feature is disabled).
+type RulesetFunc func(owner, repo string) (*monitor.RulesetChecks, error)
+
 // Hub owns one poller goroutine per PR identity and fans each fetched snapshot
 // out to every subscribed consumer. It is safe for concurrent use.
 type Hub struct {
-	fetch    FetchFunc
-	interval time.Duration
+	fetch     FetchFunc
+	rulesetFn RulesetFunc
+	interval  time.Duration
 
 	mu      sync.Mutex
 	pollers map[prKey]*prPoller
@@ -43,15 +51,17 @@ type prKey struct {
 
 // New creates a Hub. interval is the cadence between background fetches; a
 // poller also fetches immediately on start. If interval <= 0 it defaults to
-// 60s.
-func New(fetch FetchFunc, interval time.Duration) *Hub {
+// 60s. rulesetFn is called once when a poller starts to determine required
+// status checks; pass nil to disable ruleset-aware monitoring.
+func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration) *Hub {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
 	return &Hub{
-		fetch:    fetch,
-		interval: interval,
-		pollers:  make(map[prKey]*prPoller),
+		fetch:     fetch,
+		rulesetFn: rulesetFn,
+		interval:  interval,
+		pollers:   make(map[prKey]*prPoller),
 	}
 }
 
@@ -85,11 +95,11 @@ func (h *Hub) SubscribePR(ctx context.Context, opts monitor.RunOptions) (<-chan 
 	}
 	go sub.loop()
 
-	// Deliver the cached snapshot (if any) to the new consumer under the
-	// poller lock so it cannot double-up with a concurrent fetchOnce
-	// broadcast: either the broadcast reaches this sub, or this subscribe
-	// path does — never both, because both hold p.mu.
+	// Use the poller's cached ruleset (fetched once on first run).
 	p.mu.Lock()
+	if p.ruleset != nil && p.ruleset.Error == "" {
+		sub.snapOpts.RulesetChecks = p.ruleset
+	}
 	p.subs[sub] = struct{}{}
 	if p.latest != nil {
 		select {
@@ -170,6 +180,7 @@ type prPoller struct {
 	hub      *Hub
 	identity resolver.Identity
 	interval time.Duration
+	ruleset  *monitor.RulesetChecks // fetched once at poller start; nil until fetched
 
 	mu     sync.Mutex
 	latest *monitor.PullRequest
@@ -191,8 +202,27 @@ func newPRPoller(h *Hub, id resolver.Identity, interval time.Duration) *prPoller
 	}
 }
 
-// run fetches immediately, then on every tick or wake, until stop.
+// run fetches ruleset once, then fetches immediately and on every tick or
+// wake, until stop.
 func (p *prPoller) run() {
+	// Fetch the branch ruleset once at startup. Rulesets rarely change
+	// mid-monitoring; a consumer that needs a refresh can restart.
+	if p.hub.rulesetFn != nil {
+		rs, err := p.hub.rulesetFn(p.identity.Owner, p.identity.Repo)
+		if err != nil {
+			// Log but continue — the poller still works without ruleset data.
+			fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", err)
+		}
+		if rs != nil && rs.Error == "" {
+			p.mu.Lock()
+			p.ruleset = rs
+			// Update all existing subscribers with the ruleset.
+			for s := range p.subs {
+				s.snapOpts.RulesetChecks = rs
+			}
+			p.mu.Unlock()
+		}
+	}
 	p.fetchOnce()
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()

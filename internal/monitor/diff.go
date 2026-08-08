@@ -120,8 +120,8 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 	}
 
 	// CI went fully green: prev had work in flight or failing, curr has none.
-	prevHadWork := len(prev.FailingChecks) > 0 || len(prev.PendingChecks) > 0
-	currClean := len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0
+	prevHadWork := len(prev.FailingChecks) > 0 || len(prev.PendingChecks) > 0 || len(prev.AwaitingChecks) > 0 || prev.RulesetError != "" || prev.TruncatedSuites
+	currClean := len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0 && len(curr.AwaitingChecks) == 0 && curr.RulesetError == "" && !curr.TruncatedSuites
 	if prevHadWork && currClean {
 		events = append(events, Event{Type: EventCIAllGreen})
 	}

@@ -92,7 +92,7 @@ func TestHub_SingleFetchFansOutToMultipleConsumers(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return snap, nil
-	}, time.Hour)
+	}, nil, time.Hour)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,7 +125,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	current := prFixture([]string{"ci-build"})
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		return current, nil
-	}, time.Hour)
+	}, nil, time.Hour)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,7 +180,7 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return prFixture(nil), nil
-	}, 5*time.Millisecond)
+	}, nil, 5*time.Millisecond)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -213,7 +213,7 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		return prFixture(nil), nil
-	}, 5*time.Millisecond)
+	}, nil, 5*time.Millisecond)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -41,6 +41,94 @@ func (s *Service) FailedRunLogs(owner, repo string, runID int) (string, error) {
 	return s.FailedRunLogsFn(owner, repo, runID)
 }
 
+// ---------------------------------------------------------------------------
+// Ruleset types (required status checks)
+// ---------------------------------------------------------------------------
+
+// RulesetListResponse is the minimal envelope for GET /repos/{owner}/{repo}/rulesets.
+type RulesetListResponse []struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+// RulesetResponse is the minimal envelope for GET /repos/{owner}/{repo}/rulesets/{id}.
+type RulesetResponse struct {
+	ID     int            `json:"id"`
+	Name   string         `json:"name"`
+	Rules  []RulesetRule  `json:"rules"`
+	Target string         `json:"target"`
+}
+
+// RulesetRule is one rule inside a ruleset.
+type RulesetRule struct {
+	Type       string              `json:"type"`
+	Parameters *RulesetParameters  `json:"parameters,omitempty"`
+}
+
+// RulesetParameters holds the required_status_checks contexts.
+type RulesetParameters struct {
+	RequiredStatusChecks []RequiredStatusCheck `json:"required_status_checks"`
+}
+
+// RequiredStatusCheck is one required status context from a ruleset.
+type RequiredStatusCheck struct {
+	Context        string `json:"context"`
+	IntegrationID int    `json:"integration_id"`
+}
+
+// RulesetChecks holds the result of fetching required checks from the ruleset.
+// When Error is non-empty, the ruleset could not be read — the caller must
+// degrade loudly rather than assuming nothing is required. When both Contexts
+// and Error are empty, there are no required-checks rulesets (all clear).
+type RulesetChecks struct {
+	Contexts []string // required context names
+	Error    string   // non-empty when the ruleset could not be read
+}
+
+// FetchRequiredChecks reads the branch ruleset for the repository and returns
+// the required status check context names. It handles three cases:
+//
+//	1. No rulesets at all                     → Contexts=nil, Error=""
+//	2. A ruleset with required_status_checks  → Contexts filled
+//	3. The ruleset API returns 403/404        → Contexts=nil, Error="ruleset not readable"
+//
+// Case 3 is critical: a ruleset you cannot read must degrade loudly, never
+// silently become "nothing is required" — that would reproduce the exact bug
+// issue #30 is about.
+func (s *Service) FetchRequiredChecks(owner, repo string) (*RulesetChecks, error) {
+	// List rulesets.
+	var list RulesetListResponse
+	err := s.API.REST("GET", fmt.Sprintf("repos/%s/%s/rulesets", owner, repo), nil, nil, &list)
+	if err != nil {
+		// Degrade loudly: a fetch error (403/404 etc.) means we cannot
+		// determine what is required. Return the error in the RulesetChecks
+		// so the caller can surface it.
+		return &RulesetChecks{
+			Error: fmt.Sprintf("cannot read ruleset: %v", err),
+		}, nil
+	}
+
+	var contexts []string
+	for _, rs := range list {
+		var detail RulesetResponse
+		err := s.API.REST("GET", fmt.Sprintf("repos/%s/%s/rulesets/%d", owner, repo, rs.ID), nil, nil, &detail)
+		if err != nil {
+			return &RulesetChecks{
+				Error: fmt.Sprintf("cannot read ruleset %d (%s): %v", rs.ID, rs.Name, err),
+			}, nil
+		}
+		for _, rule := range detail.Rules {
+			if rule.Type == "required_status_checks" && rule.Parameters != nil {
+				for _, rc := range rule.Parameters.RequiredStatusChecks {
+					contexts = append(contexts, rc.Context)
+				}
+			}
+		}
+	}
+
+	return &RulesetChecks{Contexts: contexts}, nil
+}
+
 // MONITOR_QUERY fetches the rich snapshot a monitor needs for a single PR:
 // state, comments (+👍), review threads (+👍), mergeability, the latest review
 // decision, and the head commit with its authors, message, checks, and
@@ -92,12 +180,13 @@ const MONITOR_QUERY = `query MonitorPR($owner: String!, $repo: String!, $number:
             messageHeadline
             message
             authors(first: 10) { nodes { name user { login } } }
-            checkSuites(last: 10) {
+            checkSuites(last: 50) {
+              totalCount
               nodes {
                 conclusion
                 status
                 app { name slug }
-                checkRuns(last: 10) {
+                checkRuns(last: 50) {
                   nodes { name conclusion status
                     annotations(first: 50) {
                       nodes { path location { start { line } } annotationLevel title message }
@@ -214,7 +303,8 @@ type GitActor struct {
 }
 
 type SuiteNodes struct {
-	Nodes []CheckSuite `json:"nodes"`
+	Nodes      []CheckSuite `json:"nodes"`
+	TotalCount int          `json:"totalCount"`
 }
 
 type CheckSuite struct {
@@ -302,12 +392,13 @@ const MONITOR_REF_QUERY = `query MonitorRef($owner: String!, $repo: String!, $re
         ... on Commit {
           messageHeadline
           authors(first: 10) { nodes { name user { login } } }
-          checkSuites(last: 10) {
+          checkSuites(last: 50) {
+            totalCount
             nodes {
               conclusion
               status
               app { name slug }
-              checkRuns(last: 10) {
+              checkRuns(last: 50) {
                 nodes { name conclusion status
                   annotations(first: 50) {
                     nodes { path location { start { line } } annotationLevel title message }
@@ -332,12 +423,13 @@ const MONITOR_COMMIT_QUERY = `query MonitorCommit($owner: String!, $repo: String
         oid
         messageHeadline
         authors(first: 10) { nodes { name user { login } } }
-        checkSuites(last: 10) {
+        checkSuites(last: 50) {
+          totalCount
           nodes {
             conclusion
             status
             app { name slug }
-            checkRuns(last: 10) {
+            checkRuns(last: 50) {
               nodes { name conclusion status
                 annotations(first: 50) {
                   nodes { path location { start { line } } annotationLevel title message }
@@ -617,6 +709,23 @@ type PRStatus struct {
 	// CheckAnnotations holds the combined annotations from all completed
 	// check runs (filtered to WARNING + FAILURE levels).
 	CheckAnnotations []AnnotationSummary `json:"check_annotations,omitempty"`
+	// AwaitingChecks lists required status checks (from the branch ruleset)
+	// that are entirely absent from the check-suites/status payload — they
+	// have not been created yet. An absent required check is a distinct state
+	// from QUEUED/IN_PROGRESS (which are in-flight but present in the
+	// payload) and from FAILURE (which ran and failed). Only SKIPPED/NEUTRAL
+	// on a required context counts as satisfied.
+	AwaitingChecks []string `json:"awaiting_checks,omitempty"`
+	// RulesetError is set when the ruleset could not be read (403/404/network
+	// error). A non-empty RulesetError means the monitor cannot determine what
+	// is required and degrades loudly rather than silently assuming nothing is
+	// required. Empty when the fetch succeeded or there are no rulesets.
+	RulesetError string `json:"ruleset_error,omitempty"`
+	// TruncatedSuites is set when the checkSuites totalCount exceeds the
+	// fetched node count — some suites were silently dropped by the page
+	// limit. When true, the snapshot is degraded: AwaitingChecks may report
+	// checks as absent that actually ran in the dropped suites.
+	TruncatedSuites bool `json:"truncated_suites,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -628,6 +737,11 @@ type SnapshotOptions struct {
 	// included in the snapshot. A nil value uses the default (warning +
 	// failure). An empty filter ("none") drops all annotations.
 	AnnotationLevels *AnnotationLevels
+
+	// RulesetChecks is the result of FetchRequiredChecks for the repo.
+	// When nil, AwaitingChecks is not computed (the ruleset was not
+	// fetched — e.g. ref/commit targets that lack a PR context).
+	RulesetChecks *RulesetChecks
 }
 
 // Snapshot distills a raw PR payload into a PRStatus.
@@ -653,6 +767,17 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		PendingChecks:     pendingChecks(pr),
 		SuccessfulChecks:  successfulChecks(pr),
 		CheckAnnotations:  extractAnnotations(pr, opts.AnnotationLevels),
+	}
+
+	// Detect truncated suites: the API returned fewer nodes than exist.
+	status.TruncatedSuites = truncatedSuites(pr)
+
+	// Compute awaiting required checks from the ruleset.
+	if opts.RulesetChecks != nil {
+		status.RulesetError = opts.RulesetChecks.Error
+		if opts.RulesetChecks.Error == "" && len(opts.RulesetChecks.Contexts) > 0 {
+			status.AwaitingChecks = awaitingChecks(pr, opts.RulesetChecks.Contexts)
+		}
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {
@@ -909,6 +1034,68 @@ func pendingChecks(pr *PullRequest) []string {
 					add(ctx.Context)
 				}
 			}
+		}
+	}
+	return out
+}
+
+// truncatedSuites reports whether the check-suites payload was truncated —
+// the API reported more suites than were returned in nodes. When true, the
+// snapshot is degraded: AwaitingChecks may report checks as absent that
+// actually ran in the dropped suites.
+func truncatedSuites(pr *PullRequest) bool {
+	for i := range pr.Commits.Nodes {
+		c := &pr.Commits.Nodes[i].Commit
+		if c.CheckSuites.TotalCount > len(c.CheckSuites.Nodes) {
+			return true
+		}
+	}
+	return false
+}
+
+// allPresentCheckNames collects every check name visible in the payload —
+// suite names, individual run names, and old-style status context names.
+func allPresentCheckNames(pr *PullRequest) map[string]bool {
+	names := map[string]bool{}
+	for i := range pr.Commits.Nodes {
+		c := &pr.Commits.Nodes[i].Commit
+		for j := range c.CheckSuites.Nodes {
+			suite := &c.CheckSuites.Nodes[j]
+			if sn := suiteName(suite); sn != "" {
+				names[sn] = true
+			}
+			for _, run := range suite.CheckRuns.Nodes {
+				if run.Name != "" {
+					names[run.Name] = true
+				}
+			}
+		}
+		if c.Status != nil {
+			for _, ctx := range c.Status.Contexts {
+				if ctx.Context != "" {
+					names[ctx.Context] = true
+				}
+			}
+		}
+	}
+	return names
+}
+
+// awaitingChecks returns required context names that are entirely absent from
+// the check-suites/status payload. A check that is present but not successful
+// is still tracked by failingChecks / pendingChecks — awaiting means the check
+// has not been created at all.
+func awaitingChecks(pr *PullRequest, required []string) []string {
+	present := allPresentCheckNames(pr)
+	var out []string
+	seen := map[string]bool{}
+	for _, ctx := range required {
+		if present[ctx] {
+			continue
+		}
+		if !seen[ctx] {
+			seen[ctx] = true
+			out = append(out, ctx)
 		}
 	}
 	return out
