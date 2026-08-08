@@ -397,6 +397,173 @@ func TestSnapshot_CheckAnnotations(t *testing.T) {
 	})
 }
 
+func TestSnapshot_CheckAnnotations_Truncation(t *testing.T) {
+	mkAnn := func(path, level, title, message string, line int) Annotation {
+		return Annotation{
+			Path:    path,
+			Level:   level,
+			Title:   title,
+			Message: message,
+			Location: AnnotationLocation{
+				Start: struct {
+					Line int `json:"line"`
+				}{Line: line},
+			},
+		}
+	}
+
+	// Build a slice of N annotations (all WARNING).
+	mkAnns := func(n int) []Annotation {
+		anns := make([]Annotation, n)
+		for i := 0; i < n; i++ {
+			anns[i] = mkAnn("src/file.go", "WARNING", "lint", "unused var", i+1)
+		}
+		return anns
+	}
+
+	t.Run("exactly 10 annotations on a check run flags truncation", func(t *testing.T) {
+		anns := mkAnns(10)
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "lint"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:        "lint",
+							Conclusion:  "SUCCESS",
+							Status:      "COMPLETED",
+							Permalink:   "https://github.com/o/r/actions/runs/123",
+							Annotations: AnnotationNodes{TotalCount: 10, Nodes: anns},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.True(t, s.AnnotationsTruncated, "10 annotations (at the per-step cap) must flag truncation")
+		assert.Equal(t, "https://github.com/o/r/actions/runs/123", s.AnnotationsURL)
+		require.Len(t, s.CheckAnnotations, 10)
+	})
+
+	t.Run("fewer than 10 annotations does not flag truncation", func(t *testing.T) {
+		anns := mkAnns(3)
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "lint"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:        "lint",
+							Conclusion:  "SUCCESS",
+							Status:      "COMPLETED",
+							Annotations: AnnotationNodes{TotalCount: 3, Nodes: anns},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.False(t, s.AnnotationsTruncated, "fewer than 10 annotations must NOT flag truncation")
+		assert.Empty(t, s.AnnotationsURL)
+		require.Len(t, s.CheckAnnotations, 3)
+	})
+
+	t.Run("totalCount exceeding fetched count flags truncation (page full)", func(t *testing.T) {
+		// totalCount=55 but only 50 nodes returned — page is full.
+		anns := mkAnns(50)
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "scanner"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:        "scanner",
+							Conclusion:  "SUCCESS",
+							Status:      "COMPLETED",
+							Permalink:   "https://github.com/o/r/actions/runs/456",
+							Annotations: AnnotationNodes{TotalCount: 55, Nodes: anns},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.True(t, s.AnnotationsTruncated, "totalCount > fetched must flag truncation")
+		assert.Equal(t, "https://github.com/o/r/actions/runs/456", s.AnnotationsURL)
+		require.Len(t, s.CheckAnnotations, 50)
+	})
+
+	t.Run("totalCount equals fetched count does not flag page truncation", func(t *testing.T) {
+		anns := mkAnns(5)
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "lint"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:        "lint",
+							Conclusion:  "SUCCESS",
+							Status:      "COMPLETED",
+							Annotations: AnnotationNodes{TotalCount: 5, Nodes: anns},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.False(t, s.AnnotationsTruncated, "totalCount == fetched must NOT flag truncation")
+	})
+
+	t.Run("second run crossing the 10 cap sets URL from first", func(t *testing.T) {
+		// First run is under 10, second hits 10 — URL is from the first hit.
+		pr := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{
+							{
+								Name:        "lint",
+								Conclusion:  "SUCCESS",
+								Status:      "COMPLETED",
+								Permalink:   "https://github.com/o/r/actions/runs/1",
+								Annotations: AnnotationNodes{TotalCount: 10, Nodes: mkAnns(10)},
+							},
+							{
+								Name:        "scanner",
+								Conclusion:  "SUCCESS",
+								Status:      "COMPLETED",
+								Permalink:   "https://github.com/o/r/actions/runs/2",
+								Annotations: AnnotationNodes{TotalCount: 12, Nodes: mkAnns(12)},
+							},
+						}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.True(t, s.AnnotationsTruncated)
+		// URL from first truncating run.
+		assert.Equal(t, "https://github.com/o/r/actions/runs/1", s.AnnotationsURL)
+		require.Len(t, s.CheckAnnotations, 22)
+	})
+}
+
 func TestSnapshot_ReviewDecision(t *testing.T) {
 	t.Run("latest non-pending", func(t *testing.T) {
 		pr := &PullRequest{Reviews: ReviewNodes{Nodes: []Review{mkReview("APPROVED", "carol")}}}

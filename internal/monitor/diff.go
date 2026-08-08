@@ -69,6 +69,13 @@ type Event struct {
 
 	// Annotations holds the check-run annotations (EventCheckAnnotations).
 	Annotations []AnnotationSummary `json:"annotations,omitempty"`
+
+	// AnnotationsTruncated is true when the annotation set may be incomplete.
+	AnnotationsTruncated bool `json:"annotations_truncated,omitempty"`
+
+	// AnnotationsURL is the check run's permalink when annotations are
+	// truncated, so a consumer can view the full set.
+	AnnotationsURL string `json:"annotations_url,omitempty"`
 }
 
 // Diff returns the genuinely-new changes between prev and curr.
@@ -164,7 +171,12 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 
 	// New check-run annotations.
 	if newAnn := diffAnnotations(prev.CheckAnnotations, curr.CheckAnnotations); len(newAnn) > 0 {
-		events = append(events, Event{Type: EventCheckAnnotations, Annotations: newAnn})
+		evt := Event{Type: EventCheckAnnotations, Annotations: newAnn}
+		if curr.AnnotationsTruncated {
+			evt.AnnotationsTruncated = true
+			evt.AnnotationsURL = curr.AnnotationsURL
+		}
+		events = append(events, evt)
 	}
 
 	return events

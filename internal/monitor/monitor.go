@@ -187,8 +187,9 @@ const MONITOR_QUERY = `query MonitorPR($owner: String!, $repo: String!, $number:
                 status
                 app { name slug }
                 checkRuns(last: 50) {
-                  nodes { name conclusion status
+                  nodes { name conclusion status detailsUrl permalink
                     annotations(first: 50) {
+                      totalCount
                       nodes { path location { start { line } } annotationLevel title message }
                     }
                   }
@@ -327,11 +328,14 @@ type CheckRun struct {
 	Name        string          `json:"name"`
 	Conclusion  string          `json:"conclusion"`
 	Status      string          `json:"status"`
+	DetailsURL  string          `json:"detailsUrl"`
+	Permalink   string          `json:"permalink"`
 	Annotations AnnotationNodes `json:"annotations"`
 }
 
 type AnnotationNodes struct {
-	Nodes []Annotation `json:"nodes"`
+	Nodes      []Annotation `json:"nodes"`
+	TotalCount int          `json:"totalCount"`
 }
 
 // Annotation is a raw GraphQL check-run annotation.
@@ -399,8 +403,9 @@ const MONITOR_REF_QUERY = `query MonitorRef($owner: String!, $repo: String!, $re
               status
               app { name slug }
               checkRuns(last: 50) {
-                nodes { name conclusion status
+                nodes { name conclusion status detailsUrl permalink
                   annotations(first: 50) {
+                    totalCount
                     nodes { path location { start { line } } annotationLevel title message }
                   }
                 }
@@ -430,8 +435,9 @@ const MONITOR_COMMIT_QUERY = `query MonitorCommit($owner: String!, $repo: String
             status
             app { name slug }
             checkRuns(last: 50) {
-              nodes { name conclusion status
+              nodes { name conclusion status detailsUrl permalink
                 annotations(first: 50) {
+                  totalCount
                   nodes { path location { start { line } } annotationLevel title message }
                 }
               }
@@ -726,6 +732,13 @@ type PRStatus struct {
 	// limit. When true, the snapshot is degraded: AwaitingChecks may report
 	// checks as absent that actually ran in the dropped suites.
 	TruncatedSuites bool `json:"truncated_suites,omitempty"`
+	// AnnotationsTruncated is true when the annotation set may be incomplete
+	// because the API returned a truncated view (totalCount > fetched, or
+	// totalCount >= 10 implying the per-step cap).
+	AnnotationsTruncated bool `json:"annotations_truncated,omitempty"`
+	// AnnotationsURL is the check run's permalink when annotations are
+	// truncated, so a consumer can view the full set.
+	AnnotationsURL string `json:"annotations_url,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -766,8 +779,8 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		FailingChecks:     failingChecks(pr),
 		PendingChecks:     pendingChecks(pr),
 		SuccessfulChecks:  successfulChecks(pr),
-		CheckAnnotations:  extractAnnotations(pr, opts.AnnotationLevels),
 	}
+	status.CheckAnnotations, status.AnnotationsTruncated, status.AnnotationsURL = extractAnnotations(pr, opts.AnnotationLevels)
 
 	// Detect truncated suites: the API returned fewer nodes than exist.
 	status.TruncatedSuites = truncatedSuites(pr)
@@ -891,11 +904,11 @@ func suiteName(s *CheckSuite) string {
 }
 
 // extractAnnotations collects annotations from all check runs across all
-// check suites of the head commit, filtered by levels. The run status is
-// deliberately not checked — an in-progress run may report partial
-// annotations, but they are deduped on the next poll, so filtering on
-// status gains nothing.
-func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) []AnnotationSummary {
+// check suites of the head commit, filtered by levels. It also detects
+// truncation: when any check run has totalCount >= 10 (the per-step GitHub
+// cap) or totalCount > len(nodes) (our first: 50 page is full), the returned
+// truncated flag is true and the URL points to the first such run's permalink.
+func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) (annotations []AnnotationSummary, truncated bool, url string) {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
 	for i := range pr.Commits.Nodes {
@@ -903,7 +916,18 @@ func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) []AnnotationS
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
 			for _, run := range suite.CheckRuns.Nodes {
-				for _, ann := range run.Annotations.Nodes {
+				runAnns := run.Annotations
+				if runAnns.TotalCount >= 10 && !truncated {
+					truncated = true
+					url = run.Permalink
+				}
+				if runAnns.TotalCount > len(runAnns.Nodes) && !truncated {
+					truncated = true
+					if url == "" {
+						url = run.Permalink
+					}
+				}
+				for _, ann := range runAnns.Nodes {
 					if !levels.Allows(ann.Level) {
 						continue
 					}
@@ -924,7 +948,7 @@ func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) []AnnotationS
 			}
 		}
 	}
-	return out
+	return out, truncated, url
 }
 
 // failingChecks collects names of failing check suites/runs plus old-style

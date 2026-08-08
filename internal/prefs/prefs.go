@@ -66,7 +66,7 @@ var defaultTemplates = map[string]string{
 	"repo-new-issue": "🆕 New issue {repoItemNumber}: {repoItemTitle} by {repoItemAuthor} in {prLabel}",
 
 	// Check-run annotations
-	"check-annotations": "📋 {annotationCount} annotation(s) from {annotationCheckNames} on {prLabel}",
+	"check-annotations": "📋 {annotationCount}{annotationTruncated} annotation(s) from {annotationCheckNames} on {prLabel}",
 }
 
 // DefaultPreferences returns a fresh copy of the built-in defaults.
@@ -125,6 +125,8 @@ var recognizedTokens = map[string]bool{
 
 	"annotationCount":      true,
 	"annotationCheckNames": true,
+	"annotationTruncated":  true,
+	"annotationUrl":        true,
 }
 
 // tokenRE matches a single {token} placeholder. The token name is captured.

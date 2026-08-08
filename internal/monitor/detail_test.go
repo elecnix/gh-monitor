@@ -113,6 +113,36 @@ func TestRenderNotification_CommentDetail(t *testing.T) {
 	assert.Contains(t, n.Detail, "react G1 --type thumbs_up")
 }
 
+func TestAnnotationsDetail(t *testing.T) {
+	t.Run("non-truncated renders annotations without warning", func(t *testing.T) {
+		anns := []AnnotationSummary{
+			{CheckName: "lint", Path: "x.go", Line: 1, Level: "WARNING", Title: "unused", Message: "var x is unused"},
+		}
+		out := annotationsDetail(anns, false, "")
+		assert.Contains(t, out, "lint [WARNING] x.go:1: unused — var x is unused")
+		assert.NotContains(t, out, "incomplete")
+		assert.NotContains(t, out, "⚠️")
+	})
+
+	t.Run("truncated appends warning with URL", func(t *testing.T) {
+		anns := []AnnotationSummary{
+			{CheckName: "lint", Path: "x.go", Line: 1, Level: "WARNING", Title: "unused", Message: "var x is unused"},
+		}
+		out := annotationsDetail(anns, true, "https://github.com/o/r/actions/runs/1")
+		assert.Contains(t, out, "⚠️")
+		assert.Contains(t, out, "incomplete")
+		assert.Contains(t, out, "https://github.com/o/r/actions/runs/1")
+		assert.Contains(t, out, "1 shown here")
+	})
+
+	t.Run("truncated with empty annotations still shows warning", func(t *testing.T) {
+		out := annotationsDetail(nil, true, "https://github.com/o/r/actions/runs/1")
+		assert.Contains(t, out, "⚠️")
+		assert.Contains(t, out, "incomplete")
+		assert.Contains(t, out, "0 shown here")
+	})
+}
+
 func TestLinkifyText(t *testing.T) {
 	t.Run("wraps pr label", func(t *testing.T) {
 		n := Notification{
