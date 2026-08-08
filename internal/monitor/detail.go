@@ -170,7 +170,9 @@ func commentsDetail(comments []GeneralComment) string {
 }
 
 // annotationsDetail renders a readable block of check-run annotations.
-func annotationsDetail(annotations []AnnotationSummary) string {
+// When truncated is true, it appends a warning line pointing to the URL
+// where the full set is visible.
+func annotationsDetail(annotations []AnnotationSummary, truncated bool, url string) string {
 	parts := make([]string, 0, len(annotations))
 	for _, a := range annotations {
 		loc := a.Path
@@ -179,7 +181,14 @@ func annotationsDetail(annotations []AnnotationSummary) string {
 		}
 		parts = append(parts, fmt.Sprintf("%s [%s] %s: %s — %s", a.CheckName, a.Level, loc, a.Title, a.Message))
 	}
-	return strings.Join(parts, "\n")
+	result := strings.Join(parts, "\n")
+	if truncated {
+		if result != "" {
+			result += "\n"
+		}
+		result += fmt.Sprintf("⚠️  Annotation count may be incomplete — %d shown here. See %s for the full set.", len(annotations), url)
+	}
+	return result
 }
 
 // osc8 wraps text in an OSC-8 terminal hyperlink pointing at url.

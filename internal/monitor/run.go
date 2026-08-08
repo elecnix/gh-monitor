@@ -673,7 +673,7 @@ func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Even
 	case EventReviewApproved, EventReviewChangesRequested, EventReviewDismissed:
 		n.ReviewAuthor = ev.ReviewAuthor
 	case EventCheckAnnotations:
-		n.Detail = annotationsDetail(ev.Annotations)
+		n.Detail = annotationsDetail(ev.Annotations, ev.AnnotationsTruncated, ev.AnnotationsURL)
 	}
 	return n
 }
@@ -725,6 +725,12 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 			}
 		}
 		vars["annotationCheckNames"] = strings.Join(names, ", ")
+		if ev.AnnotationsTruncated {
+			vars["annotationTruncated"] = " (truncated)"
+		} else {
+			vars["annotationTruncated"] = ""
+		}
+		vars["annotationUrl"] = ev.AnnotationsURL
 	}
 
 	return vars

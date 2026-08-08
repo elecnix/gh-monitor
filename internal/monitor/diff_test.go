@@ -411,6 +411,39 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 	})
 }
 
+func TestDiff_CheckAnnotations_Truncated(t *testing.T) {
+	t.Run("truncation flag is propagated to event", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "lint", Path: "x.go", Line: 1, Level: "WARNING", Title: "t", Message: "m"},
+			},
+			AnnotationsTruncated: true,
+			AnnotationsURL:       "https://github.com/o/r/actions/runs/42",
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e)
+		assert.True(t, e.AnnotationsTruncated, "truncation flag must propagate from status to event")
+		assert.Equal(t, "https://github.com/o/r/actions/runs/42", e.AnnotationsURL)
+	})
+
+	t.Run("non-truncated status does not set flag", func(t *testing.T) {
+		prev := &PRStatus{}
+		curr := &PRStatus{
+			CheckAnnotations: []AnnotationSummary{
+				{CheckName: "lint", Path: "x.go", Line: 1, Level: "WARNING", Title: "t", Message: "m"},
+			},
+			AnnotationsTruncated: false,
+		}
+		events := Diff(prev, curr)
+		e := findEvent(events, EventCheckAnnotations)
+		require.NotNil(t, e)
+		assert.False(t, e.AnnotationsTruncated, "non-truncated flag must not be set")
+		assert.Empty(t, e.AnnotationsURL)
+	})
+}
+
 func TestDiff_MultipleEventsInOnePass(t *testing.T) {
 	prev := &PRStatus{
 		State:         "OPEN",
