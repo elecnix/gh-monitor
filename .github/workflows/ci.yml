@@ -29,3 +29,23 @@ jobs:
         with:
           version: latest
           args: --timeout=5m
+
+  # Cross-compile check: every target script/build.sh publishes.
+  # Keep this list in sync with script/build.sh (source of truth).
+  cross-compile:
+    runs-on: arc-runners
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile every published target
+        run: |
+          set -euo pipefail
+          # Keep in sync with script/build.sh (source of truth).
+          for pair in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64; do
+            echo "==> $pair"
+            GOOS="${pair%%/*}" GOARCH="${pair##*/}" go build ./...
+          done
