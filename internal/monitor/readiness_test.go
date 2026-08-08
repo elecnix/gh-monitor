@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,13 +18,14 @@ func TestFetchReadiness(t *testing.T) {
 			assert.Contains(t, query, "MonitorReadiness")
 			assert.Equal(t, "octocat", variables["owner"])
 			assert.Equal(t, "hello", variables["repo"])
-			assert.Equal(t, 100, variables["first"])
+			assert.Equal(t, 25, variables["first"])
 			return assign(result, ReadinessQueryResponse{
 				Repository: struct {
 					PullRequests ReadinessPRNodes `json:"pullRequests"`
 				}{
 					PullRequests: ReadinessPRNodes{
 						TotalCount: 1,
+						PageInfo:   PageInfo{HasNextPage: false},
 						Nodes: []ReadinessPR{
 							{
 								Number:           1,
@@ -43,6 +45,115 @@ func TestFetchReadiness(t *testing.T) {
 		require.Len(t, got.Repository.PullRequests.Nodes, 1)
 		assert.Equal(t, 1, got.Repository.PullRequests.Nodes[0].Number)
 		assert.Equal(t, "alice", got.Repository.PullRequests.Nodes[0].Author.Login)
+	})
+
+	t.Run("paginates across multiple pages", func(t *testing.T) {
+		calls := 0
+		api := &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			calls++
+			assert.Equal(t, 25, variables["first"])
+
+			switch calls {
+			case 1:
+				assert.NotContains(t, variables, "after")
+				return assign(result, ReadinessQueryResponse{
+					Repository: struct {
+						PullRequests ReadinessPRNodes `json:"pullRequests"`
+					}{
+						PullRequests: ReadinessPRNodes{
+							TotalCount: 45,
+							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-25"},
+							Nodes: []ReadinessPR{
+								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+							},
+						},
+					},
+				})
+			case 2:
+				assert.Equal(t, "cursor-25", variables["after"])
+				return assign(result, ReadinessQueryResponse{
+					Repository: struct {
+						PullRequests ReadinessPRNodes `json:"pullRequests"`
+					}{
+						PullRequests: ReadinessPRNodes{
+							TotalCount: 45,
+							PageInfo:   PageInfo{HasNextPage: false},
+							Nodes: []ReadinessPR{
+								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+							},
+						},
+					},
+				})
+			default:
+				t.Fatal("unexpected third page call")
+			}
+			return nil
+		}}
+		svc := &Service{API: api}
+		got, err := svc.FetchReadiness("octocat", "hello")
+		require.NoError(t, err)
+		assert.Equal(t, 2, calls)
+		require.Len(t, got.Repository.PullRequests.Nodes, 2)
+		assert.Equal(t, 45, got.Repository.PullRequests.TotalCount)
+		assert.Equal(t, 1, got.Repository.PullRequests.Nodes[0].Number)
+		assert.Equal(t, 2, got.Repository.PullRequests.Nodes[1].Number)
+	})
+
+	t.Run("halves page size on resource limit error", func(t *testing.T) {
+		calls := 0
+		api := &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			calls++
+
+			switch calls {
+			case 1:
+				// First attempt: pageSize 25 fails with resource limit.
+				assert.Equal(t, 25, variables["first"])
+				return fmt.Errorf("gh api error: gh: Resource limits for this query exceeded")
+			case 2:
+				// Retry: pageSize 12 succeeds.
+				assert.Equal(t, 12, variables["first"])
+				assert.NotContains(t, variables, "after")
+				return assign(result, ReadinessQueryResponse{
+					Repository: struct {
+						PullRequests ReadinessPRNodes `json:"pullRequests"`
+					}{
+						PullRequests: ReadinessPRNodes{
+							TotalCount: 41,
+							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-12"},
+							Nodes: []ReadinessPR{
+								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+							},
+						},
+					},
+				})
+			case 3:
+				// Second page of the retry: still pageSize 12.
+				assert.Equal(t, 12, variables["first"])
+				assert.Equal(t, "cursor-12", variables["after"])
+				return assign(result, ReadinessQueryResponse{
+					Repository: struct {
+						PullRequests ReadinessPRNodes `json:"pullRequests"`
+					}{
+						PullRequests: ReadinessPRNodes{
+							TotalCount: 41,
+							PageInfo:   PageInfo{HasNextPage: false},
+							Nodes: []ReadinessPR{
+								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+							},
+						},
+					},
+				})
+			default:
+				t.Fatal("unexpected call")
+			}
+			return nil
+		}}
+		svc := &Service{API: api}
+		got, err := svc.FetchReadiness("octocat", "hello")
+		require.NoError(t, err)
+		assert.Equal(t, 3, calls)
+		require.Len(t, got.Repository.PullRequests.Nodes, 2)
+		assert.Equal(t, 41, got.Repository.PullRequests.TotalCount)
 	})
 }
 
@@ -412,6 +523,36 @@ func TestReadinessReport_FormatDegraded(t *testing.T) {
 	s := report.Format()
 	assert.Contains(t, s, "staging=degraded")
 	assert.Contains(t, s, "graphql error")
+	// Degraded report must not render open=0 — that would be a falsehood.
+	assert.NotContains(t, s, "open=0")
+	assert.Contains(t, s, "open=?")
+	assert.Contains(t, s, "ready=?")
+	assert.Contains(t, s, "not-ready=?")
+	assert.Contains(t, s, "others=?")
+	// Degraded report must not present empty buckets as a result.
+	assert.NotContains(t, s, "ready=[]")
+	assert.NotContains(t, s, "not-ready=[]")
+	assert.NotContains(t, s, "others=[]")
+}
+
+func TestReadinessReport_FormatZeroOpen(t *testing.T) {
+	// A genuine zero-open-PRs repo must still render as a real zero,
+	// distinguishable from the degraded case (open=?).
+	report := &ReadinessReport{
+		Owner:  "octocat",
+		Repo:   "empty-repo",
+		Open:   0,
+		Viewer: "viewer",
+	}
+	s := report.Format()
+	assert.Contains(t, s, "staging=success")
+	assert.Contains(t, s, "open=0")
+	assert.Contains(t, s, "ready=[]")
+	assert.Contains(t, s, "not-ready=[]")
+	assert.Contains(t, s, "others=[]")
+	// Must NOT contain degraded markers.
+	assert.NotContains(t, s, "open=?")
+	assert.NotContains(t, s, "staging=degraded")
 }
 
 func TestReadinessReport_Reconcile(t *testing.T) {

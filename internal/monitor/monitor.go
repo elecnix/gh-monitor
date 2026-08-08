@@ -355,7 +355,8 @@ type AppInfo struct {
 }
 
 type RunNodes struct {
-	Nodes []CheckRun `json:"nodes"`
+	Nodes      []CheckRun `json:"nodes"`
+	TotalCount int        `json:"totalCount"`
 }
 
 type CheckRun struct {
@@ -1106,6 +1107,12 @@ func truncatedSuites(pr *PullRequest) bool {
 		c := &pr.Commits.Nodes[i].Commit
 		if c.CheckSuites.TotalCount > len(c.CheckSuites.Nodes) {
 			return true
+		}
+		for j := range c.CheckSuites.Nodes {
+			suite := &c.CheckSuites.Nodes[j]
+			if suite.CheckRuns.TotalCount > len(suite.CheckRuns.Nodes) {
+				return true
+			}
 		}
 	}
 	return false

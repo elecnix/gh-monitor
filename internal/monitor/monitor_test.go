@@ -1130,6 +1130,33 @@ func TestSnapshot_TruncatedSuites(t *testing.T) {
 		s := Snapshot(pr, SnapshotOptions{})
 		assert.False(t, s.TruncatedSuites)
 	})
+
+	t.Run("truncated check runs detected", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{
+				Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"},
+				CheckRuns: RunNodes{TotalCount: 20, Nodes: []CheckRun{
+					{Name: "unit", Conclusion: "SUCCESS", Status: "COMPLETED"},
+				}},
+			},
+		)
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.True(t, s.TruncatedSuites, "truncated runs must set TruncatedSuites")
+	})
+
+	t.Run("untruncated runs when counts match", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{
+				Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"},
+				CheckRuns: RunNodes{TotalCount: 2, Nodes: []CheckRun{
+					{Name: "unit", Conclusion: "SUCCESS", Status: "COMPLETED"},
+					{Name: "lint", Conclusion: "SUCCESS", Status: "COMPLETED"},
+				}},
+			},
+		)
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.False(t, s.TruncatedSuites)
+	})
 }
 
 func TestDiff_AwaitingChecksPreventsCIAllGreen(t *testing.T) {
