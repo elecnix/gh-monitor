@@ -754,3 +754,261 @@ func TestDiffIssues_NilPrev(t *testing.T) {
 	events := DiffIssues(nil, curr)
 	assert.Empty(t, events)
 }
+
+// ---------------------------------------------------------------------------
+// Ruleset / required checks tests (issue #30)
+// ---------------------------------------------------------------------------
+
+func mkPRWithCheckSuites(suites ...CheckSuite) *PullRequest {
+	return &PullRequest{
+		State: "OPEN",
+		Commits: CommitNodes{Nodes: []Commit{{
+			Commit: CommitDetails{
+				Oid:             "abc1234",
+				MessageHeadline: "fix",
+				CheckSuites:     SuiteNodes{Nodes: suites, TotalCount: len(suites)},
+			},
+		}}},
+	}
+}
+
+func TestSnapshot_AwaitingChecks(t *testing.T) {
+	// A required context that is entirely absent from the payload must appear
+	// in AwaitingChecks — it is not failing (it never ran), not pending.
+	t.Run("absent required check reported as awaiting", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: []string{"CI", "security-scan"}},
+		})
+		assert.ElementsMatch(t, []string{"security-scan"}, s.AwaitingChecks)
+		assert.Empty(t, s.FailingChecks)
+		assert.Empty(t, s.PendingChecks)
+		assert.Equal(t, "", s.RulesetError)
+	})
+
+	t.Run("all required checks present — no awaiting", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: []string{"CI"}},
+		})
+		assert.Empty(t, s.AwaitingChecks)
+	})
+
+	t.Run("required check present as a run name", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{
+				Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"},
+				CheckRuns: RunNodes{Nodes: []CheckRun{{Name: "unit", Conclusion: "SUCCESS"}}},
+			},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: []string{"unit"}},
+		})
+		assert.Empty(t, s.AwaitingChecks)
+		assert.Contains(t, s.SuccessfulChecks, "unit")
+	})
+
+	t.Run("required check present as status context", func(t *testing.T) {
+		pr := &PullRequest{
+			State: "OPEN",
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid:             "abc1234",
+					MessageHeadline: "fix",
+					Status:          &CommitStatus{Contexts: []StatusContext{{State: "SUCCESS", Context: "circleci"}}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: []string{"circleci"}},
+		})
+		assert.Empty(t, s.AwaitingChecks)
+	})
+
+	t.Run("no ruleset — no awaiting", func(t *testing.T) {
+		pr := mkPRWithCheckSuites()
+		s := Snapshot(pr, SnapshotOptions{}) // nil RulesetChecks
+		assert.Empty(t, s.AwaitingChecks)
+		assert.Equal(t, "", s.RulesetError)
+	})
+
+	t.Run("empty required list — no awaiting", func(t *testing.T) {
+		pr := mkPRWithCheckSuites()
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: nil},
+		})
+		assert.Empty(t, s.AwaitingChecks)
+	})
+}
+
+func TestSnapshot_RulesetError(t *testing.T) {
+	// A ruleset that cannot be read must produce a loud degraded signal — a
+	// non-empty RulesetError — rather than an empty required-set that silently
+	// becomes "nothing is required."
+	t.Run("ruleset error is surfaced", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Error: "cannot read ruleset: HTTP 403"},
+		})
+		assert.Equal(t, "cannot read ruleset: HTTP 403", s.RulesetError)
+		assert.Empty(t, s.AwaitingChecks)
+	})
+
+	t.Run("ciAllGreen false when ruleset has error", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Error: "cannot read ruleset"},
+		})
+		assert.False(t, ciAllGreen(s), "ci-all-green must be false when ruleset cannot be read")
+	})
+
+	t.Run("ciAllGreen false when awaiting", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{
+			RulesetChecks: &RulesetChecks{Contexts: []string{"CI", "missing-check"}},
+		})
+		assert.False(t, ciAllGreen(s), "ci-all-green must be false when a required check is awaiting")
+	})
+}
+
+func TestSnapshot_CancelledRequiredCheckIsFailure(t *testing.T) {
+	// CANCELLED on a check that ran does not count as a pass. It is already in
+	// failureConclusions, which failingChecks catches. This test proves the
+	// end-to-end: a required check that concluded CANCELLED appears in
+	// FailingChecks, not in SuccessfulChecks, and ciAllGreen is false.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{
+			Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "CI"},
+		},
+	)
+	s := Snapshot(pr, SnapshotOptions{
+		RulesetChecks: &RulesetChecks{Contexts: []string{"CI"}},
+	})
+	assert.Contains(t, s.FailingChecks, "CI")
+	assert.NotContains(t, s.SuccessfulChecks, "CI")
+	assert.Empty(t, s.AwaitingChecks, "CANCELLED check is present in payload, not awaiting")
+	assert.False(t, ciAllGreen(s))
+}
+
+func TestSnapshot_SkippedNeutralRequiredSatisfied(t *testing.T) {
+	// SKIPPED and NEUTRAL on a required check count as satisfied — the check
+	// deliberately did not apply and no more events will arrive for it.
+	for _, tc := range []struct{ name, conclusion string }{
+		{"SKIPPED", "SKIPPED"},
+		{"NEUTRAL", "NEUTRAL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pr := mkPRWithCheckSuites(
+				CheckSuite{Status: "COMPLETED", Conclusion: tc.conclusion, App: AppInfo{Name: "CI"}},
+			)
+			s := Snapshot(pr, SnapshotOptions{
+				RulesetChecks: &RulesetChecks{Contexts: []string{"CI"}},
+			})
+			assert.Empty(t, s.FailingChecks)
+			assert.Empty(t, s.PendingChecks)
+			assert.Empty(t, s.AwaitingChecks)
+			assert.Contains(t, s.SuccessfulChecks, "CI")
+			assert.True(t, ciAllGreen(s))
+		})
+	}
+}
+
+func TestSnapshot_TruncatedSuites(t *testing.T) {
+	// When the API reports more suites than were fetched (totalCount > len(nodes)),
+	// TruncatedSuites must be set.
+	t.Run("truncated suites detected", func(t *testing.T) {
+		pr := &PullRequest{
+			State: "OPEN",
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid:             "abc1234",
+					MessageHeadline: "fix",
+					CheckSuites:     SuiteNodes{TotalCount: 15, Nodes: []CheckSuite{}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.True(t, s.TruncatedSuites)
+	})
+
+	t.Run("no truncation when counts match", func(t *testing.T) {
+		pr := mkPRWithCheckSuites(
+			CheckSuite{Conclusion: "SUCCESS", Status: "COMPLETED", App: AppInfo{Name: "CI"}},
+		)
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.False(t, s.TruncatedSuites)
+	})
+
+	t.Run("zero totalCount is not truncated", func(t *testing.T) {
+		pr := &PullRequest{
+			State: "OPEN",
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid:             "abc1234",
+					MessageHeadline: "fix",
+					CheckSuites:     SuiteNodes{TotalCount: 0, Nodes: []CheckSuite{}},
+				},
+			}}},
+		}
+		s := Snapshot(pr, SnapshotOptions{})
+		assert.False(t, s.TruncatedSuites)
+	})
+}
+
+func TestDiff_AwaitingChecksPreventsCIAllGreen(t *testing.T) {
+	// When awaitingChecks is non-empty, curr is not clean, so the ci-all-green
+	// transition must not fire even though failingChecks and pendingChecks are
+	// empty.
+	t.Run("awaiting checks prevent green transition", func(t *testing.T) {
+		prev := &PRStatus{FailingChecks: []string{"CI"}}
+		curr := &PRStatus{
+			AwaitingChecks: []string{"security-scan"},
+		}
+		events := Diff(prev, curr)
+		assert.Nil(t, findEvent(events, EventCIAllGreen),
+			"ci-all-green must not fire when awaiting checks are present")
+	})
+
+	t.Run("ruleset error prevents green transition", func(t *testing.T) {
+		prev := &PRStatus{FailingChecks: []string{"CI"}}
+		curr := &PRStatus{
+			RulesetError: "cannot read ruleset: 403",
+		}
+		events := Diff(prev, curr)
+		assert.Nil(t, findEvent(events, EventCIAllGreen),
+			"ci-all-green must not fire when ruleset error is present")
+	})
+
+	t.Run("clearing awaiting checks enables green transition", func(t *testing.T) {
+		prev := &PRStatus{AwaitingChecks: []string{"security-scan"}}
+		curr := &PRStatus{}
+		events := Diff(prev, curr)
+		assert.NotNil(t, findEvent(events, EventCIAllGreen),
+			"ci-all-green must fire when awaiting checks clear")
+	})
+}
+
+func TestRun_FirstPollWithAwaitingChecks(t *testing.T) {
+	// ciAllGreen returns false when AwaitingChecks is non-empty, regardless of
+	// the poll loop. This is a unit-level assertion on the ciAllGreen predicate.
+	s := &PRStatus{
+		State:            "OPEN",
+		SuccessfulChecks: []string{"CI"},
+		AwaitingChecks:   []string{"security-scan"},
+	}
+	assert.False(t, ciAllGreen(s), "ci-all-green must be false with awaiting checks")
+
+	// When awaiting checks are cleared and everything else is green, ciAllGreen is true.
+	s.AwaitingChecks = nil
+	assert.True(t, ciAllGreen(s))
+}

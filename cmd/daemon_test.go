@@ -58,7 +58,7 @@ func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.Pul
 		atomic.AddInt64(&calls, 1)
 		return prFn(), nil
 	}
-	h := hub.New(fetcher, time.Hour)
+	h := hub.New(fetcher, nil, time.Hour)
 
 	// macOS limits Unix socket paths to 104 bytes; t.TempDir() lives under a
 	// long /var/folders/... path, so use a short throwaway dir in the system
@@ -262,7 +262,7 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 		atomic.AddInt64(&fetches, 1)
 		return closedPR(), nil
 	}
-	h := hub.New(fetcher, time.Hour)
+	h := hub.New(fetcher, nil, time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	t.Cleanup(h.Stop)
@@ -298,7 +298,7 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 		atomic.AddInt64(&fetches, 1)
 		return closedPR(), nil
 	}
-	h := hub.New(fetcher, time.Hour)
+	h := hub.New(fetcher, nil, time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	t.Cleanup(h.Stop)

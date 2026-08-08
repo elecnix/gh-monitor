@@ -254,8 +254,25 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
+	// Fetch the branch ruleset once at startup so we know which checks are
+	// required. This is cached for the lifetime of the poll loop — rulesets
+	// rarely change mid-monitoring, and re-fetching on every poll would add
+	// latency for no benefit.
+	ruleset, rulesetErr := svc.FetchRequiredChecks(opts.Identity.Owner, opts.Identity.Repo)
+	if rulesetErr != nil {
+		fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", rulesetErr)
+	}
+
 	c := NewPRConsumer(opts)
 	errBackoff := time.Duration(0)
+
+	snapOpts := SnapshotOptions{
+		IgnoredBots:      opts.Prefs.IgnoredBots,
+		AnnotationLevels: opts.AnnotationLevels,
+	}
+	if ruleset != nil && ruleset.Error == "" {
+		snapOpts.RulesetChecks = ruleset
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -273,7 +290,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		}
 		errBackoff = 0
 
-		curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels})
+		curr := Snapshot(resp.Repository.PullRequest, snapOpts)
 		if c.Consume(curr, emit) {
 			return nil
 		}
@@ -299,7 +316,21 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	if err != nil {
 		return err
 	}
-	curr := Snapshot(resp.Repository.PullRequest, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels})
+
+	ruleset, rulesetErr := svc.FetchRequiredChecks(opts.Identity.Owner, opts.Identity.Repo)
+	if rulesetErr != nil {
+		fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", rulesetErr)
+	}
+
+	snapOpts := SnapshotOptions{
+		IgnoredBots:      opts.Prefs.IgnoredBots,
+		AnnotationLevels: opts.AnnotationLevels,
+	}
+	if ruleset != nil && ruleset.Error == "" {
+		snapOpts.RulesetChecks = ruleset
+	}
+
+	curr := Snapshot(resp.Repository.PullRequest, snapOpts)
 	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
 	for _, ev := range Diff(&PRStatus{}, curr) {
 		if ev.Type == EventNewCommit {
@@ -319,9 +350,17 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 // the state GitHub reports for the first seconds after a push, and the
 // permanent state of a repo without CI — FailingChecks and PendingChecks are
 // empty too, and announcing green there would be a guess, not an observation.
+//
+// When AwaitingChecks is non-empty, CI is not green: required checks from the
+// branch ruleset have not yet been created. When RulesetError is non-empty,
+// the required set is unknown and the monitor stays quiet rather than guessing.
+// When TruncatedSuites is true, the payload is incomplete and the monitor
+// cannot confirm that all checks ran.
 func ciAllGreen(s *PRStatus) bool {
 	return !s.Merged && s.State != "CLOSED" &&
 		len(s.FailingChecks) == 0 && len(s.PendingChecks) == 0 &&
+		len(s.AwaitingChecks) == 0 && s.RulesetError == "" &&
+		!s.TruncatedSuites &&
 		len(s.SuccessfulChecks) > 0
 }
 
@@ -583,10 +622,24 @@ func nextErrBackoff(cur, base time.Duration) time.Duration {
 // typ, and populates the structured fields relevant to the event.
 func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Event) Notification {
 	vars := buildVarsPR(opts.Identity, status, ev, opts.Interval)
+	msg := prefs.Interpolate(opts.Prefs.Templates[typ], vars)
+
+	// Append awaiting-checks info when present — this is not in the template
+	// because it is a structured suffix that depends on runtime state.
+	if status != nil && len(status.AwaitingChecks) > 0 {
+		msg = msg + " | awaiting: " + strings.Join(status.AwaitingChecks, ", ")
+	}
+	if status != nil && status.RulesetError != "" {
+		msg = msg + " | ⚠ ruleset: " + status.RulesetError
+	}
+	if status != nil && status.TruncatedSuites {
+		msg = msg + " | ⚠ check suite list was truncated — snapshot may be incomplete"
+	}
+
 	n := Notification{
 		Type:      typ,
 		PRLabel:   vars["prLabel"],
-		Message:   prefs.Interpolate(opts.Prefs.Templates[typ], vars),
+		Message:   msg,
 		Timestamp: opts.now(),
 	}
 	n.PRUrl = vars["prUrl"]
@@ -644,6 +697,7 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 		vars["unresolvedThreads"] = strconv.Itoa(len(status.UnresolvedThreads))
 		vars["generalComments"] = strconv.Itoa(len(status.GeneralComments))
 		vars["failingChecks"] = strings.Join(status.FailingChecks, ", ")
+		vars["awaitingChecks"] = strings.Join(status.AwaitingChecks, ", ")
 		vars["conflict"] = strconv.FormatBool(status.Conflict)
 		vars["reviewAuthor"] = status.ReviewAuthor
 		setCommitVars(vars, host, id, status.LastCommit)

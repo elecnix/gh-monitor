@@ -81,7 +81,14 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		return resp.Repository.PullRequest, nil
 	}
 
-	h := hub.New(fetch, interval)
+	// Ruleset function is called once per new poller to read the branch
+	// ruleset and determine required status checks.
+	rulesetFn := func(owner, repo string) (*monitor.RulesetChecks, error) {
+		svc := &monitor.Service{API: apiClientFactory("")}
+		return svc.FetchRequiredChecks(owner, repo)
+	}
+
+	h := hub.New(fetch, rulesetFn, interval)
 	defer h.Stop()
 
 	ctx, cancel := context.WithCancel(context.Background())
