@@ -22,6 +22,45 @@ type API interface {
 	GraphQL(query string, variables map[string]interface{}, result interface{}) error
 }
 
+// GitHubErrorBody is a parsed GitHub REST API error response — a valid JSON body
+// whose top-level shape matches {"message":"...","documentation_url":"..."}.
+// These are the bodies returned by non-2xx GitHub responses (403 rate limit,
+// 404 not found, 422 validation for private repos, etc.). They unmarshal
+// silently into any target struct, including GraphQL envelope wrappers — the
+// fields do not collide and json.Unmarshal ignores unknowns.
+type GitHubErrorBody struct {
+	Message string `json:"message"`
+	Status  string `json:"status"`
+}
+
+// GitHubRateLimitBody is a parsed rate-limit error response.
+type GitHubRateLimitBody struct {
+	Message          string `json:"message"`
+	DocumentationURL string `json:"documentation_url"`
+	Status           string `json:"status"`
+}
+
+// IsGitHubErrorBody reports whether body is a GitHub REST API error document.
+func IsGitHubErrorBody(body []byte) (*GitHubErrorBody, bool) {
+	var eb GitHubErrorBody
+	if err := json.Unmarshal(body, &eb); err != nil {
+		return nil, false
+	}
+	if eb.Message != "" {
+		// A status field like "403" strengthens the match to avoid false
+		// positives on legitimate payloads that happen to have a "message" key.
+		if eb.Status != "" {
+			return &eb, true
+		}
+		// Rate-limit bodies specifically carry documentation_url.
+		var rlb GitHubRateLimitBody
+		if err := json.Unmarshal(body, &rlb); err == nil && rlb.DocumentationURL != "" {
+			return &GitHubErrorBody{Message: rlb.Message, Status: rlb.Status}, true
+		}
+	}
+	return nil, false
+}
+
 // GraphQLErrorEntry captures a single GraphQL error payload.
 type GraphQLErrorEntry struct {
 	Message string        `json:"message"`
@@ -142,8 +181,23 @@ func (c *Client) REST(method, path string, params map[string]string, body interf
 		return nil
 	}
 
-	if err := json.Unmarshal(stdout, result); err != nil {
-		return fmt.Errorf("unmarshal response: %w", err)
+	// Detect GitHub error bodies (rate limit, 403, etc.) that are valid JSON but
+	// not the expected data shape. These silently unmarshal into any target struct
+	// because json.Unmarshal ignores unknown fields — the caller gets a zero-value
+	// struct and may interpret it as valid (empty) data rather than as a failure.
+	if errBody, ok := IsGitHubErrorBody(stdout); ok {
+		return &APIError{
+			StatusCode: 403, // best-effort guess; Status may be "403" or empty
+			Message:    errBody.Message,
+			Body:       strings.TrimSpace(string(stdout)),
+			Stderr:     stderr,
+		}
+	}
+
+	if result != nil {
+		if err := json.Unmarshal(stdout, result); err != nil {
+			return fmt.Errorf("unmarshal response: %w", err)
+		}
 	}
 
 	return nil
@@ -176,6 +230,19 @@ func (c *Client) GraphQL(query string, variables map[string]interface{}, result 
 
 	if result == nil {
 		return nil
+	}
+
+	// Before parsing as a GraphQL envelope, check for a REST-style error body.
+	// When the GraphQL endpoint is rate-limited, GitHub returns a REST error
+	// body that json.Unmarshal into the envelope struct would treat as valid
+	// (both Data and Errors nil/omitted).
+	if errBody, ok := IsGitHubErrorBody(stdout); ok {
+		return &APIError{
+			StatusCode: 403,
+			Message:    errBody.Message,
+			Body:       strings.TrimSpace(string(stdout)),
+			Stderr:     stderr,
+		}
 	}
 
 	var envelope struct {

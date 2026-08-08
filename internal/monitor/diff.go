@@ -33,6 +33,11 @@ const (
 	EventRepoNewPR        EventType = "repo-new-pr"
 	EventRepoNewIssue     EventType = "repo-new-issue"
 	EventCheckAnnotations EventType = "check-annotations"
+
+	// EventDegraded signals that an API surface (rest, graphql, or both)
+	// could not be read. The previous snapshot is retained; no inferred
+	// state replaces it. Rate-limit details are carried when known.
+	EventDegraded EventType = "degraded"
 )
 
 // Event describes a single genuinely-new change between two snapshots. Only the
@@ -76,6 +81,17 @@ type Event struct {
 	// AnnotationsURL is the check run's permalink when annotations are
 	// truncated, so a consumer can view the full set.
 	AnnotationsURL string `json:"annotations_url,omitempty"`
+
+	// DegradedSurface is set on EventDegraded to indicate which API surface
+	// could not be read: "rest", "graphql", or "both".
+	DegradedSurface string `json:"degraded_surface,omitempty"`
+
+	// DegradedMessage carries the error detail for EventDegraded.
+	DegradedMessage string `json:"degraded_message,omitempty"`
+
+	// DegradedResetAt is an ISO 8601 timestamp of the rate-limit reset (when
+	// known). When set, the caller should back off until this time.
+	DegradedResetAt string `json:"degraded_reset_at,omitempty"`
 }
 
 // Diff returns the genuinely-new changes between prev and curr.

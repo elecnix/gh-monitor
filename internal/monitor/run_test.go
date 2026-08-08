@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -743,4 +744,141 @@ func TestOnceRun_EmitsCurrentActionable(t *testing.T) {
 	types := typesOf(got)
 	assert.Equal(t, firstPollType, types[0])
 	assert.Contains(t, types, string(EventRunCompleted))
+}
+
+// ---------------------------------------------------------------------------
+// Degradation tests (issue #33)
+// ---------------------------------------------------------------------------
+
+// failingPRAPI is a fakeAPI whose GraphQL method always returns the given error.
+func failingPRAPI(err error) *fakeAPI {
+	return &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			return err
+		},
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			return err
+		},
+	}
+}
+
+func TestRun_DegradedOnFetchError(t *testing.T) {
+	// A fetch error (e.g. gh exits 1) must emit a degraded event, not just
+	// log to stderr and continue silently.
+	api := failingPRAPI(errors.New("gh api failed: exit status 1"))
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	// Must contain a degraded event on the graphql surface.
+	var degraded *Notification
+	for i := range got {
+		if got[i].Type == string(EventDegraded) {
+			degraded = &got[i]
+		}
+	}
+	require.NotNil(t, degraded, "fetch error must emit a degraded event")
+	assert.Contains(t, degraded.Message, "degraded")
+	assert.Contains(t, degraded.Message, "graphql")
+}
+
+func TestRun_DegradedOnRateLimitBody(t *testing.T) {
+	// A successful gh invocation (exit 0) that returns a 403 rate-limit body
+	// must be detected by ghcli and surfaced as a degraded event. This is the
+	// case that bit: a valid-JSON error document yielding garbage data.
+	//
+	// We simulate this by having the REST call return an APIError that carries
+	// a rate-limit message, mimicking ghcli's detection of error bodies.
+	api := &fakeAPI{
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			return &ghcli.APIError{StatusCode: 403, Message: "API rate limit exceeded", Body: `{"message":"API rate limit exceeded","status":"403"}`}
+		},
+	}
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	opts.Identity = resolver.Identity{Owner: "o", Repo: "r", RunID: 42, Target: "run", Host: "github.com"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	var degraded *Notification
+	for i := range got {
+		if got[i].Type == string(EventDegraded) {
+			degraded = &got[i]
+		}
+	}
+	require.NotNil(t, degraded, "rate-limit error body must emit a degraded event")
+	assert.Contains(t, degraded.Message, "degraded")
+	assert.Contains(t, degraded.Message, "rest")
+}
+
+func TestRun_DegradedNoCIAllGreen(t *testing.T) {
+	// When a fetch fails, no ci-all-green event should be emitted — the
+	// previous snapshot is retained and no inference is made.
+	api := failingPRAPI(errors.New("gh api failed"))
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	for _, n := range got {
+		assert.NotEqual(t, string(EventCIAllGreen), n.Type,
+			"ci-all-green must not fire when fetch is degraded")
+	}
+}
+
+func TestRun_RefDegradedOnFetchError(t *testing.T) {
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			return errors.New("gh api failed")
+		},
+	}
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	opts.Identity = resolver.Identity{Owner: "o", Repo: "r", Ref: "main", Target: "ref", Host: "github.com"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	var degraded *Notification
+	for i := range got {
+		if got[i].Type == string(EventDegraded) {
+			degraded = &got[i]
+		}
+	}
+	require.NotNil(t, degraded, "ref fetch error must emit degraded")
+	assert.Contains(t, degraded.Message, "graphql")
 }

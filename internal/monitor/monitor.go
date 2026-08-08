@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/resolver"
@@ -127,6 +128,39 @@ func (s *Service) FetchRequiredChecks(owner, repo string) (*RulesetChecks, error
 	}
 
 	return &RulesetChecks{Contexts: contexts}, nil
+}
+
+// RateLimitResource holds the core rate-limit info for one API category.
+type RateLimitResource struct {
+	Limit     int    `json:"limit"`
+	Remaining int    `json:"remaining"`
+	Reset     int64  `json:"reset"`      // Unix epoch seconds
+	ResetAt   string `json:"-"`          // ISO 8601 derived from Reset
+}
+
+// RateLimitResponse is the parsed response from GET /rate_limit.
+type RateLimitResponse struct {
+	Resources struct {
+		Core    RateLimitResource `json:"core"`
+		GraphQL RateLimitResource `json:"graphql"`
+	} `json:"resources"`
+}
+
+// FetchRateLimit reads the current rate-limit status from GET /rate_limit.
+func (s *Service) FetchRateLimit() (*RateLimitResponse, error) {
+	var result RateLimitResponse
+	if err := s.API.REST("GET", "rate_limit", nil, nil, &result); err != nil {
+		return nil, err
+	}
+	if result.Resources.Core.Reset > 0 {
+		result.Resources.Core.ResetAt = time.Unix(
+			result.Resources.Core.Reset, 0).UTC().Format(time.RFC3339)
+	}
+	if result.Resources.GraphQL.Reset > 0 {
+		result.Resources.GraphQL.ResetAt = time.Unix(
+			result.Resources.GraphQL.Reset, 0).UTC().Format(time.RFC3339)
+	}
+	return &result, nil
 }
 
 // MONITOR_QUERY fetches the rich snapshot a monitor needs for a single PR:
