@@ -283,12 +283,15 @@ Each event carries the item's number, title, author, and URL in the `repo_items`
 
 #### Named instances with resumable cursors
 
-When watching a repository, `--instance <name>` enables a per-instance cursor so a restart resumes from where it left off — only items created after the cursor are emitted. Without a named instance, every restart replays the full backlog as "New PR", which is correct on first run but floods the operator on every subsequent restart.
+`--instance <name>` enables a per-instance cursor so a restart resumes from where it left off. For **repo targets**, the cursor is an item-creation timestamp — only items created after the cursor are emitted. For **PR and issue targets**, the cursor stores the last-delivered snapshot, so a restart re-diffs from that stored baseline and delivers everything that changed while offline (CI going red, reviews landing, comments arriving).
+
+Without a named instance, every restart replays the full backlog as "New PR" — correct on first run but a flood on every subsequent restart.
 
 ```sh
 # Named instances: each maintains its own independent cursor
 gh monitor -R owner/repo --instance orchestrator    # resumes from its cursor
 gh monitor -R owner/repo --instance agent-pr-957    # independent cursor
+gh monitor -R owner/repo 42 --instance agent-pr-42  # PR monitoring with resume
 
 # A brand-new instance starts at "now" — no pre-existing items are emitted
 gh monitor -R owner/repo --instance fresh-watcher

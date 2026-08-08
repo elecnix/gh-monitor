@@ -174,9 +174,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		FromBeginning: opts.FromBeginning,
 	}
 
-	// Wire cursor I/O for named instances (issue #32). The cursor is only
-	// meaningful for repo targets, but we thread it unconditionally — other
-	// targets ignore the fields.
+	// Wire cursor I/O for named instances (issue #32). Repo targets use the
+	// cursor's Position (a createdAt timestamp); PR and issue targets use the
+	// cursor's Snapshot (a JSON-serialised PRStatus or IssueStatus baseline).
 	if opts.Instance != "" {
 		prefsPath, err := prefs.ConfigPath("")
 		if err != nil {
@@ -190,10 +190,11 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// Load the existing cursor, if any.
 		if c, err := store.Load(opts.Instance); err == nil {
 			runOpts.CursorPosition = c.Position
+			runOpts.CursorSnapshot = c.Snapshot
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "gh-monitor: cursor load error: %v\n", err)
 		}
-		// AdvanceCursor persists the cursor after each poll.
+		// AdvanceCursor persists the repo cursor after each poll.
 		runOpts.AdvanceCursor = func(position string) {
 			c := cursor.Cursor{
 				Instance: opts.Instance,
@@ -201,6 +202,25 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 				Repo:    identity.Repo,
 				Position: position,
 				LastSeen: time.Now(),
+			}
+			if err := store.Save(c); err != nil {
+				fmt.Fprintf(os.Stderr, "gh-monitor: cursor save error: %v\n", err)
+			}
+		}
+		// SaveSnapshot persists the PR/issue baseline after each successful poll.
+		runOpts.SaveSnapshot = func(snapshotJSON string) {
+			// Load the current cursor to preserve any Position field (repo mode
+			// may have a Position set that we should not clobber).
+			c := cursor.Cursor{
+				Instance: opts.Instance,
+				Owner:    identity.Owner,
+				Repo:    identity.Repo,
+				Snapshot: snapshotJSON,
+				LastSeen: time.Now(),
+			}
+			// If there is an existing Position, carry it forward.
+			if existing, err := store.Load(opts.Instance); err == nil && existing.Position != "" {
+				c.Position = existing.Position
 			}
 			if err := store.Save(c); err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: cursor save error: %v\n", err)

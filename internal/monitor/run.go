@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -178,6 +179,18 @@ type RunOptions struct {
 	// this position. It is a no-op when nil.
 	AdvanceCursor func(position string)
 
+	// CursorSnapshot is the JSON-serialised last-known PRStatus or IssueStatus,
+	// loaded from the per-instance cursor store. When non-empty, the consumer
+	// starts from this stored baseline instead of an empty one, so a restart
+	// delivers everything that changed while offline (issue #32 PR mode).
+	CursorSnapshot string
+
+	// SaveSnapshot is called after each successful poll with a JSON-serialised
+	// PRStatus or IssueStatus. The caller persists this to the cursor store.
+	// It is NOT called on degraded (error) fetches — a cursor must not advance
+	// past events that were never actually read.
+	SaveSnapshot func(snapshotJSON string)
+
 	// Now and Sleep are injectable for tests. Now defaults to time.Now; Sleep
 	// defaults to a context-aware timer. Sleep must return the context error
 	// when the context is cancelled.
@@ -287,6 +300,17 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 	}
 
 	c := NewPRConsumer(opts)
+
+	// Restore the stored baseline for a named instance (issue #32).
+	// The first Consume diffs from this baseline instead of an empty one,
+	// so everything that changed while offline is delivered.
+	if opts.CursorSnapshot != "" {
+		var stored PRStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			c.RestoreBaseline(&stored)
+		}
+	}
+
 	errBackoff := time.Duration(0)
 
 	snapOpts := SnapshotOptions{
@@ -324,8 +348,10 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 
 		curr := Snapshot(resp.Repository.PullRequest, snapOpts)
 		if c.Consume(curr, emit) {
+			savePRSnapshot(opts, curr)
 			return nil
 		}
+		savePRSnapshot(opts, curr)
 
 		d := idleInterval(base, c.noChange)
 		if !deadline.IsZero() {
@@ -363,17 +389,30 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	}
 
 	curr := Snapshot(resp.Repository.PullRequest, snapOpts)
-	emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
-	for _, ev := range Diff(&PRStatus{}, curr) {
-		if ev.Type == EventNewCommit {
+
+	// Restore stored baseline for named instance one-shot (issue #32).
+	baseline := &PRStatus{}
+	if opts.CursorSnapshot != "" {
+		var stored PRStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			baseline = &stored
+		}
+	}
+	isFirstPoll := opts.CursorSnapshot == ""
+	if isFirstPoll {
+		emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
+	}
+	for _, ev := range Diff(baseline, curr) {
+		if isFirstPoll && ev.Type == EventNewCommit {
 			continue // agent just pushed it
 		}
 		emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
 	}
 	// ci-all-green never fires against an empty baseline — emit it explicitly.
-	if ciAllGreen(curr) {
+	if isFirstPoll && ciAllGreen(curr) {
 		emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
 	}
+	savePRSnapshot(opts, curr)
 	return nil
 }
 
@@ -542,6 +581,15 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 	}
 
 	var prev *IssueStatus
+
+	// Restore the stored baseline for a named instance (issue #32).
+	if opts.CursorSnapshot != "" {
+		var stored IssueStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			prev = &stored
+		}
+	}
+
 	noChange := 0
 	errBackoff := time.Duration(0)
 
@@ -593,6 +641,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 			noChange = 0
 		}
 		prev = curr
+		saveIssueSnapshot(opts, curr)
 
 		if curr.State == "CLOSED" {
 			if firstPoll && !terminalEmitted {
@@ -623,10 +672,23 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Not
 		return err
 	}
 	curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
-	emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
-	for _, ev := range DiffIssues(&IssueStatus{}, curr) {
+
+	// Restore stored baseline for named instance one-shot (issue #32).
+	baseline := &IssueStatus{}
+	isFirstPoll := opts.CursorSnapshot == ""
+	if !isFirstPoll {
+		var stored IssueStatus
+		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
+			baseline = &stored
+		}
+	}
+	if isFirstPoll {
+		emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
+	}
+	for _, ev := range DiffIssues(baseline, curr) {
 		emit(renderNotificationIssue(opts, curr, string(ev.Type), ev))
 	}
+	saveIssueSnapshot(opts, curr)
 	return nil
 }
 
@@ -668,6 +730,33 @@ func nextErrBackoff(cur, base time.Duration) time.Duration {
 		d = maxErrBackoff
 	}
 	return d
+}
+
+// savePRSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
+// when SaveSnapshot is nil (unnamed invocation or target not supporting
+// snapshots). Must only be called after a successful fetch.
+func savePRSnapshot(opts RunOptions, curr *PRStatus) {
+	if opts.SaveSnapshot == nil {
+		return
+	}
+	b, err := json.Marshal(curr)
+	if err != nil {
+		return
+	}
+	opts.SaveSnapshot(string(b))
+}
+
+// saveIssueSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
+// when SaveSnapshot is nil.
+func saveIssueSnapshot(opts RunOptions, curr *IssueStatus) {
+	if opts.SaveSnapshot == nil {
+		return
+	}
+	b, err := json.Marshal(curr)
+	if err != nil {
+		return
+	}
+	opts.SaveSnapshot(string(b))
 }
 
 // ---------------------------------------------------------------------------

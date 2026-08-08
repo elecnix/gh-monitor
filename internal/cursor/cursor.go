@@ -26,8 +26,13 @@ type Cursor struct {
 	Repo    string `json:"repo"`
 	// Position is the createdAt timestamp (ISO 8601) of the most recently
 	// seen item. On restart, the instance resumes from this position —
-	// emitting only items created after it.
+	// emitting only items created after it. Used for repo targets.
 	Position string `json:"position"`
+	// Snapshot is the JSON-serialised last-known state for a PR or issue
+	// target. On restart, the instance re-diffs from this stored baseline
+	// so it delivers everything that changed while offline. Empty for repo
+	// targets.
+	Snapshot string `json:"snapshot,omitempty"`
 	// LastSeen is the wall-clock time the cursor was last advanced.
 	LastSeen time.Time `json:"last_seen"`
 }

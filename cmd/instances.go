@@ -62,10 +62,20 @@ func newInstancesListCommand() *cobra.Command {
 				if c.LastSeen.IsZero() {
 					lastSeen = "-"
 				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%-24s %-32s %-24s %s\n",
+				kind := "repo"
+				pos := c.Position
+				if c.Snapshot != "" {
+					kind = "snap"
+					pos = "<snapshot>"
+				}
+				if pos == "" {
+					pos = "-"
+				}
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%-24s %-4s %-32s %-24s %s\n",
 					c.Instance,
+					kind,
 					fmt.Sprintf("%s/%s", c.Owner, c.Repo),
-					c.Position,
+					pos,
 					lastSeen,
 				)
 			}
