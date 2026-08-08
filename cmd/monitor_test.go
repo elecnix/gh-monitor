@@ -150,32 +150,45 @@ func TestMonitorOnceEmitsNDJSON_DefaultCommand(t *testing.T) {
 func TestMonitorRepoOnceEmitsNDJSON(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
+	t.Setenv("GH_VIEWER", "viewer")
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()
 
 	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		require.Contains(t, query, "MonitorRepo")
+		require.Contains(t, query, "MonitorReadiness")
 		return assignJSON(result, obj{
 			"repository": obj{
-				"pullRequests": obj{"nodes": []interface{}{obj{
-					"number":    1,
-					"title":     "feat: add x",
-					"state":     "OPEN",
-					"url":       "https://github.com/o/r/pull/1",
-					"createdAt": "2024-01-01T00:00:00Z",
-					"author":    obj{"login": "alice"},
-				}}},
-				"issues": obj{"nodes": []interface{}{obj{
-					"number":    42,
-					"title":     "bug report",
-					"state":     "OPEN",
-					"url":       "https://github.com/o/r/issues/42",
-					"createdAt": "2024-01-01T00:00:00Z",
-					"author":    obj{"login": "bob"},
-				}}},
+				"pullRequests": obj{
+					"totalCount": 1,
+					"nodes": []interface{}{obj{
+						"number":           1,
+						"state":            "OPEN",
+						"mergeable":        "MERGEABLE",
+						"mergeStateStatus": "CLEAN",
+						"author":           obj{"login": "viewer"},
+						"reviews":          obj{"nodes": []interface{}{}},
+						"commits": obj{"nodes": []interface{}{obj{
+							"commit": obj{
+								"oid":             "abc1234",
+								"messageHeadline": "test",
+								"message":         "",
+								"authors":         obj{"nodes": []interface{}{}},
+								"checkSuites": obj{
+									"totalCount": 0,
+									"nodes":      []interface{}{},
+								},
+								"status": nil,
+							},
+						}}},
+					}},
+				},
 			},
 		})
 	}}
+	// Mock the REST call for ruleset fetch (returns no rulesets).
+	fake.restFunc = func(method, path string, params map[string]string, body, result interface{}) error {
+		return assignJSON(result, []interface{}{})
+	}
 	apiClientFactory = func(string) ghcli.API { return fake }
 
 	root := newRootCommand()
@@ -186,23 +199,19 @@ func TestMonitorRepoOnceEmitsNDJSON(t *testing.T) {
 	require.NoError(t, root.Execute())
 
 	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
-	require.GreaterOrEqual(t, len(lines), 2)
-	var firstPollSeen, newPRSeen, newIssueSeen bool
+	require.GreaterOrEqual(t, len(lines), 1)
+	var readinessSeen bool
 	for _, ln := range lines {
 		var n map[string]interface{}
 		require.NoError(t, json.Unmarshal([]byte(ln), &n), "line not valid json: %s", ln)
-		switch n["type"] {
-		case "first-poll":
-			firstPollSeen = true
-		case "repo-new-pr":
-			newPRSeen = true
-		case "repo-new-issue":
-			newIssueSeen = true
+		if n["type"] == "readiness" {
+			readinessSeen = true
+			msg, _ := n["message"].(string)
+			assert.Contains(t, msg, "open=1")
+			assert.Contains(t, msg, "staging=success")
 		}
 	}
-	assert.True(t, firstPollSeen, "expected a first-poll event")
-	assert.True(t, newPRSeen, "expected a repo-new-pr event")
-	assert.True(t, newIssueSeen, "expected a repo-new-issue event")
+	assert.True(t, readinessSeen, "expected a readiness event")
 }
 
 func TestRootRejectsTooManyArgs(t *testing.T) {

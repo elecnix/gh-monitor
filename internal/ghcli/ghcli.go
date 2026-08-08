@@ -311,6 +311,20 @@ func CurrentPR() (int, error) {
 	return n, nil
 }
 
+// CurrentUser returns the authenticated user's login by delegating to
+// `gh api user -q '.login'`.
+func CurrentUser() (string, error) {
+	stdout, stderr, err := runGh([]string{"api", "user", "-q", ".login"}, nil)
+	if err != nil {
+		return "", wrapError(err, stdout, stderr)
+	}
+	result := strings.TrimSpace(string(stdout))
+	if result == "" {
+		return "", fmt.Errorf("gh api user returned empty login")
+	}
+	return result, nil
+}
+
 // FailedRunLogs returns the failed-job log output for a workflow run by
 // delegating to `gh run view <runID> --log-failed`. The output combines each
 // failing job's name with its error log lines, so a consumer can diagnose a
@@ -330,6 +344,12 @@ func (c *Client) FailedRunLogs(owner, repo string, runID int) (string, error) {
 		return "", wrapError(err, stdout, stderr)
 	}
 	return string(stdout), nil
+}
+
+// RunGh executes the `gh` CLI command with provided arguments and optional stdin data.
+// Exported for use by tests and other packages.
+func RunGh(args []string, stdin []byte) ([]byte, string, error) {
+	return runGh(args, stdin)
 }
 
 // runGh executes the `gh` CLI command with provided arguments and optional stdin data.

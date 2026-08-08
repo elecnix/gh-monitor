@@ -48,6 +48,7 @@ npx skills add elecnix/gh-monitor
 | `monitor` / `watch`             | Continuously watch a PR, streaming one event per change (NDJSON)           |
 | `monitor --run-id <id>`         | Watch a single GitHub Actions workflow run until it completes (NDJSON)     |
 | `monitor -R owner/repo`         | Watch a repository for new PRs and issues (NDJSON)                         |
+| `monitor -R owner/repo --once`  | Repo-wide merge-readiness view: which PRs can be merged now, and by whom   |
 | `draft status`                  | Check if a pull request is a draft                                         |
 | `draft mark`                    | Mark a pull request as draft                                               |
 | `draft ready`                   | Mark a pull request as ready for review                                    |
@@ -261,25 +262,51 @@ gh monitor --run-id 30433642 -R owner/repo --text
 
 The `run-completed` event carries the run's `conclusion` (`success`, `failure`, `timed_out`, `cancelled`, `neutral`, `action_required`, `stale`, `skipped`) as structured JSON, plus `run_id`, the run URL, and the head commit. When the conclusion is a failure variant (`failure`, `timed_out`, `cancelled`, `action_required`), the event also carries a `detail` body with a truncated snippet of the failed-job logs (the first 50 lines of `gh run view <run-id> --log-failed`), so an agent can diagnose the failure without an extra turn. The same `--interval`, `--timeout`, `--once`, `--text`, and `-R` flags apply. `--run-id` is mutually exclusive with the PR selector and `--ref`/`--commit`/`--issue`.
 
-### Monitoring a repository for new PRs and issues
+### Monitoring a repository (merge-readiness view)
 
-Use `--repo` alone (without a PR number, ref, commit, issue, or run-id) to watch an **entire repository** for new PRs and issues. The loop polls the repository and emits a `repo-new-pr` or `repo-new-issue` event for each genuinely-new item. Unlike PR/issue/run targets, repo targets never auto-stop — they run until cancelled or timed out.
+Use `--repo` alone (without a PR number, ref, commit, issue, or run-id) for a **repo-wide merge-readiness view**: one aggregate line per cycle showing which PRs are ready to merge and what every blocked PR is waiting for. This replaces the previous per-PR event stream — which answered "what appeared?" — with the answer to "what can I merge right now, and what is each blocked PR waiting on?"
 
 ```sh
-# Watch a repo for new PRs and issues (NDJSON, one event per line)
-gh monitor -R owner/repo
-
-# One-shot: emit the current state and exit
+# One-shot: show the merge-readiness snapshot and exit
 gh monitor -R owner/repo --once
 
-# Human-readable rendered messages instead of JSON
-gh monitor -R owner/repo --text
+# Continuous: poll on the configured interval
+gh monitor -R owner/repo --interval 60
 
-# With a timeout (stops after 1 hour)
-gh monitor -R owner/repo --timeout 3600
+# Human-readable rendered messages instead of JSON
+gh monitor -R owner/repo --once --text
+
+# Classify readiness as a specific viewer
+gh monitor -R owner/repo --once --viewer octocat
 ```
 
-Each event carries the item's number, title, author, and URL in the `repo_items` array. Templates for `repo-new-pr` and `repo-new-issue` are configurable via `prefs`.
+**Output format** — one line per cycle:
+
+```
+staging=success open=9 ready=[959 957] not-ready=[958(needs-codeowner) 956(awaiting:review) 828(red:gofmt)] others=[953@dependabot:red 573@octocat:ready]
+```
+
+**Buckets:**
+
+- **ready** — authored by the viewer, mergeable, all required checks present and green
+- **not-ready** — authored by the viewer, with a reason (`CONFLICTS`, `red:<check>`, `pending:<check>`, `awaiting:<check>`, `needs-codeowner`, `changes-requested`, `no-ci`, `mergeability-unknown`, `truncated`, `ruleset:<error>`)
+- **others** — authored by someone else; reason always included. Non-viewer PRs that would be \"ready\" appear as `others` with reason `ready` — the viewer can review and merge them.
+- **unknown** — surfaced explicitly rather than silently dropped (indicates a bug)
+
+Every open PR appears in exactly one bucket and the counts reconcile against the open total. A degraded API read produces `staging=degraded` rather than silently omitting or guessing.
+
+**`--viewer <login>`** sets whose perspective to classify from (default: authenticated user, resolved from the `gh` CLI). This determines:
+
+- `BLOCKED` + viewer's own PR → `needs-codeowner` (GitHub never counts self-approval; needs a different code owner)
+- `BLOCKED` + someone else's PR → `awaiting:review` (the viewer can review and merge)
+
+**Flags:**
+
+- `--viewer <login>` - GitHub login to classify readiness by (default: authenticated user)
+- `--interval <seconds>` - Polling interval (default: 60, min 10)
+- `--timeout <seconds>` - Maximum watch time (default: 0 = run forever)
+- `--once` - Fetch once, emit the current readiness snapshot, and exit
+- `--text` - Emit the formatted line instead of NDJSON
 
 #### Named instances with resumable cursors
 
