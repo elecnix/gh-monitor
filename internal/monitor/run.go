@@ -282,8 +282,17 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		resp, err := svc.Fetch(&opts.Identity, opts.Identity.Number)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			errBackoff = nextErrBackoff(errBackoff, base)
-			if serr := opts.sleep(ctx, errBackoff); serr != nil {
+			emitDegraded(opts, "graphql", err, emit)
+			d := nextErrBackoff(errBackoff, base)
+			errBackoff = d
+			// On rate limit, fetch the reset time and back off until then.
+			if reset := rateLimitResetSeconds(svc); reset > 0 {
+				until := time.Unix(reset, 0).UTC()
+				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+					d = wait
+				}
+			}
+			if serr := opts.sleep(ctx, d); serr != nil {
 				return serr
 			}
 			continue
@@ -397,8 +406,16 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			resp, err := svc.FetchCommit(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-				errBackoff = nextErrBackoff(errBackoff, base)
-				if serr := opts.sleep(ctx, errBackoff); serr != nil {
+				emitDegraded(opts, "graphql", err, emit)
+				d := nextErrBackoff(errBackoff, base)
+				errBackoff = d
+				if reset := rateLimitResetSeconds(svc); reset > 0 {
+					until := time.Unix(reset, 0).UTC()
+					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+						d = wait
+					}
+				}
+				if serr := opts.sleep(ctx, d); serr != nil {
 					return serr
 				}
 				continue
@@ -408,8 +425,16 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			resp, err := svc.FetchRef(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-				errBackoff = nextErrBackoff(errBackoff, base)
-				if serr := opts.sleep(ctx, errBackoff); serr != nil {
+				emitDegraded(opts, "graphql", err, emit)
+				d := nextErrBackoff(errBackoff, base)
+				errBackoff = d
+				if reset := rateLimitResetSeconds(svc); reset > 0 {
+					until := time.Unix(reset, 0).UTC()
+					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+						d = wait
+					}
+				}
+				if serr := opts.sleep(ctx, d); serr != nil {
 					return serr
 				}
 				continue
@@ -505,8 +530,16 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 		resp, err := svc.FetchIssue(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Number)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			errBackoff = nextErrBackoff(errBackoff, base)
-			if serr := opts.sleep(ctx, errBackoff); serr != nil {
+			emitDegraded(opts, "graphql", err, emit)
+			d := nextErrBackoff(errBackoff, base)
+			errBackoff = d
+			if reset := rateLimitResetSeconds(svc); reset > 0 {
+				until := time.Unix(reset, 0).UTC()
+				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+					d = wait
+				}
+			}
+			if serr := opts.sleep(ctx, d); serr != nil {
 				return serr
 			}
 			continue
@@ -915,8 +948,16 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		resp, err := svc.FetchRun(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.RunID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			errBackoff = nextErrBackoff(errBackoff, base)
-			if serr := opts.sleep(ctx, errBackoff); serr != nil {
+			emitDegraded(opts, "rest", err, emit)
+			d := nextErrBackoff(errBackoff, base)
+			errBackoff = d
+			if reset := rateLimitResetSeconds(svc); reset > 0 {
+				until := time.Unix(reset, 0).UTC()
+				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+					d = wait
+				}
+			}
+			if serr := opts.sleep(ctx, d); serr != nil {
 				return serr
 			}
 			continue
@@ -1095,8 +1136,16 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		resp, err := svc.FetchRepo(opts.Identity.Owner, opts.Identity.Repo)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			errBackoff = nextErrBackoff(errBackoff, base)
-			if serr := opts.sleep(ctx, errBackoff); serr != nil {
+			emitDegraded(opts, "graphql", err, emit)
+			d := nextErrBackoff(errBackoff, base)
+			errBackoff = d
+			if reset := rateLimitResetSeconds(svc); reset > 0 {
+				until := time.Unix(reset, 0).UTC()
+				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+					d = wait
+				}
+			}
+			if serr := opts.sleep(ctx, d); serr != nil {
 				return serr
 			}
 			continue
@@ -1221,4 +1270,68 @@ func repoItemsDetail(items []RepoItemSummary, typ string) string {
 		parts = append(parts, fmt.Sprintf("New %s #%d: %s (by %s)\n  %s", kind, it.Number, it.Title, it.Author, it.URL))
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// Degradation helpers (issue #33)
+// ---------------------------------------------------------------------------
+
+// degradedLabel builds a label for the degraded event.
+func degradedLabel(opts RunOptions) string {
+	id := opts.Identity
+	switch id.Target {
+	case "ref":
+		return fmt.Sprintf("%s/%s@%s", id.Owner, id.Repo, id.Ref)
+	case "commit":
+		label := fmt.Sprintf("%s/%s@%s", id.Owner, id.Repo, id.CommitSHA)
+		if len(id.CommitSHA) > 7 {
+			label = fmt.Sprintf("%s/%s@%s", id.Owner, id.Repo, id.CommitSHA[:7])
+		}
+		return label
+	case "issue":
+		return fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number)
+	case "run":
+		return fmt.Sprintf("%s/%s run #%d", id.Owner, id.Repo, id.RunID)
+	case "repo":
+		return fmt.Sprintf("%s/%s", id.Owner, id.Repo)
+	default:
+		return fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number)
+	}
+}
+
+// emitDegraded emits a degraded event notification for the given surface and
+// error.
+func emitDegraded(opts RunOptions, surface string, err error, emit func(Notification)) {
+	msg := err.Error()
+
+	label := degradedLabel(opts)
+	message := fmt.Sprintf("⚠️ API degraded (%s) on %s: %s", surface, label, msg)
+
+	emit(Notification{
+		Type:      string(EventDegraded),
+		PRLabel:   label,
+		Message:   message,
+		Timestamp: opts.now(),
+	})
+}
+
+// rateLimitResetSeconds extracts the rate-limit reset time from an error.
+// Returns 0 when the reset time cannot be determined.
+func rateLimitResetSeconds(svc *Service) int64 {
+	rl, err := svc.FetchRateLimit()
+	if err != nil {
+		return 0
+	}
+	// Pick the closer reset: the one with less remaining capacity.
+	// If both Core and GraphQL are close to exhausted, use the earlier reset.
+	var reset int64
+	if rl.Resources.Core.Remaining == 0 && rl.Resources.Core.Reset > 0 {
+		reset = rl.Resources.Core.Reset
+	}
+	if rl.Resources.GraphQL.Remaining == 0 && rl.Resources.GraphQL.Reset > 0 {
+		if reset == 0 || rl.Resources.GraphQL.Reset < reset {
+			reset = rl.Resources.GraphQL.Reset
+		}
+	}
+	return reset
 }
