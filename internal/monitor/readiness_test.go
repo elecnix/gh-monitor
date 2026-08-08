@@ -162,6 +162,25 @@ func makeReadinessPRBlocked(number int, author string) ReadinessPR {
 	return rp
 }
 
+// makeReadinessPRDraft creates a draft PR with clean CI.
+func makeReadinessPRDraft(number int, author string) ReadinessPR {
+	rp := makeReadinessPRWithCI(number, author, "MERGEABLE", "CLEAN")
+	rp.IsDraft = true
+	return rp
+}
+
+// makeReadinessPRBehind creates a BEHIND PR with clean CI.
+func makeReadinessPRBehind(number int, author string) ReadinessPR {
+	rp := makeReadinessPRWithCI(number, author, "MERGEABLE", "BEHIND")
+	return rp
+}
+
+// makeReadinessPRUnstable creates an UNSTABLE PR with clean CI.
+func makeReadinessPRUnstable(number int, author string) ReadinessPR {
+	rp := makeReadinessPRWithCI(number, author, "MERGEABLE", "UNSTABLE")
+	return rp
+}
+
 func TestClassifyPRsFull_CountsReconcile(t *testing.T) {
 	t.Run("every PR lands in exactly one bucket", func(t *testing.T) {
 		prs := []ReadinessPR{
@@ -455,5 +474,60 @@ func TestClassifyPRsFull_ConflictDeduplicatesRed(t *testing.T) {
 		assert.Len(t, report.NotReady, 1)
 		assert.Contains(t, report.NotReady[0].Reason, "CONFLICTS")
 		assert.NotContains(t, report.NotReady[0].Reason, "red:")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Draft PR tests
+// ---------------------------------------------------------------------------
+
+func TestClassifyPRsFull_DraftIsNotReady(t *testing.T) {
+	t.Run("draft PR with green CI is not ready", func(t *testing.T) {
+		prs := []ReadinessPR{
+			makeReadinessPRDraft(1, "viewer"),
+		}
+		report := ClassifyPRsFull(prs, "viewer", nil)
+		assert.Len(t, report.Ready, 0, "draft PR must never be ready")
+		assert.Len(t, report.NotReady, 1)
+		assert.Contains(t, report.NotReady[0].Reason, "draft")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// mergeStateStatus tests
+// ---------------------------------------------------------------------------
+
+func TestClassifyPRsFull_BehindNeedsRebase(t *testing.T) {
+	t.Run("BEHIND → needs-rebase", func(t *testing.T) {
+		prs := []ReadinessPR{
+			makeReadinessPRBehind(1, "viewer"),
+		}
+		report := ClassifyPRsFull(prs, "viewer", nil)
+		assert.Len(t, report.Ready, 0, "BEHIND PR must not be ready")
+		assert.Len(t, report.NotReady, 1)
+		assert.Contains(t, report.NotReady[0].Reason, "needs-rebase")
+	})
+}
+
+func TestClassifyPRsFull_UnstableIsNotReady(t *testing.T) {
+	t.Run("UNSTABLE → unstable", func(t *testing.T) {
+		prs := []ReadinessPR{
+			makeReadinessPRUnstable(1, "viewer"),
+		}
+		report := ClassifyPRsFull(prs, "viewer", nil)
+		assert.Len(t, report.Ready, 0, "UNSTABLE PR must not be ready")
+		assert.Len(t, report.NotReady, 1)
+		assert.Contains(t, report.NotReady[0].Reason, "unstable")
+	})
+}
+
+func TestClassifyPRsFull_UnknownMergeStateIsNotReady(t *testing.T) {
+	t.Run("unknown mergeStateStatus must not silently produce ready", func(t *testing.T) {
+		rp := makeReadinessPRWithCI(1, "viewer", "MERGEABLE", "SOMETHING_NEW")
+		prs := []ReadinessPR{rp}
+		report := ClassifyPRsFull(prs, "viewer", nil)
+		assert.Len(t, report.Ready, 0, "unrecognised mergeStateStatus must not be ready")
+		assert.Len(t, report.NotReady, 1)
+		assert.Contains(t, report.NotReady[0].Reason, "merge-state:SOMETHING_NEW")
 	})
 }

@@ -22,6 +22,7 @@ const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: 
       nodes {
         number
         state
+        isDraft
         mergeable
         mergeStateStatus
         author { login }
@@ -78,6 +79,7 @@ type ReadinessPRNodes struct {
 type ReadinessPR struct {
 	Number           int    `json:"number"`
 	State            string `json:"state"`
+	IsDraft          bool   `json:"isDraft"`
 	Mergeable        string `json:"mergeable"`
 	MergeStateStatus string `json:"mergeStateStatus"`
 	Author           struct {
@@ -216,6 +218,11 @@ func ClassifyPRsFull(prs []ReadinessPR, viewer string, ruleset *RulesetChecks) *
 func readinessReasonFull(rp *ReadinessPR, status *PRStatus, viewer string) string {
 	var reasons []string
 
+	// A draft PR cannot be merged — disqualify before anything else.
+	if rp.IsDraft {
+		reasons = append(reasons, "draft")
+	}
+
 	// Degraded snapshot data — never classify as ready.
 	if status.TruncatedSuites {
 		reasons = append(reasons, "truncated")
@@ -249,19 +256,38 @@ func readinessReasonFull(rp *ReadinessPR, status *PRStatus, viewer string) strin
 		reasons = append(reasons, "changes-requested")
 	}
 
-	// BLOCKED merge state — the distinction that decides who can act.
+	// Merge state status — only a subset mean "ready to merge".
+	// BLOCKED is handled below with the viewer distinction; every other
+	// non-CLEAN value must produce a reason so nothing silently falls to ready.
 	author := rp.Author.Login
-	if rp.MergeStateStatus == "BLOCKED" {
+	switch rp.MergeStateStatus {
+	case "BLOCKED":
 		if author == viewer {
 			reasons = append(reasons, "needs-codeowner")
 		} else {
 			reasons = append(reasons, "awaiting:review")
 		}
-	}
-
-	// Mergeability unknown (API can't determine it yet).
-	if !status.Conflict && rp.Mergeable == "UNKNOWN" {
+	case "BEHIND":
+		reasons = append(reasons, "needs-rebase")
+	case "DIRTY":
+		// DIRTY means the merge commit failed — distinct from CONFLICTING,
+		// which means a live conflict exists. Both block the merge.
+		if !status.Conflict {
+			reasons = append(reasons, "dirty-merge")
+		}
+	case "UNSTABLE":
+		// UNSTABLE means a non-required check is failing. It is technically
+		// still mergeable, but calling it ready would be misleading: the
+		// viewer likely wants to know a check is red before they merge.
+		reasons = append(reasons, "unstable")
+	case "UNKNOWN":
+		// GitHub is still computing mergeability — not the same as clean.
 		reasons = append(reasons, "mergeability-unknown")
+	case "CLEAN":
+		// Nothing wrong — proceed to check-derived reasons.
+	default:
+		// An unrecognised mergeStateStatus must not silently produce ready.
+		reasons = append(reasons, "merge-state:"+rp.MergeStateStatus)
 	}
 
 	// No CI has reported yet (no successful checks, no failing checks, no
