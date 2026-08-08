@@ -190,10 +190,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	emit := func(n monitor.Notification) {
 		if opts.Text {
 			out := cmd.OutOrStdout()
-			fmt.Fprintln(out, monitor.LinkifyText(n))
+			_, _ = fmt.Fprintln(out, monitor.LinkifyText(n))
 			if n.Detail != "" {
 				for _, line := range strings.Split(n.Detail, "\n") {
-					fmt.Fprintf(out, "  %s\n", line)
+					_, _ = fmt.Fprintf(out, "  %s\n", line)
 				}
 			}
 			return
