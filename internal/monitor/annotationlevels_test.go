@@ -116,15 +116,3 @@ func TestParseAnnotationLevels_EmptyInputDefault(t *testing.T) {
 	assert.True(t, f.Allows("FAILURE"))
 	assert.False(t, f.Allows("NOTICE"))
 }
-
-// TestAnnotationLevels_String confirms the diagnostic rendering.
-func TestAnnotationLevels_String(t *testing.T) {
-	var nilFilter *AnnotationLevels
-	assert.Equal(t, "<default>", nilFilter.String())
-
-	empty := NewAnnotationLevels()
-	assert.Equal(t, "<none>", empty.String())
-
-	populated := NewAnnotationLevels("warning", "failure")
-	assert.Equal(t, "failure,warning", populated.String())
-}

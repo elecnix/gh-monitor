@@ -12,6 +12,10 @@ type AnnotationLevels struct {
 	allowed map[string]bool
 }
 
+// defaultAnnotationLevels is the nil-filter fallback: warning + failure,
+// normalised the same way the configured path normalises input.
+var defaultAnnotationLevels = NewAnnotationLevels("warning", "failure")
+
 // validAnnotationLevels is the set of recognised annotation level strings.
 func validAnnotationLevels() map[string]bool {
 	return map[string]bool{
@@ -77,30 +81,8 @@ func ParseAnnotationLevels(s string) (*AnnotationLevels, error) {
 // default (warning + failure). Matching is case-insensitive.
 func (f *AnnotationLevels) Allows(level string) bool {
 	if f == nil {
-		return level == "WARNING" || level == "FAILURE"
+		return defaultAnnotationLevels.Allows(level)
 	}
 	return f.allowed[strings.ToLower(strings.TrimSpace(level))]
 }
 
-// String renders the allowlist as a sorted, comma-separated list for logs and
-// the --help text. Returns "<default>" for a nil filter and "<none>" for an
-// empty allowlist.
-func (f *AnnotationLevels) String() string {
-	if f == nil {
-		return "<default>"
-	}
-	if len(f.allowed) == 0 {
-		return "<none>"
-	}
-	out := make([]string, 0, len(f.allowed))
-	for k := range f.allowed {
-		out = append(out, k)
-	}
-	// stable order for logs
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
-	return strings.Join(out, ",")
-}
