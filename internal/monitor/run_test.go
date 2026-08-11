@@ -214,10 +214,40 @@ func TestOnce_UnfinishedSuite_NoCIAllGreen(t *testing.T) {
 
 func TestIdleInterval(t *testing.T) {
 	base := 60 * time.Second
-	assert.Equal(t, base, idleInterval(base, 0))
-	assert.Equal(t, base, idleInterval(base, 3))              // growth starts after 3
-	assert.Equal(t, 2*base, idleInterval(base, 4))            // base * 2^1
-	assert.Equal(t, maxIdleInterval, idleInterval(base, 100)) // capped
+	assert.Equal(t, base, IdleInterval(base, 0))
+	assert.Equal(t, base, IdleInterval(base, 3))              // growth starts after 3
+	assert.Equal(t, 2*base, IdleInterval(base, 4))            // base * 2^1
+	assert.Equal(t, maxIdleInterval, IdleInterval(base, 100)) // capped
+}
+
+func TestJittered_WithinBounds(t *testing.T) {
+	// Jitter must spread a delay by at most ±20% and never go negative.
+	base := 60 * time.Second
+	lo := base - base/5
+	hi := base + base/5
+	for i := 0; i < 200; i++ {
+		d := Jittered(base)
+		assert.GreaterOrEqual(t, d, lo, "jitter must not undershoot the -20%% bound")
+		assert.LessOrEqual(t, d, hi, "jitter must not overshoot the +20%% bound")
+		assert.Greater(t, d, time.Duration(0), "jitter must never produce a zero/negative delay")
+	}
+}
+
+func TestJittered_ProducesSpread(t *testing.T) {
+	// Over many samples the jittered delay must actually vary — a no-op
+	// jitter (always returning base) would leave concurrent watchers aligned.
+	base := 60 * time.Second
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 500; i++ {
+		seen[Jittered(base)] = true
+	}
+	assert.Greater(t, len(seen), 1, "jittered delays should vary across samples")
+}
+
+func TestJittered_ExplicitJitterWins(t *testing.T) {
+	opts := testRunOptions()
+	opts.Jitter = func(d time.Duration) time.Duration { return d / 2 }
+	assert.Equal(t, 30*time.Second, opts.jittered(60*time.Second))
 }
 
 // ---------------------------------------------------------------------------

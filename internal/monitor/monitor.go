@@ -13,6 +13,7 @@ package monitor
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -398,6 +399,100 @@ type StatusContext struct {
 	Context     string `json:"context"`
 	Description string `json:"description"`
 	TargetURL   string `json:"targetUrl"`
+}
+
+// Fingerprint returns a stable string covering every field the change
+// detector can fire an event on: state, mergeability, review decision, head
+// commit, check outcomes (suites, runs, old-style status contexts), and the
+// presence of comments, threads, and annotations. Two snapshots with equal
+// fingerprints cannot produce a Diff event between them; an unequal
+// fingerprint means a poll must not idle-back off.
+//
+// It is deliberately computed from identity fields (IDs, conclusions,
+// decisions) rather than full bodies, matching what Diff actually compares:
+// a comment body edit with the same ID produces no event today, so it does
+// not count as a change here either.
+func Fingerprint(pr *PullRequest) string {
+	if pr == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(pr.State)
+	b.WriteByte('|')
+	b.WriteString(strconv.FormatBool(pr.Merged))
+	b.WriteByte('|')
+	b.WriteString(pr.Mergeable)
+	b.WriteByte('|')
+	b.WriteString(pr.MergeState)
+
+	if len(pr.Commits.Nodes) > 0 {
+		c := pr.Commits.Nodes[0].Commit
+		b.WriteByte('|')
+		b.WriteString(c.Oid)
+		for i := range c.CheckSuites.Nodes {
+			suite := &c.CheckSuites.Nodes[i]
+			b.WriteByte('|')
+			b.WriteString(suite.App.Name)
+			b.WriteByte(':')
+			b.WriteString(suite.App.Slug)
+			b.WriteByte(':')
+			b.WriteString(suite.Conclusion)
+			b.WriteByte(':')
+			b.WriteString(suite.Status)
+			for j := range suite.CheckRuns.Nodes {
+				run := &suite.CheckRuns.Nodes[j]
+				b.WriteByte(';')
+				b.WriteString(run.Name)
+				b.WriteByte(':')
+				b.WriteString(run.Conclusion)
+				b.WriteByte(':')
+				b.WriteString(run.Status)
+				for _, ann := range run.Annotations.Nodes {
+					b.WriteByte(',')
+					b.WriteString(ann.Path)
+					b.WriteByte(':')
+					b.WriteString(strconv.Itoa(ann.Location.Start.Line))
+					b.WriteByte(':')
+					b.WriteString(ann.Level)
+					b.WriteByte(':')
+					b.WriteString(ann.Title)
+					b.WriteByte(':')
+					b.WriteString(ann.Message)
+				}
+			}
+		}
+		if c.Status != nil {
+			for _, ctx := range c.Status.Contexts {
+				b.WriteByte('!')
+				b.WriteString(ctx.State)
+				b.WriteByte(':')
+				b.WriteString(ctx.Context)
+			}
+		}
+	}
+
+	for i := range pr.Comments.Nodes {
+		b.WriteByte('#')
+		b.WriteString(pr.Comments.Nodes[i].ID)
+	}
+	for i := range pr.ReviewThreads.Nodes {
+		t := &pr.ReviewThreads.Nodes[i]
+		b.WriteByte('~')
+		b.WriteString(t.ID)
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatBool(t.IsResolved))
+		for j := range t.Comments.Nodes {
+			b.WriteByte(',')
+			b.WriteString(t.Comments.Nodes[j].ID)
+		}
+	}
+	if state, author := reviewDecision(pr); state != "" {
+		b.WriteByte('$')
+		b.WriteString(state)
+		b.WriteByte(':')
+		b.WriteString(author)
+	}
+	return b.String()
 }
 
 // Fetch retrieves the monitoring snapshot for a PR.

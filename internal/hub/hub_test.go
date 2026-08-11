@@ -208,6 +208,84 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 	assert.Equal(t, 0, remaining, "hub must drop the empty poller")
 }
 
+// TestPoller_BacksOffWhenQuiet verifies the poller's idle backoff: on an
+// unchanged PR the cadence doubles after three no-change polls, so a quiet
+// PR watched through the shared daemon costs a fraction of the fetches a
+// fixed ticker would. Before this change the poller polled at the base
+// interval forever. The assertion is relative (later windows poll less than
+// earlier ones) rather than absolute, so jittered delays cannot make it
+// flaky.
+func TestPoller_BacksOffWhenQuiet(t *testing.T) {
+	var fetches int64
+	snap := prFixture(nil) // never changes
+	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
+		atomic.AddInt64(&fetches, 1)
+		return snap, nil
+	}, nil, 20*time.Millisecond)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 60*time.Millisecond) // drain the first polls; backoff begins
+
+	first := atomic.LoadInt64(&fetches)
+	time.Sleep(120 * time.Millisecond)
+	mid := atomic.LoadInt64(&fetches)
+	time.Sleep(120 * time.Millisecond)
+	last := atomic.LoadInt64(&fetches)
+
+	early := mid - first
+	late := last - mid
+	assert.GreaterOrEqual(t, early, int64(2), "the early window must still poll")
+	assert.Less(t, late, early,
+		"the cadence must slow as the PR stays quiet (backoff)")
+}
+
+// TestPoller_WakeResetsBackoffAndFetchesNow verifies that a wake (a fresh
+// subscriber, or an explicit RefreshPR) drops any accumulated idle backoff
+// and fetches immediately — a new consumer must not wait out a quiet-PR
+// backoff before seeing current state.
+func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
+	var fetches int64
+	var mu sync.Mutex
+	current := prFixture(nil) // quiet: backoff will grow
+	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
+		atomic.AddInt64(&fetches, 1)
+		mu.Lock()
+		defer mu.Unlock()
+		return current, nil
+	}, nil, 5*time.Millisecond)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 50*time.Millisecond)
+
+	// Let the backoff grow well past the base interval.
+	time.Sleep(60 * time.Millisecond)
+	before := atomic.LoadInt64(&fetches)
+
+	// A change lands while the poller is backed off; the consumer must still
+	// learn about it promptly. RefreshPR is the explicit wake path (the same
+	// channel a new subscriber triggers).
+	mu.Lock()
+	current = prFixture([]string{"ci-build"})
+	mu.Unlock()
+	require.NoError(t, h.RefreshPR(testHubOpts().Identity))
+
+	got := collect(ch, 200*time.Millisecond)
+	assert.Contains(t, got, "new-failing-checks",
+		"a wake must fetch immediately even when the poller was backed off")
+	assert.Greater(t, atomic.LoadInt64(&fetches), before,
+		"the wake must produce at least one fetch")
+}
+
 // TestHub_ConcurrentSubscribersDoNotRace exercises the hub under concurrent
 // subscribe/cancel churn to guard against data races (run with -race).
 func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {

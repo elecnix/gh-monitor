@@ -182,9 +182,10 @@ type prPoller struct {
 	interval time.Duration
 	ruleset  *monitor.RulesetChecks // fetched once at poller start; nil until fetched
 
-	mu     sync.Mutex
-	latest *monitor.PullRequest
-	subs   map[*prSub]struct{}
+	mu       sync.Mutex
+	latest   *monitor.PullRequest
+	noChange int // consecutive fingerprint-unchanged fetches; drives idle backoff
+	subs     map[*prSub]struct{}
 
 	wake  chan struct{}
 	stopc chan struct{}
@@ -203,7 +204,12 @@ func newPRPoller(h *Hub, id resolver.Identity, interval time.Duration) *prPoller
 }
 
 // run fetches ruleset once, then fetches immediately and on every tick or
-// wake, until stop.
+// wake, until stop. The cadence backs off like the in-process loop's
+// idleInterval: after three consecutive polls whose fingerprint is unchanged,
+// the delay doubles up to the same 300s cap, so a quiet PR watched through
+// the shared daemon costs the same GraphQL as one watched in-process. A wake
+// (new subscriber, or an explicit RefreshPR) resets the backoff and fetches
+// immediately.
 func (p *prPoller) run() {
 	// Fetch the branch ruleset once at startup. Rulesets rarely change
 	// mid-monitoring; a consumer that needs a refresh can restart.
@@ -224,18 +230,38 @@ func (p *prPoller) run() {
 		}
 	}
 	p.fetchOnce()
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
+	delay := p.nextDelay()
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	for {
 		select {
 		case <-p.stopc:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			p.fetchOnce()
+			delay = p.nextDelay()
+			timer.Reset(delay)
 		case <-p.wake:
+			// A fresh subscriber wants the current state promptly; drop any
+			// accumulated idle backoff so it gets one now, then a normal
+			// cadence.
+			p.mu.Lock()
+			p.noChange = 0
+			p.mu.Unlock()
 			p.fetchOnce()
+			delay = p.nextDelay()
+			timer.Reset(delay)
 		}
 	}
+}
+
+// nextDelay returns the jittered idle-interval for the current noChange
+// count. Jitter de-phases pollers that subscribed at the same moment, so a
+// fleet attaching many watchers at once does not burst requests in phase.
+func (p *prPoller) nextDelay() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return monitor.Jittered(monitor.IdleInterval(p.interval, p.noChange))
 }
 
 func (p *prPoller) stop() {
@@ -267,7 +293,19 @@ func (p *prPoller) fetchOnce() {
 	if err != nil || curr == nil {
 		return
 	}
+	// Track fingerprint changes so run() can idle-back off a quiet PR the way
+	// the in-process loop does. Errors leave noChange untouched: a fetch that
+	// failed tells us nothing about whether the PR changed.
+	prevFp := ""
 	p.mu.Lock()
+	if p.latest != nil {
+		prevFp = monitor.Fingerprint(p.latest)
+	}
+	if monitor.Fingerprint(curr) != prevFp {
+		p.noChange = 0
+	} else {
+		p.noChange++
+	}
 	p.latest = curr
 	for s := range p.subs {
 		select {
