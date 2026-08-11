@@ -88,7 +88,14 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		return svc.FetchRequiredChecks(owner, repo)
 	}
 
-	h := hub.New(fetch, rulesetFn, interval)
+	// Budget guard: every poller stretches its cadence as the shared GraphQL
+	// budget runs low. Advisory only — rate-limit errors keep their hard
+	// backoff, and the rate_limit endpoint is read over REST (the two budgets
+	// exhaust independently).
+	budgetSvc := &monitor.Service{API: apiClientFactory("")}
+	budget := monitor.NewBudgetGuard(budgetSvc, interval)
+
+	h := hub.New(fetch, rulesetFn, interval, budget)
 	defer h.Stop()
 
 	ctx, cancel := context.WithCancel(context.Background())

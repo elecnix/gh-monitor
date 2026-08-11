@@ -23,8 +23,11 @@ const (
 
 // maxIdleInterval caps the adaptive idle backoff, and maxErrBackoff caps the
 // transient-error backoff. Both mirror pi-ghpr-monitor's 5-minute ceilings.
+// MaxIdleInterval is exported so the shared poller daemon can cap its
+// budget-stretched cadence with the same ceiling.
 const (
-	maxIdleInterval = 300 * time.Second
+	MaxIdleInterval = 300 * time.Second
+	maxIdleInterval = MaxIdleInterval
 	maxErrBackoff   = 300 * time.Second
 	defaultInterval = 60 * time.Second
 )
@@ -205,6 +208,13 @@ type RunOptions struct {
 	// When nil, Jittered (uniform ±20%) is used. The value returned must be
 	// non-negative.
 	Jitter func(time.Duration) time.Duration
+
+	// Budget, when non-nil, makes the loop GraphQL-budget-aware: before each
+	// poll it consults the advisory rate limit and stretches the delay as the
+	// GraphQL budget runs low, emitting a loud notice on each transition into
+	// and out of the low state. Nil (the default) preserves today's
+	// budget-blind cadence.
+	Budget *BudgetGuard
 }
 
 func (o *RunOptions) now() time.Time {
@@ -388,6 +398,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		savePRSnapshot(opts, curr)
 
 		d := opts.jittered(IdleInterval(base, c.noChange))
+		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -559,6 +570,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		prev = curr
 
 		d := opts.jittered(IdleInterval(base, noChange))
+		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -685,6 +697,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 		}
 
 		d := opts.jittered(IdleInterval(base, noChange))
+		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -1339,6 +1352,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		}
 
 		d := opts.jittered(IdleInterval(base, noChange))
+		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {

@@ -174,6 +174,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		Timeout:       time.Duration(opts.Timeout) * time.Second,
 		Instance:      opts.Instance,
 		FromBeginning: opts.FromBeginning,
+		// Budget awareness: read the advisory GraphQL budget over REST and
+		// stretch the cadence as it runs low, so a continuous watcher slows
+		// instead of contributing to wholesale exhaustion.
+		Budget: monitor.NewBudgetGuard(svc, time.Duration(opts.Interval)*time.Second),
 	}
 
 	// Wire cursor I/O for named instances (issue #32). Repo targets use the
