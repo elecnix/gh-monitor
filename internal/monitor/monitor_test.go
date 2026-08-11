@@ -1206,3 +1206,65 @@ func TestRun_FirstPollWithAwaitingChecks(t *testing.T) {
 	s.AwaitingChecks = nil
 	assert.True(t, ciAllGreen(s))
 }
+
+func TestFingerprint_StableForIdenticalSnapshot(t *testing.T) {
+	a := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+	b := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+	assert.Equal(t, Fingerprint(a), Fingerprint(b))
+	assert.NotEmpty(t, Fingerprint(a))
+}
+
+func TestFingerprint_ChangesOnRelevantFields(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*PullRequest)
+	}{
+		{"new commit oid", func(p *PullRequest) { p.Commits.Nodes[0].Commit.Oid = "def5678" }},
+		{"merge state", func(p *PullRequest) { p.Mergeable = "CONFLICTING" }},
+		{"closed", func(p *PullRequest) { p.State = "CLOSED" }},
+		{"check conclusion", func(p *PullRequest) {
+			p.Commits.Nodes[0].Commit.CheckSuites.Nodes[0].CheckRuns.Nodes[0].Conclusion = "SUCCESS"
+		}},
+		{"review decision", func(p *PullRequest) {
+			p.Reviews = ReviewNodes{Nodes: []Review{{State: "APPROVED", Author: struct {
+				Login string `json:"login"`
+			}{Login: "alice"}, SubmittedAt: "2026-01-01T00:00:00Z"}}}
+		}},
+		{"new general comment", func(p *PullRequest) {
+			p.Comments = CommentNodes{Nodes: []Comment{{ID: "c1", Author: struct {
+				Login string `json:"login"`
+			}{Login: "alice"}}}}
+		}},
+		{"thread resolved", func(p *PullRequest) {
+			p.ReviewThreads = ThreadNodes{Nodes: []ReviewThread{{ID: "t1", IsResolved: true}}}
+		}},
+		{"new annotation", func(p *PullRequest) {
+			p.Commits.Nodes[0].Commit.CheckSuites.Nodes[0].CheckRuns.Nodes[0].Annotations = AnnotationNodes{
+				Nodes: []Annotation{{Path: "a.go", Level: "WARNING", Title: "t", Message: "m"}},
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+			b := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+			tc.mut(b)
+			assert.NotEqual(t, Fingerprint(a), Fingerprint(b), "%s must change the fingerprint", tc.name)
+		})
+	}
+}
+
+func TestFingerprint_IgnoresCommentBodyEdit(t *testing.T) {
+	// A comment body edit with the same ID produces no Diff event today
+	// (diffNewComments matches by ID), so it must not count as a change here
+	// either — otherwise a quiet PR would never idle-back off.
+	a := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+	a.Comments = CommentNodes{Nodes: []Comment{{ID: "c1", Body: "v1", Author: struct {
+		Login string `json:"login"`
+	}{Login: "alice"}}}}
+	b := mkPR("OPEN", false, "abc1234", []string{"ci-build"})
+	b.Comments = CommentNodes{Nodes: []Comment{{ID: "c1", Body: "v2", Author: struct {
+		Login string `json:"login"`
+	}{Login: "alice"}}}}
+	assert.Equal(t, Fingerprint(a), Fingerprint(b))
+}

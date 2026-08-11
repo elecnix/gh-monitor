@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"regexp"
 	"strconv"
@@ -196,6 +197,14 @@ type RunOptions struct {
 	// when the context is cancelled.
 	Now   func() time.Time
 	Sleep func(context.Context, time.Duration) error
+
+	// Jitter spreads a poll delay before it is slept. It exists so concurrent
+	// watchers do not poll on aligned cadences — a fleet booting several
+	// monitors at the same moment would otherwise burst requests in phase,
+	// which is exactly what exhausts a shared API budget at reset boundaries.
+	// When nil, Jittered (uniform ±20%) is used. The value returned must be
+	// non-negative.
+	Jitter func(time.Duration) time.Duration
 }
 
 func (o *RunOptions) now() time.Time {
@@ -210,6 +219,31 @@ func (o *RunOptions) sleep(ctx context.Context, d time.Duration) error {
 		return o.Sleep(ctx, d)
 	}
 	return realSleep(ctx, d)
+}
+
+// jittered spreads d by ±20% unless the caller supplied an explicit Jitter
+// function. It is applied to idle and error-backoff sleeps so that watchers
+// that started at the same moment drift apart instead of polling in phase.
+// Reset-targeted waits (back off until the rate-limit reset) are deliberately
+// not jittered: they target an absolute time.
+func (o *RunOptions) jittered(d time.Duration) time.Duration {
+	if o.Jitter != nil {
+		return o.Jitter(d)
+	}
+	return Jittered(d)
+}
+
+// Jittered spreads d by a uniform ±20%. It is exported so the shared poller
+// daemon can de-phase its per-PR tickers the same way the in-process loop
+// de-phases its polls. math/rand is fine here: the value shapes request
+// timing, not security.
+func Jittered(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	span := d / 5
+	offset := time.Duration(rand.Int63n(2*int64(span)+1)) - span
+	return d + offset
 }
 
 func realSleep(ctx context.Context, d time.Duration) error {
@@ -330,7 +364,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 			emitDegraded(opts, "graphql", err, emit)
-			d := nextErrBackoff(errBackoff, base)
+			d := opts.jittered(nextErrBackoff(errBackoff, base))
 			errBackoff = d
 			// On rate limit, fetch the reset time and back off until then.
 			if reset := rateLimitResetSeconds(svc); reset > 0 {
@@ -353,7 +387,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		}
 		savePRSnapshot(opts, curr)
 
-		d := idleInterval(base, c.noChange)
+		d := opts.jittered(IdleInterval(base, c.noChange))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -469,7 +503,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 				emitDegraded(opts, "graphql", err, emit)
-				d := nextErrBackoff(errBackoff, base)
+				d := opts.jittered(nextErrBackoff(errBackoff, base))
 				errBackoff = d
 				if reset := rateLimitResetSeconds(svc); reset > 0 {
 					until := time.Unix(reset, 0).UTC()
@@ -488,7 +522,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 				emitDegraded(opts, "graphql", err, emit)
-				d := nextErrBackoff(errBackoff, base)
+				d := opts.jittered(nextErrBackoff(errBackoff, base))
 				errBackoff = d
 				if reset := rateLimitResetSeconds(svc); reset > 0 {
 					until := time.Unix(reset, 0).UTC()
@@ -524,7 +558,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		}
 		prev = curr
 
-		d := idleInterval(base, noChange)
+		d := opts.jittered(IdleInterval(base, noChange))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -602,7 +636,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 			emitDegraded(opts, "graphql", err, emit)
-			d := nextErrBackoff(errBackoff, base)
+			d := opts.jittered(nextErrBackoff(errBackoff, base))
 			errBackoff = d
 			if reset := rateLimitResetSeconds(svc); reset > 0 {
 				until := time.Unix(reset, 0).UTC()
@@ -650,7 +684,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 			return nil
 		}
 
-		d := idleInterval(base, noChange)
+		d := opts.jittered(IdleInterval(base, noChange))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -696,10 +730,11 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Not
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// idleInterval returns the poll interval given the number of consecutive
+// IdleInterval returns the poll interval given the number of consecutive
 // no-change polls: base until 3 no-change polls, then base*2^(n-3) capped at
-// maxIdleInterval.
-func idleInterval(base time.Duration, noChange int) time.Duration {
+// maxIdleInterval. It is exported so the shared poller daemon can back its
+// per-PR cadence off the same formula the in-process loop uses.
+func IdleInterval(base time.Duration, noChange int) time.Duration {
 	d := base
 	if noChange >= 3 {
 		shift := uint(noChange - 3)
@@ -1061,7 +1096,7 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 			emitDegraded(opts, "rest", err, emit)
-			d := nextErrBackoff(errBackoff, base)
+			d := opts.jittered(nextErrBackoff(errBackoff, base))
 			errBackoff = d
 			if reset := rateLimitResetSeconds(svc); reset > 0 {
 				until := time.Unix(reset, 0).UTC()
@@ -1117,7 +1152,7 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			return nil
 		}
 
-		d := idleInterval(base, noChange)
+		d := opts.jittered(IdleInterval(base, noChange))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -1253,7 +1288,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
 			emitDegraded(opts, "graphql", err, emit)
-			d := nextErrBackoff(errBackoff, base)
+			d := opts.jittered(nextErrBackoff(errBackoff, base))
 			errBackoff = d
 			if reset := rateLimitResetSeconds(svc); reset > 0 {
 				until := time.Unix(reset, 0).UTC()
@@ -1303,7 +1338,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 			}
 		}
 
-		d := idleInterval(base, noChange)
+		d := opts.jittered(IdleInterval(base, noChange))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
