@@ -2,10 +2,13 @@ package monitor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -248,4 +251,183 @@ func TestRun_BudgetRecoveryEmitsNotice(t *testing.T) {
 	}
 	require.NotNil(t, recovered, "recovering from the low state must emit a recovery notice")
 	assert.GreaterOrEqual(t, lowNotices, 1, "the low transition must have been reported")
+}
+
+func TestRun_TierShedsOnLowBudgetAndNotices(t *testing.T) {
+	// A low GraphQL budget must select a shed tier: the fetch query drops
+	// annotations, and a loud degraded notice names what is no longer watched.
+	// The shed snapshot must not fire false events against the full baseline.
+	var lastQuery string
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			lastQuery = query
+			return assign(result, QueryResponse{Repository: struct {
+				PullRequest *PullRequest `json:"pullRequest"`
+			}{PullRequest: mkPR("OPEN", false, "aaaaaaa", []string{"ci-build"})}})
+		},
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			rl := RateLimitResponse{}
+			rl.Resources.GraphQL.Remaining = 100 // 2%: TierNoReviews
+			rl.Resources.GraphQL.Limit = 5000
+			rl.Resources.GraphQL.Reset = time.Now().Add(30 * time.Minute).Unix()
+			return assign(result, rl)
+		},
+	}
+	svc := &Service{API: api}
+
+	// Seed the consumer with a full baseline first: an APPROVED review that
+	// must not read as dismissed once reviews are shed.
+	baseline := &PRStatus{
+		State:          "OPEN",
+		ReviewDecision: "APPROVED",
+		ReviewAuthor:   "alice",
+		FailingChecks:  []string{"ci-build"},
+	}
+
+	var got []Notification
+	opts := testRunOptions()
+	opts.Budget = NewBudgetGuard(svc, opts.Interval)
+	opts.CursorSnapshot = baselineJSON(t, baseline)
+	ctx, cancel := context.WithCancel(context.Background())
+	polls := 0
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		polls++
+		if polls >= 3 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	// The fetch must use the shed query (no annotations, no reviews).
+	assert.NotContains(t, lastQuery, "annotations", "the low-budget tier must shed annotations")
+	assert.NotContains(t, lastQuery, "reviews(", "the low-budget tier must shed reviews")
+
+	var notice *Notification
+	for i := range got {
+		if got[i].Type == string(EventDegraded) && strings.Contains(got[i].Message, "no longer watching") {
+			notice = &got[i]
+		}
+	}
+	require.NotNil(t, notice, "entering a shed tier must emit a loud notice")
+	assert.Contains(t, notice.Message, "annotations")
+	assert.Contains(t, notice.Message, "reviews")
+
+	// No false events: the baseline's APPROVED review must not fire a
+	// dismissal, and failing checks must not read as CI-green.
+	for _, n := range got {
+		assert.NotEqual(t, string(EventReviewDismissed), n.Type, "a shed review must not read as dismissed")
+		assert.NotEqual(t, string(EventCIAllGreen), n.Type, "a shed snapshot must not read as CI-green")
+	}
+}
+
+func TestRun_TierRecoversToFullAndNotices(t *testing.T) {
+	// When the budget recovers, the tier must return to full and the watcher
+	// must say so loudly.
+	remaining := 100
+	var lastQuery string
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			lastQuery = query
+			return assign(result, QueryResponse{Repository: struct {
+				PullRequest *PullRequest `json:"pullRequest"`
+			}{PullRequest: mkPR("OPEN", false, "aaaaaaa", []string{"ci-build"})}})
+		},
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			rl := RateLimitResponse{}
+			rl.Resources.GraphQL.Remaining = remaining
+			rl.Resources.GraphQL.Limit = 5000
+			rl.Resources.GraphQL.Reset = time.Now().Add(30 * time.Minute).Unix()
+			return assign(result, rl)
+		},
+	}
+	svc := &Service{API: api}
+
+	var got []Notification
+	opts := testRunOptions()
+	opts.Budget = NewBudgetGuard(svc, opts.Interval)
+	ctx, cancel := context.WithCancel(context.Background())
+	cur := time.Unix(0, 0).UTC()
+	opts.Now = func() time.Time { return cur }
+	polls := 0
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		polls++
+		cur = cur.Add(31 * time.Second) // advance past the guard's refresh window
+		if polls == 2 {
+			remaining = 4900 // recovery becomes visible next poll
+		}
+		if polls >= 4 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	var recovered *Notification
+	for i := range got {
+		if got[i].Type == string(EventDegraded) && strings.Contains(got[i].Message, "resuming full monitoring") {
+			recovered = &got[i]
+		}
+	}
+	require.NotNil(t, recovered, "recovering to the full tier must emit a notice")
+	assert.Contains(t, lastQuery, "annotations", "the recovered tier must fetch annotations again")
+}
+
+func TestRun_QueryCostFallbackRetriesCheaperTier(t *testing.T) {
+	// "Resource limits for this query exceeded" is a per-query cost error: the
+	// watcher must retry once with a cheaper tier instead of failing
+	// wholesale. A rate-limit 403 must NOT retry (every query costs points).
+	var queries []string
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			queries = append(queries, query)
+			if len(queries) == 1 {
+				return &ghcli.GraphQLError{Errors: []ghcli.GraphQLErrorEntry{
+					{Message: "Resource limits for this query exceeded. Please reduce your query"},
+				}}
+			}
+			return assign(result, QueryResponse{Repository: struct {
+				PullRequest *PullRequest `json:"pullRequest"`
+			}{PullRequest: mkPR("OPEN", false, "aaaaaaa", []string{"ci-build"})}})
+		},
+	}
+	svc := &Service{API: api}
+
+	var got []Notification
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	polls := 0
+	opts.Sleep = func(ctx context.Context, d time.Duration) error {
+		polls++
+		if polls >= 2 {
+			cancel()
+			return context.Canceled
+		}
+		return nil
+	}
+
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	require.GreaterOrEqual(t, len(queries), 2, "the cost error must trigger a cheaper retry")
+	assert.Contains(t, queries[0], "annotations", "first attempt is the full query")
+	assert.NotContains(t, queries[1], "annotations", "the retry must shed annotations")
+	for _, n := range got {
+		assert.NotEqual(t, string(EventDegraded), n.Type, "a successful cheaper retry must not degrade")
+	}
+}
+
+// baselineJSON serialises a PRStatus for CursorSnapshot, mirroring how the
+// cursor store persists a named-instance baseline.
+func baselineJSON(t *testing.T, st *PRStatus) string {
+	t.Helper()
+	b, err := json.Marshal(st)
+	require.NoError(t, err)
+	return string(b)
 }

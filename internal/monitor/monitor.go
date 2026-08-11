@@ -164,80 +164,10 @@ func (s *Service) FetchRateLimit() (*RateLimitResponse, error) {
 	return &result, nil
 }
 
-// MONITOR_QUERY fetches the rich snapshot a monitor needs for a single PR:
-// state, comments (+👍), review threads (+👍), mergeability, the latest review
-// decision, and the head commit with its authors, message, checks, and
-// old-style statuses. The commit author/message fields are intentionally
-// richer than pi's snapshot: pi documented author/co-author support but never
-// wired the query, so we fetch it here.
-const MONITOR_QUERY = `query MonitorPR($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      state
-      merged
-      mergeable
-      mergeStateStatus
-      comments(last: 25) {
-        nodes {
-          id
-          body
-          author { login }
-          createdAt
-          reactionGroups { content users { totalCount } }
-        }
-      }
-      reviewThreads(last: 25) {
-        nodes {
-          id
-          isResolved
-          isOutdated
-          path
-          line
-          comments(last: 25) {
-            nodes {
-              id
-              body
-              author { login }
-              createdAt
-              diffHunk
-              reactionGroups { content users { totalCount } }
-            }
-          }
-        }
-      }
-      reviews(last: 100) {
-        nodes { state author { login } submittedAt }
-      }
-      commits(last: 1) {
-        nodes {
-          commit {
-            oid
-            messageHeadline
-            message
-            authors(first: 10) { nodes { name user { login } } }
-            checkSuites(last: 50) {
-              totalCount
-              nodes {
-                conclusion
-                status
-                app { name slug }
-                checkRuns(last: 50) {
-                  nodes { name conclusion status detailsUrl permalink
-                    annotations(first: 50) {
-                      totalCount
-                      nodes { path location { start { line } } annotationLevel title message }
-                    }
-                  }
-                }
-              }
-            }
-            status { contexts { state context description targetUrl } }
-          }
-        }
-      }
-    }
-  }
-}`
+// MONITOR_QUERY is kept for back-compat (tests and callers that snapshot a
+// full PR); the tiered builder is MonitorQuery. See tier.go for the tier
+// model and per-tier fragments.
+var MONITOR_QUERY = MonitorQuery(TierFull)
 
 // QueryResponse mirrors the GraphQL envelope's data shape.
 type QueryResponse struct {
@@ -495,10 +425,18 @@ func Fingerprint(pr *PullRequest) string {
 	return b.String()
 }
 
-// Fetch retrieves the monitoring snapshot for a PR.
+// Fetch retrieves the full monitoring snapshot for a PR — equivalent to
+// FetchWithTier with TierFull.
 func (s *Service) Fetch(identity *resolver.Identity, number int) (*QueryResponse, error) {
+	return s.FetchWithTier(identity, number, TierFull)
+}
+
+// FetchWithTier retrieves the monitoring snapshot for a PR at the given tier.
+// Shedding surfaces keeps PR status + check outcomes alive under a tight
+// GraphQL budget; see tier.go.
+func (s *Service) FetchWithTier(identity *resolver.Identity, number int, tier QueryTier) (*QueryResponse, error) {
 	var result QueryResponse
-	err := s.API.GraphQL(MONITOR_QUERY, map[string]interface{}{
+	err := s.API.GraphQL(MonitorQuery(tier), map[string]interface{}{
 		"owner":  identity.Owner,
 		"repo":   identity.Repo,
 		"number": number,
@@ -515,70 +453,6 @@ func (s *Service) Fetch(identity *resolver.Identity, number int) (*QueryResponse
 // ---------------------------------------------------------------------------
 // Ref / commit monitoring
 // ---------------------------------------------------------------------------
-
-// MONITOR_REF_QUERY fetches the commit at the tip of a ref along with its
-// check suites and status contexts.
-const MONITOR_REF_QUERY = `query MonitorRef($owner: String!, $repo: String!, $ref: String!) {
-  repository(owner: $owner, name: $repo) {
-    ref(qualifiedName: $ref) {
-      target {
-        oid
-        ... on Commit {
-          messageHeadline
-          authors(first: 10) { nodes { name user { login } } }
-          checkSuites(last: 50) {
-            totalCount
-            nodes {
-              conclusion
-              status
-              app { name slug }
-              checkRuns(last: 50) {
-                nodes { name conclusion status detailsUrl permalink
-                  annotations(first: 50) {
-                    totalCount
-                    nodes { path location { start { line } } annotationLevel title message }
-                  }
-                }
-              }
-            }
-          }
-          status { contexts { state context description targetUrl } }
-        }
-      }
-    }
-  }
-}`
-
-// MONITOR_COMMIT_QUERY fetches a specific commit by OID along with its check
-// suites and status contexts.
-const MONITOR_COMMIT_QUERY = `query MonitorCommit($owner: String!, $repo: String!, $oid: GitObjectID!) {
-  repository(owner: $owner, name: $repo) {
-    object(oid: $oid) {
-      ... on Commit {
-        oid
-        messageHeadline
-        authors(first: 10) { nodes { name user { login } } }
-        checkSuites(last: 50) {
-          totalCount
-          nodes {
-            conclusion
-            status
-            app { name slug }
-            checkRuns(last: 50) {
-              nodes { name conclusion status detailsUrl permalink
-                annotations(first: 50) {
-                  totalCount
-                  nodes { path location { start { line } } annotationLevel title message }
-                }
-              }
-            }
-          }
-        }
-        status { contexts { state context description targetUrl } }
-      }
-    }
-  }
-}`
 
 // RefQueryResponse mirrors the GraphQL envelope for a ref query.
 type RefQueryResponse struct {
@@ -616,8 +490,14 @@ type CommitObject struct {
 
 // FetchRef retrieves the monitoring snapshot for a branch ref.
 func (s *Service) FetchRef(owner, repo, ref string) (*RefQueryResponse, error) {
+	return s.FetchRefWithTier(owner, repo, ref, TierFull)
+}
+
+// FetchRefWithTier retrieves the ref snapshot at the given tier. Ref queries
+// carry no comments or reviews, so only annotations are shed.
+func (s *Service) FetchRefWithTier(owner, repo, ref string, tier QueryTier) (*RefQueryResponse, error) {
 	var result RefQueryResponse
-	err := s.API.GraphQL(MONITOR_REF_QUERY, map[string]interface{}{
+	err := s.API.GraphQL(MonitorRefQuery(tier), map[string]interface{}{
 		"owner": owner,
 		"repo":  repo,
 		"ref":   ref,
@@ -633,8 +513,13 @@ func (s *Service) FetchRef(owner, repo, ref string) (*RefQueryResponse, error) {
 
 // FetchCommit retrieves the monitoring snapshot for a commit SHA.
 func (s *Service) FetchCommit(owner, repo, sha string) (*CommitQueryResponse, error) {
+	return s.FetchCommitWithTier(owner, repo, sha, TierFull)
+}
+
+// FetchCommitWithTier retrieves the commit snapshot at the given tier.
+func (s *Service) FetchCommitWithTier(owner, repo, sha string, tier QueryTier) (*CommitQueryResponse, error) {
 	var result CommitQueryResponse
-	err := s.API.GraphQL(MONITOR_COMMIT_QUERY, map[string]interface{}{
+	err := s.API.GraphQL(MonitorCommitQuery(tier), map[string]interface{}{
 		"owner": owner,
 		"repo":  repo,
 		"oid":   sha,
@@ -869,6 +754,14 @@ type PRStatus struct {
 	// AnnotationsURL is the check run's permalink when annotations are
 	// truncated, so a consumer can view the full set.
 	AnnotationsURL string `json:"annotations_url,omitempty"`
+	// ShedSurfaces names the surfaces the current tier does not fetch
+	// (e.g. "annotations", "reviews"). The snapshot retains the last-known
+	// values for those surfaces via CarryForwardShed, so a shed surface reads
+	// as "not watched" rather than "cleared" — an APPROVED review must not
+	// read as dismissed, failing checks must not read as CI-green. Empty when
+	// nothing is shed. It is the loud part of degradation: consumers can see
+	// exactly what is no longer being watched.
+	ShedSurfaces []string `json:"shed_surfaces,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -885,6 +778,11 @@ type SnapshotOptions struct {
 	// When nil, AwaitingChecks is not computed (the ruleset was not
 	// fetched — e.g. ref/commit targets that lack a PR context).
 	RulesetChecks *RulesetChecks
+
+	// Tier is the query tier this snapshot was fetched at. It drives
+	// ShedSurfaces on the resulting PRStatus so consumers can see what is no
+	// longer being watched. TierFull (the zero value) sheds nothing.
+	Tier QueryTier
 }
 
 // Snapshot distills a raw PR payload into a PRStatus.
@@ -909,6 +807,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		FailingChecks:     failingChecks(pr),
 		PendingChecks:     pendingChecks(pr),
 		SuccessfulChecks:  successfulChecks(pr),
+		ShedSurfaces:      opts.Tier.ShedSurfaces(),
 	}
 	status.CheckAnnotations, status.AnnotationsTruncated, status.AnnotationsURL = extractAnnotations(pr, opts.AnnotationLevels)
 

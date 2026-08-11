@@ -71,10 +71,12 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	defer func() { _ = os.Remove(socket) }()
 
 	// One fetch function per identity. Each call goes through the real gh CLI
-	// client; the hub fans the single result out to every subscribed client.
-	fetch := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+	// client at the poller's current query tier (shedding low-priority
+	// surfaces as the GraphQL budget runs low); the hub fans the single result
+	// out to every subscribed client.
+	fetch := func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (*monitor.PullRequest, error) {
 		svc := &monitor.Service{API: apiClientFactory(id.Host)}
-		resp, err := svc.Fetch(&id, id.Number)
+		resp, err := svc.FetchWithTier(&id, id.Number, tier)
 		if err != nil {
 			return nil, err
 		}

@@ -365,28 +365,47 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 		snapOpts.RulesetChecks = ruleset
 	}
 
+	lastTier := TierFull
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		resp, err := svc.Fetch(&opts.Identity, opts.Identity.Number)
+		// Select the fetch tier from the advisory GraphQL budget and say
+		// loudly what is no longer being watched when it changes.
+		tier := opts.currentTier()
+		if tier != lastTier {
+			emitTierNotice(opts, tier, emit)
+			lastTier = tier
+		}
+		snapOpts.Tier = tier
+
+		resp, err := svc.FetchWithTier(&opts.Identity, opts.Identity.Number, tier)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			emitDegraded(opts, "graphql", err, emit)
-			d := opts.jittered(nextErrBackoff(errBackoff, base))
-			errBackoff = d
-			// On rate limit, fetch the reset time and back off until then.
-			if reset := rateLimitResetSeconds(svc); reset > 0 {
-				until := time.Unix(reset, 0).UTC()
-				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-					d = wait
+			// A per-query resource-limit error can be beaten by a cheaper
+			// query: retry once one tier down. A rate-limit 403 cannot — every
+			// query costs points — so it keeps the hard backoff below.
+			if IsQueryCostError(err) && tier > TierStatus {
+				resp, err = svc.FetchWithTier(&opts.Identity, opts.Identity.Number, tier.Lower())
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
+				emitDegraded(opts, "graphql", err, emit)
+				d := opts.jittered(nextErrBackoff(errBackoff, base))
+				errBackoff = d
+				// On rate limit, fetch the reset time and back off until then.
+				if reset := rateLimitResetSeconds(svc); reset > 0 {
+					until := time.Unix(reset, 0).UTC()
+					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+						d = wait
+					}
 				}
+				if serr := opts.sleep(ctx, d); serr != nil {
+					return serr
+				}
+				continue
 			}
-			if serr := opts.sleep(ctx, d); serr != nil {
-				return serr
-			}
-			continue
 		}
 		errBackoff = 0
 
@@ -507,44 +526,64 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			return err
 		}
 
+		// Ref/commit targets shed only annotations (their queries carry no
+		// comments or reviews). The shed is invisible in the snapshot — the
+		// ref watcher surfaces checks only — so it is logged, not notified.
+		tier := opts.currentTier()
+		if tier == TierNoReviews || tier == TierStatus {
+			// The ref query has no comments/reviews to shed; the annotation
+			// shed is the only meaningful step.
+			tier = TierNoAnnotations
+		}
+
 		var curr *RefStatus
 		switch opts.Identity.Target {
 		case "commit":
-			resp, err := svc.FetchCommit(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA)
+			resp, err := svc.FetchCommitWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA, tier)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-				emitDegraded(opts, "graphql", err, emit)
-				d := opts.jittered(nextErrBackoff(errBackoff, base))
-				errBackoff = d
-				if reset := rateLimitResetSeconds(svc); reset > 0 {
-					until := time.Unix(reset, 0).UTC()
-					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-						d = wait
+				if IsQueryCostError(err) && tier > TierStatus {
+					resp, err = svc.FetchCommitWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA, tier.Lower())
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
+					emitDegraded(opts, "graphql", err, emit)
+					d := opts.jittered(nextErrBackoff(errBackoff, base))
+					errBackoff = d
+					if reset := rateLimitResetSeconds(svc); reset > 0 {
+						until := time.Unix(reset, 0).UTC()
+						if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+							d = wait
+						}
 					}
+					if serr := opts.sleep(ctx, d); serr != nil {
+						return serr
+					}
+					continue
 				}
-				if serr := opts.sleep(ctx, d); serr != nil {
-					return serr
-				}
-				continue
 			}
 			curr = SnapshotCommit(resp.Repository.Object)
 		default:
-			resp, err := svc.FetchRef(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref)
+			resp, err := svc.FetchRefWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref, tier)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-				emitDegraded(opts, "graphql", err, emit)
-				d := opts.jittered(nextErrBackoff(errBackoff, base))
-				errBackoff = d
-				if reset := rateLimitResetSeconds(svc); reset > 0 {
-					until := time.Unix(reset, 0).UTC()
-					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-						d = wait
+				if IsQueryCostError(err) && tier > TierStatus {
+					resp, err = svc.FetchRefWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref, tier.Lower())
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
+					emitDegraded(opts, "graphql", err, emit)
+					d := opts.jittered(nextErrBackoff(errBackoff, base))
+					errBackoff = d
+					if reset := rateLimitResetSeconds(svc); reset > 0 {
+						until := time.Unix(reset, 0).UTC()
+						if wait := until.Sub(opts.now()); wait > 0 && wait > d {
+							d = wait
+						}
 					}
+					if serr := opts.sleep(ctx, d); serr != nil {
+						return serr
+					}
+					continue
 				}
-				if serr := opts.sleep(ctx, d); serr != nil {
-					return serr
-				}
-				continue
 			}
 			curr = SnapshotRef(resp.Repository.Ref)
 		}

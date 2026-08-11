@@ -54,7 +54,7 @@ func openPR() *monitor.PullRequest {
 func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.PullRequest) (socket string, fetches *int64, cleanup func()) {
 	t.Helper()
 	var calls int64
-	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&calls, 1)
 		return prFn(), nil
 	}
@@ -258,7 +258,7 @@ func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string
 // spawnDaemonFn) and streams the first-poll from it.
 func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 	var fetches int64
-	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return closedPR(), nil
 	}
@@ -294,7 +294,7 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 // second daemon when one is already listening.
 func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 	var fetches int64
-	fetcher := func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error) {
+	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return closedPR(), nil
 	}
