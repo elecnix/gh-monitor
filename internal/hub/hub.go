@@ -37,6 +37,7 @@ type Hub struct {
 	fetch     FetchFunc
 	rulesetFn RulesetFunc
 	interval  time.Duration
+	budget    *monitor.BudgetGuard
 
 	mu      sync.Mutex
 	pollers map[prKey]*prPoller
@@ -52,8 +53,10 @@ type prKey struct {
 // New creates a Hub. interval is the cadence between background fetches; a
 // poller also fetches immediately on start. If interval <= 0 it defaults to
 // 60s. rulesetFn is called once when a poller starts to determine required
-// status checks; pass nil to disable ruleset-aware monitoring.
-func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration) *Hub {
+// status checks; pass nil to disable ruleset-aware monitoring. budget, when
+// non-nil, makes every poller stretch its cadence as the shared GraphQL
+// budget runs low (advisory; rate-limit errors keep their hard backoff).
+func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget *monitor.BudgetGuard) *Hub {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
@@ -61,6 +64,7 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration) *Hub {
 		fetch:     fetch,
 		rulesetFn: rulesetFn,
 		interval:  interval,
+		budget:    budget,
 		pollers:   make(map[prKey]*prPoller),
 	}
 }
@@ -177,9 +181,10 @@ func (h *Hub) detach(key prKey, p *prPoller, sub *prSub) {
 // prPoller owns one fetch loop for one PR identity and broadcasts each fetched
 // snapshot to its subscribers.
 type prPoller struct {
-	hub      *Hub
+		hub      *Hub
 	identity resolver.Identity
 	interval time.Duration
+	budget   *monitor.BudgetGuard
 	ruleset  *monitor.RulesetChecks // fetched once at poller start; nil until fetched
 
 	mu       sync.Mutex
@@ -197,6 +202,7 @@ func newPRPoller(h *Hub, id resolver.Identity, interval time.Duration) *prPoller
 		hub:      h,
 		identity: id,
 		interval: interval,
+		budget:   h.budget,
 		subs:     make(map[*prSub]struct{}),
 		wake:     make(chan struct{}, 1),
 		stopc:    make(chan struct{}),
@@ -256,12 +262,20 @@ func (p *prPoller) run() {
 }
 
 // nextDelay returns the jittered idle-interval for the current noChange
-// count. Jitter de-phases pollers that subscribed at the same moment, so a
-// fleet attaching many watchers at once does not burst requests in phase.
+// count, stretched by the advisory GraphQL budget when the guard reports the
+// budget low. Jitter de-phases pollers that subscribed at the same moment, so
+// a fleet attaching many watchers at once does not burst requests in phase.
 func (p *prPoller) nextDelay() time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return monitor.Jittered(monitor.IdleInterval(p.interval, p.noChange))
+	d := monitor.Jittered(monitor.IdleInterval(p.interval, p.noChange))
+	if p.budget != nil {
+		d += p.budget.Stretch(time.Now()).Extra
+		if d > monitor.MaxIdleInterval {
+			d = monitor.MaxIdleInterval
+		}
+	}
+	return d
 }
 
 func (p *prPoller) stop() {

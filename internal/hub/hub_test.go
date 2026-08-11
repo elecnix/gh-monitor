@@ -92,7 +92,7 @@ func TestHub_SingleFetchFansOutToMultipleConsumers(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return snap, nil
-	}, nil, time.Hour)
+	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,7 +125,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	current := prFixture([]string{"ci-build"})
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		return current, nil
-	}, nil, time.Hour)
+	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,7 +180,7 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return prFixture(nil), nil
-	}, nil, 5*time.Millisecond)
+	}, nil, 5*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,7 +221,7 @@ func TestPoller_BacksOffWhenQuiet(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		atomic.AddInt64(&fetches, 1)
 		return snap, nil
-	}, nil, 20*time.Millisecond)
+	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -257,7 +257,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		return current, nil
-	}, nil, 5*time.Millisecond)
+	}, nil, 5*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -291,7 +291,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
 	h := New(func(ctx context.Context, _ resolver.Identity) (*monitor.PullRequest, error) {
 		return prFixture(nil), nil
-	}, nil, 5*time.Millisecond)
+	}, nil, 5*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
