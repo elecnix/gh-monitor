@@ -97,6 +97,41 @@ type Event struct {
 	DegradedResetAt string `json:"degraded_reset_at,omitempty"`
 }
 
+// CarryForwardShed retains the last-known values for surfaces the current
+// snapshot's tier no longer fetches (listed in curr.ShedSurfaces), so Diff
+// sees "not watched" rather than "cleared": a shed review decision must not
+// read as dismissed, shed check annotations must not vanish, and shed
+// comments/threads must not re-emit as new. Without this, dropping a tier
+// would fire false events — an APPROVED review reading as DISMISSED is the
+// worst of them.
+//
+// It must run before Diff, and only against the consumer's own previous
+// snapshot (shed surfaces on the very first poll have nothing to carry).
+func CarryForwardShed(prev, curr *PRStatus) {
+	if prev == nil || curr == nil || len(curr.ShedSurfaces) == 0 {
+		return
+	}
+	shed := make(map[string]bool, len(curr.ShedSurfaces))
+	for _, s := range curr.ShedSurfaces {
+		shed[s] = true
+	}
+	if shed["annotations"] {
+		curr.CheckAnnotations = append([]AnnotationSummary(nil), prev.CheckAnnotations...)
+		curr.AnnotationsTruncated = prev.AnnotationsTruncated
+		curr.AnnotationsURL = prev.AnnotationsURL
+	}
+	if shed["reviews"] {
+		curr.ReviewDecision = prev.ReviewDecision
+		curr.ReviewAuthor = prev.ReviewAuthor
+	}
+	if shed["review threads"] {
+		curr.UnresolvedThreads = append([]ThreadSummary(nil), prev.UnresolvedThreads...)
+	}
+	if shed["comments"] {
+		curr.GeneralComments = append([]GeneralComment(nil), prev.GeneralComments...)
+	}
+}
+
 // Diff returns the genuinely-new changes between prev and curr.
 //
 // First-poll semantics (documented decision): when prev is nil the call is a

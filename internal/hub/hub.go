@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +21,14 @@ import (
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
-// FetchFunc returns the current raw PR payload for one identity. The hub
-// shares this single fetch across every consumer; each consumer then distills
-// it into a *monitor.PRStatus with its own SnapshotOptions (so per-consumer
-// IgnoredBots are honored) before diffing against its own baseline.
-type FetchFunc func(ctx context.Context, id resolver.Identity) (*monitor.PullRequest, error)
+// FetchFunc returns the current raw PR payload for one identity at the given
+// query tier (see monitor.QueryTier). The hub shares this single fetch across
+// every consumer; each consumer then distills it into a *monitor.PRStatus with
+// its own SnapshotOptions (so per-consumer IgnoredBots are honored) before
+// diffing against its own baseline. The tier lets the poller shed low-priority
+// surfaces (annotations, reviews, comments) as the shared GraphQL budget runs
+// low, keeping PR status + check outcomes alive.
+type FetchFunc func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (*monitor.PullRequest, error)
 
 // RulesetFunc returns the required status checks for a repository. It is called
 // once per poller (not per consumer) — rulesets rarely change mid-monitoring.
@@ -94,6 +98,7 @@ func (h *Hub) SubscribePR(ctx context.Context, opts monitor.RunOptions) (<-chan 
 		consumer:   monitor.NewPRConsumer(opts),
 		snapOpts:   monitor.SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels},
 		snapshotCh: make(chan *monitor.PullRequest, 1),
+		notifCh:    make(chan monitor.Notification, 4),
 		out:        make(chan monitor.Notification, 16),
 		done:       make(chan struct{}),
 	}
@@ -181,7 +186,7 @@ func (h *Hub) detach(key prKey, p *prPoller, sub *prSub) {
 // prPoller owns one fetch loop for one PR identity and broadcasts each fetched
 // snapshot to its subscribers.
 type prPoller struct {
-		hub      *Hub
+	hub      *Hub
 	identity resolver.Identity
 	interval time.Duration
 	budget   *monitor.BudgetGuard
@@ -190,6 +195,7 @@ type prPoller struct {
 	mu       sync.Mutex
 	latest   *monitor.PullRequest
 	noChange int // consecutive fingerprint-unchanged fetches; drives idle backoff
+	tier     monitor.QueryTier // last fetched tier; drives shed notices
 	subs     map[*prSub]struct{}
 
 	wake  chan struct{}
@@ -292,6 +298,13 @@ func (p *prPoller) fetchOnce() {
 	fetch := p.hub.fetch
 	p.hub.mu.Unlock()
 
+	// Select the tier from the advisory GraphQL budget (TierFull when no
+	// guard is wired) and say loudly when the watched surfaces change.
+	tier := p.selectTier()
+	if tier != p.tier {
+		p.applyTier(tier)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Stop the fetch if the poller is stopped.
@@ -303,9 +316,26 @@ func (p *prPoller) fetchOnce() {
 		}
 	}()
 
-	curr, err := fetch(ctx, p.identity)
-	if err != nil || curr == nil {
-		return
+	curr, err := fetch(ctx, p.identity, tier)
+	if err != nil {
+		// A per-query resource-limit error can be beaten by a cheaper query:
+		// retry once one tier down. A rate-limit 403 cannot (every query
+		// costs points), so it falls through to the degraded broadcast.
+		if monitor.IsQueryCostError(err) && tier > monitor.TierStatus {
+			curr, err = fetch(ctx, p.identity, tier-1)
+		}
+		if err != nil || curr == nil {
+			// Degrade loudly: a fetch error must reach subscribers, never
+			// vanish — a silently blind watcher reads as "all clear". The
+			// previous snapshot is retained; no inference replaces it.
+			p.broadcast(monitor.Notification{
+				Type:      string(monitor.EventDegraded),
+				PRLabel:   p.label(),
+				Message:   fmt.Sprintf("⚠️ API degraded (graphql) on %s: %v", p.label(), err),
+				Timestamp: time.Now(),
+			})
+			return
+		}
 	}
 	// Track fingerprint changes so run() can idle-back off a quiet PR the way
 	// the in-process loop does. Errors leave noChange untouched: a fetch that
@@ -330,12 +360,75 @@ func (p *prPoller) fetchOnce() {
 	p.mu.Unlock()
 }
 
+// selectTier returns the fetch tier for the next poll: TierFull when no
+// BudgetGuard is wired, otherwise derived from the advisory GraphQL budget.
+func (p *prPoller) selectTier() monitor.QueryTier {
+	if p.budget == nil {
+		return monitor.TierFull
+	}
+	if remaining, limit, ok := p.budget.GraphQLRemaining(time.Now()); ok {
+		return monitor.TierForRemaining(remaining, limit)
+	}
+	return monitor.TierFull
+}
+
+// applyTier records a tier change: it updates every subscriber's snapshot
+// options (so ShedSurfaces flow into their snapshots) and broadcasts a loud
+// notice naming what is no longer being watched (or that full monitoring has
+// resumed). A watcher that quietly shed surfaces would turn a missing signal
+// into an apparent all-clear.
+func (p *prPoller) applyTier(tier monitor.QueryTier) {
+	p.mu.Lock()
+	p.tier = tier
+	for s := range p.subs {
+		s.snapOpts.Tier = tier
+	}
+	p.mu.Unlock()
+
+	shed := tier.ShedSurfaces()
+	var msg string
+	if len(shed) > 0 {
+		msg = fmt.Sprintf("⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers",
+			p.label(), strings.Join(shed, ", "))
+	} else {
+		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
+	}
+	p.broadcast(monitor.Notification{
+		Type:      string(monitor.EventDegraded),
+		PRLabel:   p.label(),
+		Message:   msg,
+		Timestamp: time.Now(),
+	})
+}
+
+// broadcast fans a notification out to every subscriber's notification
+// channel. Sends are non-blocking: a consumer that has not drained its
+// previous notice drops the intermediate one, which is acceptable for
+// state-change notices (the next tier change or error re-notifies).
+func (p *prPoller) broadcast(n monitor.Notification) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for s := range p.subs {
+		select {
+		case s.notifCh <- n:
+		default:
+		}
+	}
+}
+
+// label renders the identity as "owner/repo#number" for notifications.
+func (p *prPoller) label() string {
+	return fmt.Sprintf("%s/%s#%d", p.identity.Owner, p.identity.Repo, p.identity.Number)
+}
+
 // prSub is one consumer's handle: its own PRConsumer (baseline), a buffered
-// snapshot inbox, and an output channel of notifications.
+// snapshot inbox, a notification channel for loop-level notices (degraded /
+// tier-shed), and an output channel of notifications.
 type prSub struct {
 	consumer   *monitor.PRConsumer
 	snapOpts   monitor.SnapshotOptions
 	snapshotCh chan *monitor.PullRequest
+	notifCh    chan monitor.Notification
 	out        chan monitor.Notification
 	done       chan struct{}
 }
@@ -364,6 +457,12 @@ func (s *prSub) loop() {
 			if terminal {
 				close(s.out)
 				return
+			}
+		case n := <-s.notifCh:
+			// Loop-level notices (degraded, tier-shed) pass straight through.
+			select {
+			case s.out <- n:
+			case <-s.done:
 			}
 		case <-s.done:
 			close(s.out)

@@ -54,6 +54,9 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal 
 		compare = &PRStatus{}
 		emit(renderNotificationPR(c.opts, curr, firstPollType, Event{}))
 	}
+	// Shed surfaces keep their last-known values so a tier drop never reads
+	// as "cleared" (see CarryForwardShed).
+	CarryForwardShed(c.prev, curr)
 	events := diff(compare, curr)
 	for _, ev := range events {
 		if firstPoll && ev.Type == EventNewCommit {

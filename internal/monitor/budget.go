@@ -1,9 +1,13 @@
 package monitor
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 )
 
 // BudgetGuard provides advisory awareness of the shared GitHub GraphQL
@@ -140,6 +144,54 @@ func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok 
 		return 0, 0, false
 	}
 	return g.cached.Resources.GraphQL.Remaining, g.cached.Resources.GraphQL.Limit, true
+}
+
+// currentTier returns the fetch tier for the next poll: TierFull when no
+// BudgetGuard is wired, otherwise derived from the advisory GraphQL budget.
+func (o *RunOptions) currentTier() QueryTier {
+	if o.Budget == nil {
+		return TierFull
+	}
+	if remaining, limit, ok := o.Budget.GraphQLRemaining(o.now()); ok {
+		return TierForRemaining(remaining, limit)
+	}
+	return TierFull
+}
+
+// emitTierNotice emits a loud degraded notification when the fetch tier drops
+// (naming exactly what is no longer being watched) or recovers. A watcher
+// that quietly sheds surfaces would turn a missing signal into an apparent
+// all-clear; this is the loud half of that rule.
+func emitTierNotice(opts RunOptions, tier QueryTier, emit func(Notification)) {
+	label := degradedLabel(opts)
+	var msg string
+	if shed := tier.ShedSurfaces(); len(shed) > 0 {
+		msg = fmt.Sprintf(
+			"⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers",
+			label, strings.Join(shed, ", "))
+	} else {
+		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", label)
+	}
+	emit(Notification{
+		Type:      string(EventDegraded),
+		PRLabel:   label,
+		Message:   msg,
+		Timestamp: opts.now(),
+	})
+}
+
+// isQueryCostError reports whether a GraphQL error is a per-query resource
+// limit ("Resource limits for this query exceeded") rather than a rate-limit
+// 403. A cheaper tier can pass where the richer query failed; a rate-limit
+// 403 cannot — every query costs points, so it keeps the hard backoff.
+func IsQueryCostError(err error) bool {
+	var gqlErr *ghcli.GraphQLError
+	if errors.As(err, &gqlErr) {
+		msg := strings.ToLower(gqlErr.Error())
+		return strings.Contains(msg, "resource limits") ||
+			(strings.Contains(msg, "query") && strings.Contains(msg, "exceeded"))
+	}
+	return false
 }
 
 // applyBudgetStretch consults the loop's BudgetGuard (when set), emits a loud
