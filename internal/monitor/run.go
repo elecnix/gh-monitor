@@ -520,6 +520,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	var prev *RefStatus
 	noChange := 0
 	errBackoff := time.Duration(0)
+	lastTier := TierFull
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -534,6 +535,11 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 			// The ref query has no comments/reviews to shed; the annotation
 			// shed is the only meaningful step.
 			tier = TierNoAnnotations
+		}
+		if tier != lastTier {
+			fmt.Fprintf(os.Stderr, "gh-monitor: %s %s: graphql budget low, dropping annotations from polls\n",
+				opts.Identity.Owner+"/"+opts.Identity.Repo, opts.Identity.Ref)
+			lastTier = tier
 		}
 
 		var curr *RefStatus
