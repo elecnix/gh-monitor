@@ -107,7 +107,9 @@ Flags: `--interval` (default 60s, min 10), `--timeout` (default 0 = forever), `-
 Monitor({ command: "gh monitor -R owner/repo 42", persistent: true })
 ```
 
-**Adaptive backoff:** After 3 no-change polls, interval grows exponentially (cap 5min), resets on any change. Transient errors retry with doubling backoff — the loop doesn't crash.
+**Adaptive backoff:** After 3 no-change polls, interval grows exponentially (cap 5min), resets on any change. Transient errors retry with doubling backoff — the loop doesn't crash. Poll delays are jittered (±20%) so concurrent watchers don't burst requests in phase.
+
+**GraphQL-budget aware:** the watcher reads `rate_limit` over REST and stretches its cadence as the shared GraphQL budget runs low (below ~10% of the limit), slowing instead of contributing to wholesale exhaustion. Transitions into/out of the low state emit a `degraded` notification. When the budget is very low the snapshot query sheds low-priority surfaces in order — annotations, then reviews, then comments — keeping PR status and check outcomes alive in every tier; each shed is announced loudly, and shed surfaces keep their last-known values (a shed review never reads as dismissed).
 
 **One-shot check:** `gh monitor --once -R owner/repo <pr>` emits current actionable state and exits (replaces the removed `await` command).
 
