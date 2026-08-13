@@ -46,6 +46,18 @@ cutting a release. The rules that matter:
    `linux-arm64`, `windows-amd64.exe`, built by
    [`script/build.sh`](script/build.sh) via
    [`cli/gh-extension-precompile`](https://github.com/cli/gh-extension-precompile).
+6. **Confirm the upgrade against the binary, not the manifest.**
+   `gh extension list` prints the install manifest's `tag:`, which is not
+   derived from the executable. Ask the binary:
+   ```sh
+   gh monitor --version
+   # gh monitor v1.17.0 (55d9154, 2026-08-11T15:24:54Z, go1.22.12)
+   ```
+   The tag comes from an `-ldflags -X` stamp that
+   [`script/build.sh`](script/build.sh) applies;
+   `cli/gh-extension-precompile` passes the release tag to the override script
+   as `$1`, so the release workflow needs no version plumbing of its own. The
+   revision and build time come from the Go toolchain's own VCS stamp.
 
 ### Self-hosted runner constraints
 
@@ -94,6 +106,12 @@ and is unaffected. See [`go help build`](https://pkg.go.dev/cmd/go#hdr-Compile_p
 ```sh
 go test -buildvcs=false ./...
 ```
+
+`-buildvcs=false` also strips the VCS stamp, so a worktree-built binary reports
+`unknown revision` from `gh monitor --version`. That is expected and is why the
+release version comes from an explicit `-ldflags -X` stamp rather than from VCS
+metadata alone. To exercise the revision path locally, build from a normal
+clone rather than a linked worktree.
 
 ## Pull requests
 
