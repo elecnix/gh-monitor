@@ -1,5 +1,7 @@
 # gh-monitor
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/elecnix/gh-monitor)
+
 A GitHub CLI extension for inline PR review comments, thread inspection, and live PR monitoring in the terminal — built to be driven by coding agents such as Claude Code.
 
 This fork of [agynio/gh-pr-review](https://github.com/agynio/gh-pr-review) adds features for developers, DevOps teams, and AI systems that need complete pull request review context.
