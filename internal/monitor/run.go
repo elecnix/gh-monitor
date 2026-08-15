@@ -816,6 +816,19 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(bac
 // maxIdleInterval. It is exported so the shared poller daemon can back its
 // per-PR cadence off the same formula the in-process loop uses.
 func IdleInterval(base time.Duration, noChange int) time.Duration {
+	return IdleIntervalCapped(base, noChange, maxIdleInterval)
+}
+
+// IdleIntervalCapped is IdleInterval with a caller-supplied ceiling instead
+// of the fixed MaxIdleInterval. It exists for the daemon's optional broker
+// transport (see internal/hub and internal/broker): while that transport
+// reports healthy, a poller's idle backoff is allowed to grow well past the
+// normal 300s ceiling, because a real change now arrives as an immediate
+// wake instead of waiting for the next tick — polling becomes a rare safety
+// net, not the primary path. cap <= 0 is treated as "no ceiling" (the
+// backoff still starts at base and only grows, so this is never used to
+// stop polling altogether).
+func IdleIntervalCapped(base time.Duration, noChange int, cap time.Duration) time.Duration {
 	d := base
 	if noChange >= 3 {
 		shift := uint(noChange - 3)
@@ -824,8 +837,8 @@ func IdleInterval(base time.Duration, noChange int) time.Duration {
 		}
 		d = base * time.Duration(uint64(1)<<shift)
 	}
-	if d > maxIdleInterval {
-		d = maxIdleInterval
+	if cap > 0 && d > cap {
+		d = cap
 	}
 	if d < base {
 		d = base

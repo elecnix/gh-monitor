@@ -46,6 +46,12 @@ type Hub struct {
 
 	mu      sync.Mutex
 	pollers map[prKey]*prPoller
+
+	// brokerMu guards the optional broker-transport health flag and its
+	// extended idle-poll ceiling. See SetBrokerHealth and SetBrokerIdleCap.
+	brokerMu      sync.RWMutex
+	brokerHealthy bool
+	brokerIdleCap time.Duration // 0 = broker integration not enabled
 }
 
 // prKey identifies a single PR poller.
@@ -172,6 +178,104 @@ func (h *Hub) RefreshPR(id resolver.Identity) error {
 	return nil
 }
 
+// RefreshRepo wakes every currently-subscribed poller for owner/repo. It
+// exists for broker events that name a repository but no specific PR —
+// check_run and check_suite events are keyed by commit SHA, not PR number,
+// so there is nothing to filter client-side by (the module README's
+// pr_number guidance only applies when an event carries one). Refreshing
+// every actively-watched PR in that repository is still far cheaper than
+// the polling this transport replaces, and it stays authoritative: nothing
+// is inferred from the fact the event fired, only that a fetch should run
+// now instead of waiting for the next tick.
+func (h *Hub) RefreshRepo(owner, repo string) {
+	h.mu.Lock()
+	var keys []prKey
+	for k := range h.pollers {
+		if k.owner == owner && k.repo == repo {
+			keys = append(keys, k)
+		}
+	}
+	h.mu.Unlock()
+	for _, k := range keys {
+		_ = h.RefreshPR(resolver.Identity{Owner: k.owner, Repo: k.repo, Number: k.number})
+	}
+}
+
+// SetBrokerIdleCap enables broker-aware cadence stretching: while the
+// broker transport is healthy (SetBrokerHealth), a poller's idle backoff is
+// allowed to grow past monitor.MaxIdleInterval up to cap instead — polling
+// becomes a rare safety net because a real change now wakes the poller
+// immediately via RefreshPR/RefreshRepo. Call once at daemon startup,
+// before any broker events arrive. cap <= 0 disables the override: pollers
+// keep the normal ceiling even when the broker reports healthy.
+func (h *Hub) SetBrokerIdleCap(cap time.Duration) {
+	h.brokerMu.Lock()
+	h.brokerIdleCap = cap
+	h.brokerMu.Unlock()
+}
+
+// SetBrokerHealth records the broker transport's connection state and, on
+// every transition, broadcasts a loud notice to every active subscriber
+// across every poller — never silently. This is the "absence is not
+// success" guarantee the transport exists to honour at the daemon level: a
+// subscriber must be able to tell whether the low-latency wake path is live
+// or whether interval polling alone is currently doing the work, because
+// each state calls for a different response from whatever reads the
+// notification stream. detail (typically an error's message) is appended
+// to a degraded notice when non-empty; it is ignored for a healthy one.
+//
+// A transition to unhealthy takes effect on the very next poll: nextDelay
+// stops honouring the extended idle cap immediately, so a lost broker
+// connection is followed by normal polling within one cycle, not a stale
+// long wait computed while the broker still looked healthy.
+func (h *Hub) SetBrokerHealth(healthy bool, detail string) {
+	h.brokerMu.Lock()
+	changed := h.brokerHealthy != healthy
+	h.brokerHealthy = healthy
+	h.brokerMu.Unlock()
+	if !changed {
+		return
+	}
+
+	var msg string
+	if healthy {
+		msg = "✅ broker transport connected: PR/CI updates now arrive as they happen; polling continues as a rare safety net"
+	} else {
+		msg = "⚠️ broker transport degraded — falling back to interval polling until it reconnects"
+		if detail != "" {
+			msg += ": " + detail
+		}
+	}
+	h.broadcastAll(monitor.Event{
+		Type:   monitor.EventDegraded,
+		Notice: msg,
+	})
+}
+
+// BrokerHealthy reports the broker transport's last-known health and its
+// configured extended idle cap (0 when SetBrokerIdleCap was never called,
+// meaning the override never applies even if healthy is true).
+func (h *Hub) BrokerHealthy() (healthy bool, idleCap time.Duration) {
+	h.brokerMu.RLock()
+	defer h.brokerMu.RUnlock()
+	return h.brokerHealthy, h.brokerIdleCap
+}
+
+// broadcastAll fans an event out to every subscriber of every active
+// poller — used for hub-wide notices (broker health) rather than a single
+// poller's own degraded/tier-shed broadcasts.
+func (h *Hub) broadcastAll(ev monitor.Event) {
+	h.mu.Lock()
+	pollers := make([]*prPoller, 0, len(h.pollers))
+	for _, p := range h.pollers {
+		pollers = append(pollers, p)
+	}
+	h.mu.Unlock()
+	for _, p := range pollers {
+		p.broadcast(ev)
+	}
+}
+
 // Stop tears down every poller. It is safe to call multiple times.
 func (h *Hub) Stop() {
 	h.mu.Lock()
@@ -290,14 +394,29 @@ func (p *prPoller) run() {
 // count, stretched by the advisory GraphQL budget when the guard reports the
 // budget low. Jitter de-phases pollers that subscribed at the same moment, so
 // a fleet attaching many watchers at once does not burst requests in phase.
+//
+// When the hub's optional broker transport reports healthy (and an idle cap
+// was configured via SetBrokerIdleCap), the idle ceiling is extended well
+// past monitor.MaxIdleInterval: a real change now arrives as an immediate
+// wake instead of waiting for the next tick, so the periodic poll only has
+// to serve as a rare safety net. The moment the broker degrades, this reads
+// the normal ceiling again on the very next call — no stale extended wait
+// survives a lost connection.
 func (p *prPoller) nextDelay() time.Duration {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	d := monitor.Jittered(monitor.IdleInterval(p.interval, p.noChange))
+	noChange := p.noChange
+	p.mu.Unlock()
+
+	ceiling := monitor.MaxIdleInterval
+	if healthy, cap := p.hub.BrokerHealthy(); healthy && cap > 0 {
+		ceiling = cap
+	}
+
+	d := monitor.Jittered(monitor.IdleIntervalCapped(p.interval, noChange, ceiling))
 	if p.budget != nil {
 		d += p.budget.Stretch(time.Now()).Extra
-		if d > monitor.MaxIdleInterval {
-			d = monitor.MaxIdleInterval
+		if d > ceiling {
+			d = ceiling
 		}
 	}
 	return d

@@ -18,6 +18,7 @@ import (
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/remote"
+	"github.com/elecnix/gh-monitor/internal/broker"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -27,6 +28,14 @@ import (
 // DaemonBackendName is the name the daemon announces itself under, and the
 // name to pass to --backend to pin monitoring to it.
 const DaemonBackendName = "daemon"
+
+// brokerIdleCapDefault is the daemon's poll-cadence ceiling while the broker
+// transport reports healthy — see internal/hub.Hub.SetBrokerIdleCap. 30
+// minutes turns polling into a rare safety net (event-driven wakes carry the
+// real load) without ever making a watched PR go fully silent even if a
+// wake is somehow missed. Override with GH_MONITOR_BROKER_IDLE_CAP (seconds)
+// — see broker.IdleCapFromEnv.
+const brokerIdleCapDefault = 30 * time.Minute
 
 // newDaemonCommand builds `gh monitor daemon`: a long-lived process that
 // multiplexes one fetch loop per PR identity across many `gh monitor` client
@@ -48,7 +57,14 @@ daemon is running, ` + "`gh monitor`" + ` falls back to its usual in-process pol
 existing behaviour is unchanged.
 
 The daemon honours $GH_MONITOR_SOCK, $XDG_RUNTIME_DIR, and a per-user cache
-dir for the socket path. Send SIGTERM/SIGINT to stop it cleanly.`,
+dir for the socket path. Send SIGTERM/SIGINT to stop it cleanly.
+
+Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
+broker: matching events wake the affected PR's fetch immediately instead of
+waiting for the next tick, so a quiet PR polls far less often. It is purely
+additive — a lost broker connection reports itself loudly and falls back to
+normal interval polling within one cycle, never silence. See the README's
+"Broker transport" section.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -121,6 +137,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	}()
 
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s)\n", socket, interval)
+	startBrokerTransport(ctx, cmd, h)
 
 	var wg sync.WaitGroup
 	go func() {
@@ -150,6 +167,63 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 // hubSource adapts the shared poller to backend.Source, so the daemon serves
 // the same protocol as any other out-of-process backend.
 type hubSource struct{ hub *hub.Hub }
+
+// startBrokerTransport wires the optional broker-backed transport (see
+// internal/broker) into the daemon's hub, if configured via
+// GH_MONITOR_BROKER_ENDPOINT. It is a no-op — logged once, loudly, so a
+// user can always tell which transport is answering — when the variable is
+// unset, which is the default for every gh-monitor install that has never
+// heard of this feature.
+//
+// Wiring is deliberately thin: a wake only ever triggers an existing
+// RefreshPR/RefreshRepo fetch through the hub, never derives PR state
+// itself, and every connection-state transition flows straight into
+// h.SetBrokerHealth so a lost connection is loud and falls back to normal
+// interval polling within one poll cycle — never silence, per the "absence
+// is not success" guidance in the broker's own operator documentation.
+func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
+	cfg, ok := broker.ConfigFromEnv()
+	if !ok {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+			"gh-monitor daemon: broker transport not configured (set GH_MONITOR_BROKER_ENDPOINT to enable) — polling only")
+		return
+	}
+
+	h.SetBrokerIdleCap(broker.IdleCapFromEnv(brokerIdleCapDefault))
+
+	w := broker.NewWatcher(cfg)
+	w.OnState = func(state broker.State, err error) {
+		detail := ""
+		if err != nil {
+			detail = err.Error()
+		}
+		h.SetBrokerHealth(state == broker.StateHealthy, detail)
+		switch state {
+		case broker.StateHealthy:
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport connected (topic %s)\n", cfg.Topic)
+		case broker.StateDegraded:
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport degraded (%v) — falling back to interval polling\n", err)
+		}
+	}
+	w.OnWake = func(owner, repo string, prNumber int) {
+		if prNumber > 0 {
+			_ = h.RefreshPR(resolver.Identity{Owner: owner, Repo: repo, Number: prNumber})
+			return
+		}
+		// No PR number on the event (e.g. check_run/check_suite, which key
+		// off a commit SHA): refresh every PR this daemon currently watches
+		// for that repository rather than guess which one changed.
+		h.RefreshRepo(owner, repo)
+	}
+
+	go func() {
+		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker watcher stopped: %v\n", err)
+		}
+	}()
+
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport enabled (endpoint %s, topic %s)\n", cfg.Endpoint, cfg.Topic)
+}
 
 func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
 	if t.Kind != backend.KindPR {

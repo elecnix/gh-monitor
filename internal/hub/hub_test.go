@@ -364,6 +364,153 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 		"entering a shed tier must broadcast a degraded notice")
 }
 
+// TestHub_SetBrokerHealth_BroadcastsOnceOnTransition verifies the loud
+// signal a broker-backed watcher must give per the module's "absence is not
+// success" guidance: every health transition reaches every subscriber
+// exactly once, and re-reporting the same state a second time (a duplicate
+// OnState call, or the daemon re-affirming the same health) does not spam a
+// second notice.
+func TestHub_SetBrokerHealth_BroadcastsOnceOnTransition(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 100*time.Millisecond) // drain the first-poll
+
+	h.SetBrokerHealth(true, "")
+	gotHealthy := collect(ch, 100*time.Millisecond)
+	require.Len(t, gotHealthy, 1, "a health transition must broadcast exactly one notice")
+	assert.Equal(t, string(monitor.EventDegraded), gotHealthy[0])
+
+	// Re-affirming the same state must not broadcast again.
+	h.SetBrokerHealth(true, "")
+	gotRepeat := collect(ch, 50*time.Millisecond)
+	assert.Empty(t, gotRepeat, "reporting the same health twice must not double-broadcast")
+
+	h.SetBrokerHealth(false, "connection lost: EOF")
+	gotDegraded := collect(ch, 100*time.Millisecond)
+	require.Len(t, gotDegraded, 1, "the degrade transition must also broadcast exactly one notice")
+}
+
+// TestHub_BrokerHealthy_ReflectsLastSetState verifies BrokerHealthy answers
+// with whatever was last reported, defaulting to unhealthy (a hub that never
+// had SetBrokerHealth called — no broker configured — must never claim
+// healthy by default, since nextDelay's extended cap is gated on it).
+func TestHub_BrokerHealthy_ReflectsLastSetState(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	healthy, cap := h.BrokerHealthy()
+	assert.False(t, healthy, "a hub with no broker wired must default to unhealthy")
+	assert.Zero(t, cap)
+
+	h.SetBrokerIdleCap(30 * time.Minute)
+	h.SetBrokerHealth(true, "")
+	healthy, cap = h.BrokerHealthy()
+	assert.True(t, healthy)
+	assert.Equal(t, 30*time.Minute, cap)
+
+	h.SetBrokerHealth(false, "boom")
+	healthy, _ = h.BrokerHealthy()
+	assert.False(t, healthy)
+}
+
+// TestPoller_NextDelayHonoursBrokerExtendedCap is the mechanism-level "prove
+// it actually reduces polling" test: at the same noChange count (the same
+// point in a quiet PR's backoff curve), nextDelay must return a strictly
+// longer wait once the broker reports healthy with an extended idle cap
+// configured than it does with no broker wired at all. A longer wait between
+// fetches is, by construction, fewer fetches over any fixed window — the
+// exact arithmetic (how many fewer, over a realistic window) is measured
+// separately in internal/monitor's IdleIntervalCapped tests, which don't
+// need a live poller and so can simulate a full 30-minute window without
+// actually sleeping.
+func TestPoller_NextDelayHonoursBrokerExtendedCap(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return prFixture(nil), nil
+	}, nil, 60*time.Second, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 50*time.Millisecond) // let the poller start and register
+
+	h.mu.Lock()
+	var p *prPoller
+	for _, poller := range h.pollers {
+		p = poller
+	}
+	h.mu.Unlock()
+	require.NotNil(t, p, "the poller must exist once a consumer is subscribed")
+
+	// Put the poller deep into its idle backoff — the state a genuinely
+	// quiet PR reaches after a few minutes either way.
+	p.mu.Lock()
+	p.noChange = 20
+	p.mu.Unlock()
+
+	withoutBroker := p.nextDelay()
+	assert.LessOrEqual(t, withoutBroker, 2*monitor.MaxIdleInterval,
+		"with no broker configured, nextDelay must stay within the default ceiling (plus jitter)")
+
+	h.SetBrokerIdleCap(2 * time.Hour)
+	h.SetBrokerHealth(true, "")
+	withBroker := p.nextDelay()
+
+	assert.Greater(t, withBroker, withoutBroker,
+		"a healthy broker with an extended idle cap must allow a longer idle wait than the default ceiling — that longer wait is the reduced polling")
+}
+
+// TestPoller_RevertsToNormalCadenceWhenBrokerDegrades is the "break it and
+// confirm it falls back" test at the hub level (the broker package's own
+// tests break the MQTT session itself; this proves the daemon's poller
+// actually acts on that signal). A poller running under the broker's
+// extended idle cap must, the moment the broker degrades, stop honouring
+// that extension — nextDelay must read the normal ceiling on its very next
+// call, not a stale extended one computed while the broker still looked up.
+func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return prFixture(nil), nil
+	}, nil, 5*time.Millisecond, nil)
+	t.Cleanup(h.Stop)
+
+	h.SetBrokerIdleCap(time.Hour) // deliberately huge: a bug that keeps using it would starve the test
+	h.SetBrokerHealth(true, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 60*time.Millisecond) // let noChange grow well past 3
+
+	// Kill the broker transport.
+	h.SetBrokerHealth(false, "connection lost: EOF")
+	got := collect(ch, 60*time.Millisecond)
+	require.Contains(t, got, string(monitor.EventDegraded), "the degrade must reach the subscriber as a loud notice")
+
+	h.mu.Lock()
+	var p *prPoller
+	for _, poller := range h.pollers {
+		p = poller
+	}
+	h.mu.Unlock()
+	require.NotNil(t, p)
+
+	d := p.nextDelay()
+	assert.LessOrEqual(t, d, 2*monitor.MaxIdleInterval,
+		"once degraded, nextDelay must fall back within the normal ceiling, not the broker-healthy extended one")
+}
+
 // rateLimitAPIStub serves GET /rate_limit over REST with the given GraphQL
 // remaining/limit, mirroring the monitor package's test fixture.
 type rateLimitAPIStub struct {
