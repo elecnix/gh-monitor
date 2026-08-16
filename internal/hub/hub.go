@@ -448,7 +448,7 @@ func (s *prSub) loop() {
 				return
 			}
 			curr := monitor.Snapshot(raw, s.snapOpts)
-			terminal := s.consumer.Consume(curr, func(n monitor.Notification) {
+			terminal := s.consumer.ConsumeNotifications(curr, func(n monitor.Notification) {
 				select {
 				case s.out <- n:
 				case <-s.done:
