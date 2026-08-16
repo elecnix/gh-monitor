@@ -109,6 +109,19 @@ notification using the user's own templates and `--events` filter, so your
 backend's output looks exactly like the built-in one's, and `gh monitor prefs`
 still controls it.
 
+### What WatchOptions asks for
+
+Every field is advisory. Ignore what you cannot honour rather than failing —
+except `Once`, which changes what the caller is asking for.
+
+| Field      | Meaning                                                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Since`    | An opaque cursor from an earlier `Update`. Empty means start from now.                                                                      |
+| `Kinds`    | The event types the caller cares about. Empty means all. Delivering more is fine; the caller filters again.                                 |
+| `Interval` | The caller's preferred cadence. Meaningful to a poller, meaningless otherwise.                                                              |
+| `Timeout`  | Stop after this long. Zero means run until terminal or cancelled.                                                                           |
+| `Once`     | Deliver the current actionable state, then close — do not keep watching. If you cannot tell the two apart, emit what is true now and close. |
+
 ### Say so when you go blind
 
 A `Source` that stops seeing its target must emit an `EventDegraded` update
