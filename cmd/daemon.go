@@ -263,6 +263,7 @@ func writeNDJSON(w io.Writer, n monitor.Notification) error {
 	_, err = w.Write([]byte("\n"))
 	return err
 }
+
 // spawnDaemonFn spawns a detached daemon bound to socket. It is a package
 // variable so tests can substitute an in-process server instead of re-exec'ing
 // the real binary.

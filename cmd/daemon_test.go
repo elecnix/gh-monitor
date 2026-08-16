@@ -26,7 +26,7 @@ import (
 func closedPR() *monitor.PullRequest {
 	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
 	return &monitor.PullRequest{
-		State:   "CLOSED",
+		State: "CLOSED",
 		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
 			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
 		}}}},
@@ -41,7 +41,7 @@ func closedPR() *monitor.PullRequest {
 func openPR() *monitor.PullRequest {
 	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
 	return &monitor.PullRequest{
-		State:   "OPEN",
+		State: "OPEN",
 		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
 			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
 		}}}},
@@ -213,6 +213,7 @@ func TestDaemon_FallsBackWhenSocketAbsent(t *testing.T) {
 func init() {
 	_ = os.Unsetenv("GH_MONITOR_SOCK")
 }
+
 // runOptsFor is a closed-PR RunOptions whose stream terminates naturally, so
 // streamFromDaemonAndEmit returns instead of blocking forever.
 func runOptsFor() monitor.RunOptions {

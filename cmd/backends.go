@@ -8,6 +8,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/gh"
@@ -30,8 +31,24 @@ type backendOptions struct {
 }
 
 func addBackendFlags(cmd *cobra.Command, opts *backendOptions) {
-	cmd.Flags().StringVar(&opts.Name, "backend", "", "Pin monitoring to a named backend (default: the most specific one registered for the target)")
-	cmd.Flags().StringVar(&opts.Endpoint, "backend-endpoint", "", "Connect an external backend: unix:<path>, tcp:<host:port>, or exec:<command> (default: $"+backendEndpointEnv+")")
+	bindBackendFlags(cmd.Flags(), opts)
+}
+
+// addPersistentBackendFlags puts the backend flags on a command group so every
+// subcommand under it accepts them.
+func addPersistentBackendFlags(cmd *cobra.Command, opts *backendOptions) {
+	bindBackendFlags(cmd.PersistentFlags(), opts)
+}
+
+func bindBackendFlags(fs *pflag.FlagSet, opts *backendOptions) {
+	fs.StringVar(&opts.Name, "backend", "", "Pin to a named backend (default: the most specific one registered for the target)")
+	fs.StringVar(&opts.Endpoint, "backend-endpoint", "", "Connect an external backend: unix:<path>, tcp:<host:port>, or exec:<command> (default: $"+backendEndpointEnv+")")
+}
+
+// actorRegistry builds a registry for a mutation command. Mutations need no
+// run configuration and no budget guard — they are one-shot calls, not watches.
+func actorRegistry(ctx context.Context, opts *backendOptions) (*backend.Registry, error) {
+	return buildRegistry(ctx, opts, monitor.RunOptions{}, false)
 }
 
 // endpoint returns the configured endpoint, falling back to the environment.

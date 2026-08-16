@@ -8,6 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	reviewsvc "github.com/elecnix/gh-monitor/internal/review"
 )
@@ -29,6 +31,7 @@ func newReviewCommand() *cobra.Command {
 
 	cmd.Flags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
 	cmd.Flags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addBackendFlags(cmd, &opts.Backend)
 
 	cmd.Flags().BoolVar(&opts.Start, "start", false, "Open a pending review")
 	cmd.Flags().BoolVar(&opts.AddComment, "add-comment", false, "Add an inline comment to a pending review")
@@ -76,6 +79,8 @@ type reviewOptions struct {
 	Body      string
 	BodyFile  string
 	Event     string
+
+	Backend backendOptions
 }
 
 func runReview(cmd *cobra.Command, opts *reviewOptions) error {
@@ -109,31 +114,39 @@ func runReview(cmd *cobra.Command, opts *reviewOptions) error {
 		return err
 	}
 
-	service := reviewsvc.NewService(apiClientFactory(identity.Host))
+	target := monitor.TargetOf(identity)
+	reg, err := actorRegistry(cmd.Context(), &opts.Backend)
+	if err != nil {
+		return err
+	}
+	actor, _, err := reg.ReviewFor(target)
+	if err != nil {
+		return err
+	}
 
 	switch {
 	case opts.Start:
-		return executeReviewStart(cmd, service, identity, opts)
+		return executeReviewStart(cmd, actor, target, opts)
 	case opts.AddComment:
-		return executeReviewAddComment(cmd, service, identity, opts)
+		return executeReviewAddComment(cmd, actor, target, opts)
 	case opts.EditComment:
-		return executeReviewEditComment(cmd, service, identity, opts)
+		return executeReviewEditComment(cmd, actor, target, opts)
 	case opts.DeleteComment:
-		return executeReviewDeleteComment(cmd, service, identity, opts)
+		return executeReviewDeleteComment(cmd, actor, target, opts)
 	default: // Submit
-		return executeReviewSubmit(cmd, service, identity, opts)
+		return executeReviewSubmit(cmd, actor, target, opts)
 	}
 }
 
-func executeReviewStart(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
-	state, err := service.Start(pr, strings.TrimSpace(opts.Commit))
+func executeReviewStart(cmd *cobra.Command, actor backend.ReviewActor, pr backend.Target, opts *reviewOptions) error {
+	state, err := actor.StartReview(cmd.Context(), pr, strings.TrimSpace(opts.Commit))
 	if err != nil {
 		return err
 	}
 	return encodeJSON(cmd, state)
 }
 
-func executeReviewAddComment(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
+func executeReviewAddComment(cmd *cobra.Command, actor backend.ReviewActor, pr backend.Target, opts *reviewOptions) error {
 	reviewID := strings.TrimSpace(opts.ReviewID)
 	if reviewID == "" {
 		return errors.New("--review-id is required")
@@ -169,14 +182,14 @@ func executeReviewAddComment(cmd *cobra.Command, service *reviewsvc.Service, pr 
 		Body:      opts.Body,
 	}
 
-	thread, err := service.AddThread(pr, input)
+	thread, err := actor.AddReviewComment(cmd.Context(), pr, input)
 	if err != nil {
 		return err
 	}
 	return encodeJSON(cmd, thread)
 }
 
-func executeReviewEditComment(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
+func executeReviewEditComment(cmd *cobra.Command, actor backend.ReviewActor, pr backend.Target, opts *reviewOptions) error {
 	commentID := strings.TrimSpace(opts.CommentID)
 	if commentID == "" {
 		return errors.New("--comment-id is required")
@@ -194,13 +207,13 @@ func executeReviewEditComment(cmd *cobra.Command, service *reviewsvc.Service, pr
 		CommentID: commentID,
 		Body:      trimmedBody,
 	}
-	if err := service.UpdateComment(pr, input); err != nil {
+	if err := actor.UpdateReviewComment(cmd.Context(), pr, input); err != nil {
 		return err
 	}
 	return encodeJSON(cmd, map[string]string{"status": "Comment updated successfully"})
 }
 
-func executeReviewDeleteComment(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
+func executeReviewDeleteComment(cmd *cobra.Command, actor backend.ReviewActor, pr backend.Target, opts *reviewOptions) error {
 	commentID := strings.TrimSpace(opts.CommentID)
 	if commentID == "" {
 		return errors.New("--comment-id is required")
@@ -212,13 +225,13 @@ func executeReviewDeleteComment(cmd *cobra.Command, service *reviewsvc.Service, 
 	input := reviewsvc.DeleteCommentInput{
 		CommentID: commentID,
 	}
-	if err := service.DeleteComment(pr, input); err != nil {
+	if err := actor.DeleteReviewComment(cmd.Context(), pr, input); err != nil {
 		return err
 	}
 	return encodeJSON(cmd, map[string]string{"status": "Comment deleted successfully"})
 }
 
-func executeReviewSubmit(cmd *cobra.Command, service *reviewsvc.Service, pr resolver.Identity, opts *reviewOptions) error {
+func executeReviewSubmit(cmd *cobra.Command, actor backend.ReviewActor, pr backend.Target, opts *reviewOptions) error {
 	event, err := normalizeEvent(opts.Event)
 	if err != nil {
 		return err
@@ -232,7 +245,7 @@ func executeReviewSubmit(cmd *cobra.Command, service *reviewsvc.Service, pr reso
 		Event:    event,
 		Body:     opts.Body,
 	}
-	status, err := service.Submit(pr, input)
+	status, err := actor.SubmitReview(cmd.Context(), pr, input)
 	if err != nil {
 		return err
 	}

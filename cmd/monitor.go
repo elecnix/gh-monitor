@@ -47,24 +47,24 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 }
 
 type monitorOptions struct {
-	Repo        string
-	Pull        int
-	Ref         string
-	Commit      string
-	Issue       int
-	RunID       int
-	Selector    string
-	Interval    int
-	Timeout     int
-	IgnoredBots string
-	Events      string
-	Annotations string
-	Once        bool
-	Text        bool
-	Instance       string
-	FromBeginning  bool
-	Viewer         string
-	Backend        backendOptions
+	Repo          string
+	Pull          int
+	Ref           string
+	Commit        string
+	Issue         int
+	RunID         int
+	Selector      string
+	Interval      int
+	Timeout       int
+	IgnoredBots   string
+	Events        string
+	Annotations   string
+	Once          bool
+	Text          bool
+	Instance      string
+	FromBeginning bool
+	Viewer        string
+	Backend       backendOptions
 }
 
 func (o *monitorOptions) Validate() error {
@@ -198,7 +198,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			c := cursor.Cursor{
 				Instance: opts.Instance,
 				Owner:    identity.Owner,
-				Repo:    identity.Repo,
+				Repo:     identity.Repo,
 				Position: position,
 				LastSeen: time.Now(),
 			}
@@ -213,7 +213,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			c := cursor.Cursor{
 				Instance: opts.Instance,
 				Owner:    identity.Owner,
-				Repo:    identity.Repo,
+				Repo:     identity.Repo,
 				Snapshot: snapshotJSON,
 				LastSeen: time.Now(),
 			}

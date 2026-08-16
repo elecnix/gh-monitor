@@ -58,6 +58,8 @@ type Request struct {
 	Op      string               `json:"op"`
 	Target  backend.Target       `json:"target"`
 	Options backend.WatchOptions `json:"options,omitempty"`
+	// Payload carries a mutation's arguments, encoded as JSON.
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
 // Frame is one server response line. Exactly one field is meaningful per
@@ -71,6 +73,8 @@ type Frame struct {
 	Error string `json:"error,omitempty"`
 	// Done ends the stream cleanly.
 	Done bool `json:"done,omitempty"`
+	// Result carries a mutation's return value, encoded as JSON.
+	Result json.RawMessage `json:"result,omitempty"`
 }
 
 // writeJSON writes one newline-delimited JSON frame.
@@ -115,7 +119,7 @@ func validateHello(h Hello) error {
 		return fmt.Errorf("backend %q declares no capabilities", h.Name)
 	}
 	for _, c := range h.Capabilities {
-		if c != backend.CapSource && c != backend.CapReader {
+		if !knownCapabilities[c] {
 			return fmt.Errorf("backend %q declares unknown capability %q", h.Name, c)
 		}
 	}
@@ -135,4 +139,17 @@ func (h Hello) has(c backend.Capability) bool {
 		}
 	}
 	return false
+}
+
+// knownCapabilities is what a server may declare. Anything else is rejected:
+// a capability this build does not understand would be registered and then
+// never resolved, which reads as a backend that is present but silent.
+var knownCapabilities = map[backend.Capability]bool{
+	backend.CapSource:    true,
+	backend.CapReader:    true,
+	backend.CapThreads:   true,
+	backend.CapReview:    true,
+	backend.CapComments:  true,
+	backend.CapDraft:     true,
+	backend.CapReactions: true,
 }

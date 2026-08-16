@@ -263,3 +263,149 @@ func TestMonitorRejectsAMalformedBackendEndpoint(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "carrier-pigeon")
 }
+
+// ---------------------------------------------------------------------------
+// Mutations
+// ---------------------------------------------------------------------------
+
+// capturingThreads records the resolve it was asked to perform.
+type capturingThreads struct{ resolved chan string }
+
+func (c *capturingThreads) ListThreads(context.Context, backend.Target, backend.ThreadListOptions) ([]backend.Thread, error) {
+	return []backend.Thread{{ThreadID: "PRRT_from_backend", Path: "x.go"}}, nil
+}
+
+func (c *capturingThreads) ViewThreads(context.Context, backend.Target, []string) ([]backend.ThreadWithComments, error) {
+	return nil, nil
+}
+
+func (c *capturingThreads) ResolveThread(_ context.Context, _ backend.Target, ref backend.ThreadRef) (backend.ThreadResolution, error) {
+	select {
+	case c.resolved <- ref.ThreadID:
+	default:
+	}
+	return backend.ThreadResolution{ThreadNodeID: ref.ThreadID, IsResolved: true}, nil
+}
+
+func (c *capturingThreads) UnresolveThread(context.Context, backend.Target, backend.ThreadRef) (backend.ThreadResolution, error) {
+	return backend.ThreadResolution{}, nil
+}
+
+func TestThreadsResolveGoesToAnExternalBackend(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+
+	actor := &capturingThreads{resolved: make(chan string, 1)}
+	t.Setenv(backendEndpointEnv, serveTestBackend(t, remote.ServerConfig{
+		Name:    "relay",
+		Kinds:   []backend.Kind{backend.KindPR},
+		Threads: actor,
+	}))
+
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	apiClientFactory = func(string) ghcli.API {
+		return &commandFakeAPI{graphqlFunc: func(string, map[string]interface{}, interface{}) error {
+			t.Error("the built-in backend was called even though an external backend serves threads")
+			return nil
+		}}
+	}
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"threads", "resolve", "7", "-R", "o/r", "--thread-id", "PRRT_abc"})
+	require.NoError(t, root.Execute())
+
+	select {
+	case id := <-actor.resolved:
+		assert.Equal(t, "PRRT_abc", id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the external backend was never asked to resolve")
+	}
+	assert.Contains(t, stdout.String(), "PRRT_abc")
+}
+
+func TestThreadsListGoesToAnExternalBackend(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	t.Setenv(backendEndpointEnv, serveTestBackend(t, remote.ServerConfig{
+		Name:    "relay",
+		Kinds:   []backend.Kind{backend.KindPR},
+		Threads: &capturingThreads{},
+	}))
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"threads", "list", "7", "-R", "o/r"})
+	require.NoError(t, root.Execute())
+
+	assert.Contains(t, stdout.String(), "PRRT_from_backend")
+}
+
+func TestDraftStaysWithTheBuiltInBackendWhenNotDeclared(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+
+	// The external backend serves threads only. Draft must still work, via gh.
+	t.Setenv(backendEndpointEnv, serveTestBackend(t, remote.ServerConfig{
+		Name:    "relay",
+		Kinds:   []backend.Kind{backend.KindPR},
+		Threads: &capturingThreads{},
+	}))
+
+	called := false
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	apiClientFactory = func(string) ghcli.API {
+		return &commandFakeAPI{graphqlFunc: func(_ string, _ map[string]interface{}, result interface{}) error {
+			called = true
+			return assignJSON(result, obj{"repository": obj{"pullRequest": obj{
+				"id": "PR_1", "number": 7, "isDraft": true, "title": "wip",
+			}}})
+		}}
+	}
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"draft", "status", "7", "-R", "o/r"})
+	require.NoError(t, root.Execute())
+
+	assert.True(t, called, "draft was not declared by the external backend, so gh must serve it")
+	assert.Contains(t, stdout.String(), "\"is_draft\":true")
+}
+
+func TestBackendsCommandListsMutationCapabilities(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv(backendEndpointEnv, serveTestBackend(t, remote.ServerConfig{
+		Name:    "relay",
+		Kinds:   []backend.Kind{backend.KindPR},
+		Threads: &capturingThreads{},
+	}))
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"backends", "--json"})
+	require.NoError(t, root.Execute())
+
+	var infos []backend.Info
+	require.NoError(t, json.Unmarshal(stdout.Bytes(), &infos))
+	byName := map[string]backend.Info{}
+	for _, i := range infos {
+		byName[i.Name] = i
+	}
+
+	assert.Equal(t, []backend.Capability{backend.CapThreads}, byName["relay"].Capabilities)
+	// The built-in backend provides every capability, so it is always the
+	// fallback for whatever an external backend leaves alone.
+	assert.Contains(t, byName["gh"].Capabilities, backend.CapReview)
+	assert.Contains(t, byName["gh"].Capabilities, backend.CapDraft)
+	assert.Contains(t, byName["gh"].Capabilities, backend.CapReactions)
+}

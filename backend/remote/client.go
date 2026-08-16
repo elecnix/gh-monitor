@@ -53,6 +53,21 @@ func (p *Provider) Register(r *backend.Registry) error {
 	if p.hello.has(backend.CapReader) {
 		r.RegisterReader(p.hello.Name, p.hello.Kinds, backend.ReaderFunc(p.Read))
 	}
+	if p.hello.has(backend.CapThreads) {
+		r.RegisterThreads(p.hello.Name, p.hello.Kinds, p)
+	}
+	if p.hello.has(backend.CapReview) {
+		r.RegisterReview(p.hello.Name, p.hello.Kinds, p)
+	}
+	if p.hello.has(backend.CapComments) {
+		r.RegisterComments(p.hello.Name, p.hello.Kinds, p)
+	}
+	if p.hello.has(backend.CapDraft) {
+		r.RegisterDraft(p.hello.Name, p.hello.Kinds, p)
+	}
+	if p.hello.has(backend.CapReactions) {
+		r.RegisterReactions(p.hello.Name, p.hello.Kinds, p)
+	}
 	return nil
 }
 

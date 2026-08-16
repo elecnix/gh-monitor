@@ -21,34 +21,6 @@ func NewService(api ghcli.API) *Service {
 	return &Service{API: api}
 }
 
-// ListOptions configures list filtering.
-type ListOptions struct {
-	OnlyUnresolved bool
-	MineOnly       bool
-}
-
-// Thread represents a normalized review thread payload for JSON output.
-type Thread struct {
-	ThreadID   string     `json:"thread_id"`
-	IsResolved bool       `json:"is_resolved"`
-	ResolvedBy *string    `json:"resolved_by,omitempty"`
-	UpdatedAt  *time.Time `json:"updated_at,omitempty"`
-	Path       string     `json:"path"`
-	Line       *int       `json:"line,omitempty"`
-	IsOutdated bool       `json:"is_outdated"`
-}
-
-// ActionOptions controls resolve/unresolve operations.
-type ActionOptions struct {
-	ThreadID string
-}
-
-// ActionResult captures the outcome of a resolve/unresolve mutation.
-type ActionResult struct {
-	ThreadNodeID string `json:"thread_node_id"`
-	IsResolved   bool   `json:"is_resolved"`
-}
-
 type pullContext struct {
 	identity resolver.Identity
 	nodeID   string
@@ -417,25 +389,6 @@ mutation UnresolveThread($threadId: ID!) {
   }
 }
 `
-
-// ThreadComment represents a single comment in a review thread.
-type ThreadComment struct {
-	ID        string    `json:"id"`
-	Body      string    `json:"body"`
-	Author    string    `json:"author"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-}
-
-// ThreadWithComments represents a review thread with all comments.
-type ThreadWithComments struct {
-	ThreadID   string          `json:"thread_id"`
-	IsResolved bool            `json:"is_resolved"`
-	Path       string          `json:"path"`
-	Line       *int            `json:"line,omitempty"`
-	IsOutdated bool            `json:"is_outdated"`
-	Comments   []ThreadComment `json:"comments"`
-}
 
 // GetThreadsByID fetches one or more threads (with all comments) by thread ID.
 func (s *Service) GetThreadsByID(threadIDs []string) ([]ThreadWithComments, error) {

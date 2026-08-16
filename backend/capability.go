@@ -53,3 +53,10 @@ type ReaderFunc func(ctx context.Context, t Target) (Status, error)
 
 // Read implements Reader.
 func (f ReaderFunc) Read(ctx context.Context, t Target) (Status, error) { return f(ctx, t) }
+
+// allCapabilities is every capability in canonical order. Listings and
+// diagnostics iterate it so their output is stable.
+var allCapabilities = []Capability{
+	CapSource, CapReader,
+	CapThreads, CapReview, CapComments, CapDraft, CapReactions,
+}

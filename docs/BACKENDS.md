@@ -4,20 +4,28 @@
 GitHub API. You can supply your own — as a Go library or as a separate process —
 and it will take over as much or as little of the job as it implements.
 
-## The two capabilities
+## The capabilities
 
-A backend provides one or both of these. They are independent, and a backend
+A backend provides any subset of these. They are independent, and a backend
 registers only what it actually has.
 
-| Capability | Interface        | What it does                                           | Used by                  |
-| ---------- | ---------------- | ------------------------------------------------------ | ------------------------ |
-| `source`   | `backend.Source` | Delivers `Update`s describing what changed on a target | continuous watching      |
-| `reader`   | `backend.Reader` | Returns a target's current `Status`                    | `--once`, and any poller |
+| Capability  | Interface               | What it does                                           | Used by               |
+| ----------- | ----------------------- | ------------------------------------------------------ | --------------------- |
+| `source`    | `backend.Source`        | Delivers `Update`s describing what changed on a target | continuous watching   |
+| `reader`    | `backend.Reader`        | Returns a target's current `Status`                    | `--once`              |
+| `threads`   | `backend.ThreadActor`   | Lists, views, resolves review threads                  | `gh monitor threads`  |
+| `review`    | `backend.ReviewActor`   | Drives a pending review                                | `gh monitor review`   |
+| `comments`  | `backend.CommentActor`  | Replies to review threads                              | `gh monitor comments` |
+| `draft`     | `backend.DraftActor`    | Reads and changes draft status                         | `gh monitor draft`    |
+| `reactions` | `backend.ReactionActor` | Adds a reaction to a node                              | `gh monitor react`    |
 
-The split matters because the two jobs have different answers. A backend that
+The split matters because the jobs have different answers. A backend that
 learns about changes as they happen has a much better `Source` than polling can
-be, and no reason to reimplement reads — so it registers a `Source`, omits the
-`Reader`, and `--once` keeps using the built-in backend.
+be, and no reason to reimplement anything else — so it registers a `Source`,
+omits the rest, and every other verb keeps using the built-in backend.
+
+Nothing forces a backend to take a capability it does not want. Registering
+`threads` alone is a complete, valid backend.
 
 ## Target kinds
 
@@ -43,9 +51,9 @@ gh monitor backends --json
 ```
 
 ```
-BACKEND  CAPABILITIES   KINDS
-gh       source,reader  all
-relay    source         pr,run
+BACKEND  CAPABILITIES                                        KINDS
+gh       source,reader,threads,review,comments,draft,reactions  all
+relay    source,threads                                      pr,run
 ```
 
 ## Writing a backend as a Go library
@@ -91,6 +99,10 @@ Register it and build your own binary:
 reg := backend.NewRegistry()
 reg.RegisterSource("mine", []backend.Kind{backend.KindPR}, &mySource{})
 ```
+
+Each capability has its own `Register` method — `RegisterSource`,
+`RegisterReader`, `RegisterThreads`, `RegisterReview`, `RegisterComments`,
+`RegisterDraft`, `RegisterReactions`. Call the ones you implement.
 
 ### What an Update carries
 
@@ -186,8 +198,31 @@ claim every kind — a strong claim, since everything will then be routed to you
 | ------------------ | ----------------------------------------------------------- |
 | `{"update":{...}}` | One change.                                                 |
 | `{"status":{...}}` | The answer to `{"op":"read"}`.                              |
+| `{"result":{...}}` | The answer to a mutation op.                                |
 | `{"done":true}`    | End of stream. The watch finished.                          |
 | `{"error":"..."}`  | End of stream with a failure; reported as a degraded event. |
+
+### Mutation ops
+
+Mutations use the same request/response shape: one request in, one frame out.
+The arguments go in `payload`, the return value comes back in `result`.
+
+```
+client → {"op":"threads.resolve","target":{...},"payload":{"ThreadID":"PRRT_1"}}
+server → {"result":{"thread_node_id":"PRRT_1","is_resolved":true}}
+```
+
+| Capability  | Ops                                                                                                  |
+| ----------- | ---------------------------------------------------------------------------------------------------- |
+| `threads`   | `threads.list`, `threads.view`, `threads.resolve`, `threads.unresolve`                               |
+| `review`    | `review.start`, `review.addComment`, `review.updateComment`, `review.deleteComment`, `review.submit` |
+| `comments`  | `comments.reply`                                                                                     |
+| `draft`     | `draft.status`, `draft.set`, `draft.list`                                                            |
+| `reactions` | `reactions.react`                                                                                    |
+
+An op for a capability the server did not declare comes back as an `error`
+frame rather than a zero value, so a caller never mistakes "not implemented"
+for "nothing to do".
 
 A stream that ends without `done` or `error` is treated as a failure and
 surfaced as a degraded event — the client will not read a dropped connection as
@@ -217,7 +252,8 @@ func main() {
 		Name:   "relay",
 		Kinds:  []backend.Kind{backend.KindPR, backend.KindRun},
 		Source: &mySource{},
-		// Reader omitted: reads stay with the built-in backend.
+		// Every other field is optional. What you leave nil stays with the
+		// built-in backend, and is not announced in the hello.
 	}
 	for {
 		conn, err := ln.Accept()
@@ -252,8 +288,9 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 
 ## What the built-in backend still owns
 
-The `gh` backend keeps the parts that are specific to polling the GitHub API,
-and no other backend has to think about them:
+The `gh` backend provides every capability for every kind, so it is the
+fallback under anything partial. It also keeps the parts that are specific to
+polling the GitHub API, which no other backend has to think about:
 
 - adaptive idle backoff and jitter, so quiet targets cost less and concurrent
   watchers do not poll in phase

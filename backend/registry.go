@@ -24,7 +24,19 @@ var ErrNoBackend = errors.New("no backend registered")
 type Registry struct {
 	sources []registration[Source]
 	readers []registration[Reader]
-	pinned  string
+	// actors holds the mutation capabilities. They share one slice keyed by
+	// capability rather than one slice each: they resolve identically, and a
+	// field per capability would grow with every verb the CLI gains.
+	actors []actorRegistration
+	pinned string
+}
+
+// actorRegistration is one mutation capability registered by one backend. The
+// implementation is stored untyped and asserted on the way out; the typed
+// Register* methods are what keep registration honest.
+type actorRegistration struct {
+	registration[any]
+	capability Capability
 }
 
 type registration[T any] struct {
@@ -54,6 +66,89 @@ func (r *Registry) RegisterSource(name string, kinds []Kind, s Source) {
 // registers the reader for every kind.
 func (r *Registry) RegisterReader(name string, kinds []Kind, rd Reader) {
 	r.readers = append(r.readers, registration[Reader]{name: name, kinds: kindSet(kinds), impl: rd})
+}
+
+// RegisterThreads adds the review-thread capability.
+func (r *Registry) RegisterThreads(name string, kinds []Kind, a ThreadActor) {
+	r.registerActor(name, CapThreads, kinds, a)
+}
+
+// RegisterReview adds the pending-review capability.
+func (r *Registry) RegisterReview(name string, kinds []Kind, a ReviewActor) {
+	r.registerActor(name, CapReview, kinds, a)
+}
+
+// RegisterComments adds the thread-reply capability.
+func (r *Registry) RegisterComments(name string, kinds []Kind, a CommentActor) {
+	r.registerActor(name, CapComments, kinds, a)
+}
+
+// RegisterDraft adds the draft-status capability.
+func (r *Registry) RegisterDraft(name string, kinds []Kind, a DraftActor) {
+	r.registerActor(name, CapDraft, kinds, a)
+}
+
+// RegisterReactions adds the reaction capability.
+func (r *Registry) RegisterReactions(name string, kinds []Kind, a ReactionActor) {
+	r.registerActor(name, CapReactions, kinds, a)
+}
+
+func (r *Registry) registerActor(name string, capability Capability, kinds []Kind, impl any) {
+	r.actors = append(r.actors, actorRegistration{
+		registration: registration[any]{name: name, kinds: kindSet(kinds), impl: impl},
+		capability:   capability,
+	})
+}
+
+// ThreadsFor returns the review-thread capability covering t.
+func (r *Registry) ThreadsFor(t Target) (ThreadActor, string, error) {
+	return resolveActor[ThreadActor](r, t.Kind, CapThreads)
+}
+
+// ReviewFor returns the pending-review capability covering t.
+func (r *Registry) ReviewFor(t Target) (ReviewActor, string, error) {
+	return resolveActor[ReviewActor](r, t.Kind, CapReview)
+}
+
+// CommentsFor returns the thread-reply capability covering t.
+func (r *Registry) CommentsFor(t Target) (CommentActor, string, error) {
+	return resolveActor[CommentActor](r, t.Kind, CapComments)
+}
+
+// DraftFor returns the draft-status capability covering t.
+func (r *Registry) DraftFor(t Target) (DraftActor, string, error) {
+	return resolveActor[DraftActor](r, t.Kind, CapDraft)
+}
+
+// ReactionsFor returns the reaction capability covering t.
+func (r *Registry) ReactionsFor(t Target) (ReactionActor, string, error) {
+	return resolveActor[ReactionActor](r, t.Kind, CapReactions)
+}
+
+// resolveActor applies the same precedence as resolve, over the subset of
+// actor registrations matching the wanted capability.
+func resolveActor[T any](r *Registry, kind Kind, want Capability) (T, string, error) {
+	matching := make([]registration[any], 0, len(r.actors))
+	for _, a := range r.actors {
+		if a.capability == want {
+			matching = append(matching, a.registration)
+		}
+	}
+	impl, name, err := resolve(matching, kind, r.pinned, want)
+	if err != nil {
+		var zero T
+		return zero, "", err
+	}
+	typed, ok := impl.(T)
+	if !ok {
+		var zero T
+		if impl == nil {
+			return zero, "", fmt.Errorf("%w: backend %q registered a nil %s", ErrNoBackend, name, want)
+		}
+		return zero, "", fmt.Errorf("%w: backend %q registered a %s of the wrong type (%T)",
+			ErrNoBackend, name, want, impl)
+	}
+	return typed, name, nil
 }
 
 // Use registers a provider's capabilities.
@@ -167,11 +262,16 @@ func (r *Registry) List() []Info {
 		a.caps[CapReader] = true
 		a.merge(rd.kinds)
 	}
+	for _, ac := range r.actors {
+		a := get(ac.name)
+		a.caps[ac.capability] = true
+		a.merge(ac.kinds)
+	}
 
 	out := make([]Info, 0, len(byName))
 	for name, a := range byName {
 		info := Info{Name: name}
-		for _, c := range []Capability{CapSource, CapReader} {
+		for _, c := range allCapabilities {
 			if a.caps[c] {
 				info.Capabilities = append(info.Capabilities, c)
 			}
@@ -200,6 +300,11 @@ func (r *Registry) known(name string) bool {
 			return true
 		}
 	}
+	for _, a := range r.actors {
+		if a.name == name {
+			return true
+		}
+	}
 	return false
 }
 
@@ -216,6 +321,12 @@ func (r *Registry) namesForError() string {
 		if !seen[rd.name] {
 			seen[rd.name] = true
 			names = append(names, rd.name)
+		}
+	}
+	for _, a := range r.actors {
+		if !seen[a.name] {
+			seen[a.name] = true
+			names = append(names, a.name)
 		}
 	}
 	sort.Strings(names)

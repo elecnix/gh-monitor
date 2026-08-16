@@ -37,21 +37,30 @@ type Provider struct {
 // Name identifies the backend.
 func (p *Provider) Name() string { return Name }
 
-// Register adds the polling Source and the reading Reader for every kind.
+// Register adds every capability this backend provides, for every kind.
 func (p *Provider) Register(r *backend.Registry) error {
 	r.RegisterSource(Name, nil, backend.SourceFunc(p.watch))
 	r.RegisterReader(Name, nil, backend.ReaderFunc(p.read))
+	r.RegisterThreads(Name, nil, threadActor{p})
+	r.RegisterReview(Name, nil, reviewActor{p})
+	r.RegisterComments(Name, nil, commentActor{p})
+	r.RegisterDraft(Name, nil, draftActor{p})
+	r.RegisterReactions(Name, nil, reactionActor{p})
 	return nil
+}
+
+// api returns the API client for a host, defaulting to the gh CLI client.
+func (p *Provider) api(host string) ghcli.API {
+	if p.API == nil {
+		return &ghcli.Client{Host: host}
+	}
+	return p.API(host)
 }
 
 // service builds a monitor.Service for the target's host, wired with the
 // failed-run log fetcher so a failed run's notification carries its log.
 func (p *Provider) service(host string) *monitor.Service {
-	factory := p.API
-	if factory == nil {
-		factory = func(h string) ghcli.API { return &ghcli.Client{Host: h} }
-	}
-	svc := &monitor.Service{API: factory(host)}
+	svc := &monitor.Service{API: p.api(host)}
 	if c, ok := svc.API.(*ghcli.Client); ok {
 		svc.FailedRunLogsFn = c.FailedRunLogs
 	}

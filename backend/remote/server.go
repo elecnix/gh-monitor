@@ -23,6 +23,13 @@ type ServerConfig struct {
 	Source backend.Source
 	// Reader serves read requests. Optional.
 	Reader backend.Reader
+	// The mutation capabilities. Each is optional and independent: leave one
+	// nil and gh-monitor keeps that verb with its built-in backend.
+	Threads   backend.ThreadActor
+	Review    backend.ReviewActor
+	Comments  backend.CommentActor
+	Draft     backend.DraftActor
+	Reactions backend.ReactionActor
 }
 
 func (c ServerConfig) capabilities() []backend.Capability {
@@ -32,6 +39,21 @@ func (c ServerConfig) capabilities() []backend.Capability {
 	}
 	if c.Reader != nil {
 		caps = append(caps, backend.CapReader)
+	}
+	if c.Threads != nil {
+		caps = append(caps, backend.CapThreads)
+	}
+	if c.Review != nil {
+		caps = append(caps, backend.CapReview)
+	}
+	if c.Comments != nil {
+		caps = append(caps, backend.CapComments)
+	}
+	if c.Draft != nil {
+		caps = append(caps, backend.CapDraft)
+	}
+	if c.Reactions != nil {
+		caps = append(caps, backend.CapReactions)
 	}
 	return caps
 }
@@ -45,7 +67,7 @@ func (c ServerConfig) capabilities() []backend.Capability {
 func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 	caps := cfg.capabilities()
 	if len(caps) == 0 {
-		return fmt.Errorf("serve %q: no Source and no Reader configured", cfg.Name)
+		return fmt.Errorf("serve %q: no capabilities configured", cfg.Name)
 	}
 	if cfg.Name == "" {
 		return fmt.Errorf("serve: the backend must name itself")
@@ -71,9 +93,11 @@ func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 		return serveWatch(ctx, conn, cfg, req)
 	case OpRead:
 		return serveRead(ctx, conn, cfg, req)
-	default:
-		return writeJSON(conn, Frame{Error: fmt.Sprintf("unsupported op %q", req.Op)})
 	}
+	if handled, err := serveMutation(ctx, conn, cfg, req); handled {
+		return err
+	}
+	return writeJSON(conn, Frame{Error: fmt.Sprintf("unsupported op %q", req.Op)})
 }
 
 func serveWatch(ctx context.Context, conn io.Writer, cfg ServerConfig, req Request) error {
