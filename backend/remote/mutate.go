@@ -68,8 +68,7 @@ func call[Out any](ctx context.Context, p *Provider, op string, t backend.Target
 	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 
-	var hello Hello
-	if err := readJSON(br, &hello); err != nil {
+	if _, err := readHello(ctx, conn, br); err != nil {
 		return out, fmt.Errorf("read hello from %s: %w", p.transport, err)
 	}
 

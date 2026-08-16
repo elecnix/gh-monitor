@@ -530,8 +530,14 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 	}
 	provider, err := remote.Connect(ctx, transport)
 	if err != nil {
+		// The likeliest cause is a daemon left running from a build before
+		// this protocol: it holds the socket and waits for the client to speak
+		// first, so the handshake times out. Say what to do about it — the
+		// alternative is every invocation quietly paying that timeout.
 		_, _ = fmt.Fprintf(os.Stderr,
-			"gh-monitor: could not attach to the shared poller (%v); polling in-process\n", err)
+			"gh-monitor: the process holding %s does not speak this backend protocol (%v).\n"+
+				"gh-monitor: polling in-process. If it is a daemon from an older build, stop it:\n"+
+				"gh-monitor:   pkill -f 'gh monitor daemon'\n", socket, err)
 		return
 	}
 	if err := reg.Use(provider); err != nil {

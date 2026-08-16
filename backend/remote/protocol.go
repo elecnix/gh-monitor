@@ -23,9 +23,11 @@ package remote
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
 )
@@ -33,6 +35,42 @@ import (
 // Protocol is the version this package speaks. A server announcing a
 // different major version is refused rather than guessed at.
 const Protocol = 1
+
+// HandshakeTimeout bounds the wait for a server's opening frame.
+//
+// It exists because a peer that never says hello would otherwise block
+// forever, and there is one such peer in the wild: a gh-monitor daemon from a
+// build before this protocol, which holds the socket and waits for the client
+// to speak first. Without a bound, meeting one hangs the client with no output
+// and no error — the worst thing a monitor can do.
+const HandshakeTimeout = 2 * time.Second
+
+// readHello reads the server's opening frame, giving up after
+// HandshakeTimeout. On timeout it closes the connection, both to release the
+// peer and to unblock the goroutine still parked in the read.
+func readHello(ctx context.Context, conn io.Closer, br *bufio.Reader) (Hello, error) {
+	type result struct {
+		hello Hello
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		var h Hello
+		err := readJSON(br, &h)
+		ch <- result{h, err}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.hello, r.err
+	case <-time.After(HandshakeTimeout):
+		_ = conn.Close()
+		return Hello{}, fmt.Errorf("no protocol hello within %s (is this a gh-monitor backend?)", HandshakeTimeout)
+	case <-ctx.Done():
+		_ = conn.Close()
+		return Hello{}, ctx.Err()
+	}
+}
 
 // Operations a client can request.
 const (

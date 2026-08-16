@@ -29,8 +29,8 @@ func Connect(ctx context.Context, tr Transport) (*Provider, error) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	var hello Hello
-	if err := readJSON(bufio.NewReader(conn), &hello); err != nil {
+	hello, err := readHello(ctx, conn, bufio.NewReader(conn))
+	if err != nil {
 		return nil, fmt.Errorf("read hello from %s: %w", tr, err)
 	}
 	if err := validateHello(hello); err != nil {
@@ -85,8 +85,8 @@ func (p *Provider) Watch(ctx context.Context, t backend.Target, opts backend.Wat
 	}
 	br := bufio.NewReader(conn)
 
-	var hello Hello
-	if err := readJSON(br, &hello); err != nil {
+	hello, err := readHello(ctx, conn, br)
+	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read hello from %s: %w", p.transport, err)
 	}
@@ -176,8 +176,7 @@ func (p *Provider) Read(ctx context.Context, t backend.Target) (backend.Status, 
 	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 
-	var hello Hello
-	if err := readJSON(br, &hello); err != nil {
+	if _, err := readHello(ctx, conn, br); err != nil {
 		return nil, fmt.Errorf("read hello from %s: %w", p.transport, err)
 	}
 	if err := writeJSON(conn, Request{Op: OpRead, Target: t}); err != nil {

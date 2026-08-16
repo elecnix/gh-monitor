@@ -420,3 +420,55 @@ func TestUnixTransportEndToEnd(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 }
+
+func TestConnectGivesUpOnAPeerThatNeverSaysHello(t *testing.T) {
+	// A gh-monitor daemon from a build before this protocol holds the socket
+	// and waits for the client to speak first. Without a bounded handshake the
+	// client blocks there forever, producing no output and no error — so this
+	// is the regression that matters most on an upgrade.
+	accepted := make(chan struct{}, 1)
+	tr := TransportFunc("silent", func(ctx context.Context) (io.ReadWriteCloser, error) {
+		clientConn, serverConn := net.Pipe()
+		go func() {
+			accepted <- struct{}{}
+			// Never write anything: wait to be spoken to, like an old daemon.
+			var req Request
+			_ = readJSON(serverConn, &req)
+			_ = serverConn.Close()
+		}()
+		return clientConn, nil
+	})
+
+	start := time.Now()
+	_, err := Connect(context.Background(), tr)
+	elapsed := time.Since(start)
+
+	<-accepted
+	if err == nil {
+		t.Fatal("Connect must fail against a peer that never says hello")
+	}
+	if elapsed > HandshakeTimeout*3 {
+		t.Fatalf("Connect took %s; the handshake must be bounded by %s", elapsed, HandshakeTimeout)
+	}
+}
+
+func TestConnectHonoursContextCancellationDuringHandshake(t *testing.T) {
+	tr := TransportFunc("silent", func(ctx context.Context) (io.ReadWriteCloser, error) {
+		clientConn, _ := net.Pipe() // nothing ever reads or writes the far end
+		return clientConn, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	if _, err := Connect(ctx, tr); err == nil {
+		t.Fatal("Connect must fail when the caller cancels")
+	}
+	if elapsed := time.Since(start); elapsed >= HandshakeTimeout {
+		t.Fatalf("cancellation took %s; it must not wait out the handshake timeout", elapsed)
+	}
+}

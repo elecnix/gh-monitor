@@ -180,6 +180,12 @@ opens its own connection.
 A malformed endpoint fails at startup rather than falling back, so you are never
 left believing an external backend is watching when it is not.
 
+The handshake is bounded: a peer that does not send its hello within two
+seconds is abandoned. Without that bound, pointing `gh monitor` at something
+that is not a backend — including a `gh monitor daemon` from a build before
+this protocol, which waits for the client to speak first — would block forever
+with no output and no error.
+
 ### The protocol
 
 On connect the server announces itself, the client sends one request, and the
