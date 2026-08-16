@@ -74,6 +74,12 @@ type WatchOptions struct {
 	// Timeout stops the watch after this duration. Zero means run until the
 	// target is terminal or the context is cancelled.
 	Timeout time.Duration `json:"timeout,omitempty"`
+
+	// Once asks for the target's current actionable state rather than an
+	// ongoing watch: deliver what is true now, then close the channel. A
+	// Source that cannot distinguish the two should emit its current state
+	// and close, which is the useful approximation.
+	Once bool `json:"once,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

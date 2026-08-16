@@ -201,7 +201,7 @@ type providerFunc struct {
 	fn   func(*Registry) error
 }
 
-func (p providerFunc) Name() string              { return p.name }
+func (p providerFunc) Name() string               { return p.name }
 func (p providerFunc) Register(r *Registry) error { return p.fn(r) }
 
 func TestRegistryListReportsCapabilitiesPerBackend(t *testing.T) {

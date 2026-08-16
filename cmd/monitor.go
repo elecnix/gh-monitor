@@ -15,8 +15,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/elecnix/gh-monitor/internal/ghcli"
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/internal/cursor"
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/prefs"
@@ -41,6 +43,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.Instance, "instance", "", "Named instance identifier for resumable cursor (issue #32)")
 	cmd.Flags().BoolVar(&opts.FromBeginning, "from-beginning", false, "Replay the full backlog, ignoring any cursor (new named instances start at 'now' by default)")
 	cmd.Flags().StringVar(&opts.Viewer, "viewer", "", "GitHub login to classify readiness by (default: authenticated user)")
+	addBackendFlags(cmd, &opts.Backend)
 }
 
 type monitorOptions struct {
@@ -61,6 +64,7 @@ type monitorOptions struct {
 	Instance       string
 	FromBeginning  bool
 	Viewer         string
+	Backend        backendOptions
 }
 
 func (o *monitorOptions) Validate() error {
@@ -146,13 +150,6 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 	}
 
-	svc := &monitor.Service{API: apiClientFactory(identity.Host)}
-	// Wire the failed-run log fetcher (issue #19) so run-completed
-	// notifications for failed runs embed a `gh run view --log-failed` snippet.
-	if c, ok := svc.API.(*ghcli.Client); ok {
-		svc.FailedRunLogsFn = c.FailedRunLogs
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -174,10 +171,6 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		Timeout:       time.Duration(opts.Timeout) * time.Second,
 		Instance:      opts.Instance,
 		FromBeginning: opts.FromBeginning,
-		// Budget awareness: read the advisory GraphQL budget over REST and
-		// stretch the cadence as it runs low, so a continuous watcher slows
-		// instead of contributing to wholesale exhaustion.
-		Budget: monitor.NewBudgetGuard(svc, time.Duration(opts.Interval)*time.Second),
 	}
 
 	// Wire cursor I/O for named instances (issue #32). Repo targets use the
@@ -255,7 +248,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		runOpts.AnnotationLevels = levels
 	}
 
-	emit := func(n monitor.Notification) {
+	write := func(n monitor.Notification) {
 		if opts.Text {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintln(out, monitor.LinkifyText(n))
@@ -271,11 +264,34 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 	}
 
+	// --events applies here, at the one boundary every notification crosses,
+	// whatever produced it — the in-process loop, the shared daemon, or an
+	// external backend.
+	emit := func(n monitor.Notification) {
+		if runOpts.EventFilter.Allows(n.Type) {
+			write(n)
+		}
+	}
+
+	// Resolve which backend serves this target. The built-in one covers every
+	// kind, so this only picks something else when an external backend was
+	// configured and declared this kind.
+	target := monitor.TargetOf(identity)
+	reg, err := buildRegistry(ctx, &opts.Backend, runOpts, true)
+	if err != nil {
+		return err
+	}
+	source, sourceName, err := reg.SourceFor(target)
+	if err != nil {
+		return err
+	}
+
 	// If a shared-poller daemon is running, stream from it so multiple
 	// processes watching the same PR share one fetch (issue #34). --once and
 	// non-PR targets always use the in-process loop; the daemon path is for
-	// continuous PR monitoring only.
-	if socket := daemonSocketPath(); !opts.Once && identity.Target == "pr" && socket != "" {
+	// continuous PR monitoring only, and only when the built-in backend is
+	// what would otherwise do the polling.
+	if socket := daemonSocketPath(); !opts.Once && identity.Target == "pr" && socket != "" && sourceName == gh.Name {
 		err := streamFromDaemonAndEmit(ctx, socket, runOpts, emit)
 		if err == nil {
 			return nil
@@ -283,17 +299,28 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		if !ipc.IsAbsent(err) {
 			return err
 		}
-		// Socket missing: no daemon running — fall through to in-process polling.
+		// Socket missing: no daemon running — fall through to the backend.
 	}
 
-	if opts.Once {
-		return monitor.Once(ctx, svc, runOpts, emit)
+	updates, err := source.Watch(ctx, target, backend.WatchOptions{
+		Interval: runOpts.Interval,
+		Timeout:  runOpts.Timeout,
+		Once:     opts.Once,
+		Since:    runOpts.CursorPosition,
+	})
+	if err != nil {
+		return fmt.Errorf("backend %q: %w", sourceName, err)
 	}
-
-	if err := monitor.Run(ctx, svc, runOpts, emit); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil // clean shutdown on signal
+	// A backend with at-least-once delivery repeats itself; a repeat that
+	// reaches the operator is a second notification about one thing.
+	dedup := backend.NewDeduper(0)
+	for u := range updates {
+		if !dedup.Allow(u) {
+			continue
 		}
+		emit(monitor.Render(u, runOpts.Prefs, runOpts.Interval))
+	}
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil
