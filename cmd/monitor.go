@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -16,7 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/backend"
-	"github.com/elecnix/gh-monitor/backend/gh"
+	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/cursor"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/ipc"
@@ -274,39 +272,32 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 
 	// Resolve which backend serves this target. The built-in one covers every
-	// kind, so this only picks something else when an external backend was
-	// configured and declared this kind.
+	// kind; the shared-poller daemon and any configured external backend layer
+	// over it for the kinds they declare.
 	target := monitor.TargetOf(identity)
 	reg, err := buildRegistry(ctx, &opts.Backend, runOpts, true)
 	if err != nil {
 		return err
+	}
+	// The daemon exists so several processes watching one pull request share a
+	// single fetch (issue #34). It only makes sense for a continuous watch, so
+	// a one-shot read goes straight to the backend that can answer it.
+	if !opts.Once {
+		attachDaemon(ctx, reg, target, runOpts.Interval)
 	}
 	source, sourceName, err := reg.SourceFor(target)
 	if err != nil {
 		return err
 	}
 
-	// If a shared-poller daemon is running, stream from it so multiple
-	// processes watching the same PR share one fetch (issue #34). --once and
-	// non-PR targets always use the in-process loop; the daemon path is for
-	// continuous PR monitoring only, and only when the built-in backend is
-	// what would otherwise do the polling.
-	if socket := daemonSocketPath(); !opts.Once && identity.Target == "pr" && socket != "" && sourceName == gh.Name {
-		err := streamFromDaemonAndEmit(ctx, socket, runOpts, emit)
-		if err == nil {
-			return nil
-		}
-		if !ipc.IsAbsent(err) {
-			return err
-		}
-		// Socket missing: no daemon running — fall through to the backend.
-	}
-
 	updates, err := source.Watch(ctx, target, backend.WatchOptions{
-		Interval: runOpts.Interval,
-		Timeout:  runOpts.Timeout,
-		Once:     opts.Once,
-		Since:    runOpts.CursorPosition,
+		Interval:         runOpts.Interval,
+		Timeout:          runOpts.Timeout,
+		Once:             opts.Once,
+		Since:            runOpts.CursorPosition,
+		IgnoredAuthors:   runOpts.Prefs.IgnoredBots,
+		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
+		AnnotationLevels: runOpts.AnnotationLevels.Names(),
 	})
 	if err != nil {
 		return fmt.Errorf("backend %q: %w", sourceName, err)
@@ -498,54 +489,52 @@ func splitRepo(repoArg string) (owner, repo string) {
 	return repoArg, ""
 }
 
-// streamFromDaemonAndEmit connects to a running daemon, sends a subscribe
-// request for runOpts, and pipes the streamed notifications through emit
-// (honouring --text) until the daemon closes the stream or ctx is cancelled.
-// When no daemon is listening and autostart is enabled (the default), it
-// spawns one detached and waits for it to come up first.
-func streamFromDaemonAndEmit(ctx context.Context, socket string, runOpts monitor.RunOptions, emit func(monitor.Notification)) error {
-	req := ipc.Subscribe{
-		Target:   "pr",
-		Identity: runOpts.Identity,
-		Prefs:    runOpts.Prefs,
-		Interval: int(runOpts.Interval.Seconds()),
-		Timeout:  int(runOpts.Timeout.Seconds()),
+// attachDaemon registers the shared-poller daemon as a backend for pull
+// requests, starting one if none is listening and autostart is enabled.
+//
+// It is best-effort by design: the daemon is an optimisation — several
+// processes watching one pull request share a single fetch — and its absence
+// must never stop a watch. Every failure path simply leaves the registry as it
+// was, so the built-in backend polls in-process instead.
+//
+// Registering it as a backend rather than special-casing it is what lets an
+// explicitly configured external backend still win: it registers after this
+// one, and the later registration takes precedence for the kinds it claims.
+func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Target, interval time.Duration) {
+	if target.Kind != backend.KindPR {
+		return // the shared poller only serves pull requests
+	}
+	socket := daemonSocketPath()
+	if socket == "" {
+		return // opted out via GH_MONITOR_DAEMON=0
 	}
 
-	// Auto-start: if no daemon is listening, spawn one detached and wait for
-	// it to accept. Best-effort — on failure fall back to in-process polling.
-	if daemonAutostart() {
-		if c, err := ipc.Dial(socket); err == nil {
-			_ = c.Close() // daemon already up; don't spawn a second one
-		} else if spawnErr := autostartDaemon(ctx, socket, runOpts.Interval); spawnErr != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: could not autostart daemon (%v); using in-process polling\n", spawnErr)
-			return os.ErrNotExist // so runMonitor falls back to in-process polling
+	if probe, err := ipc.Dial(socket); err == nil {
+		// Only a liveness check — leaving it open would strand a server
+		// goroutine on a request that never comes.
+		_ = probe.Close()
+	} else {
+		if !daemonAutostart() {
+			return
+		}
+		if err := autostartDaemon(ctx, socket, interval); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"gh-monitor: could not start the shared poller (%v); polling in-process\n", err)
+			return
 		}
 	}
 
-	pr, pw := io.Pipe()
-	go func() {
-		err := streamFromDaemon(ctx, socket, req, pw)
-		_ = pw.CloseWithError(err)
-	}()
-	r := bufio.NewReader(pr)
-	dec := newNDJSONDecoder(r)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n, err := dec.Decode()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			// A pipe write error from a closed daemon surfaces here; treat a
-			// closed pipe as a clean end of stream.
-			if errors.Is(err, io.ErrClosedPipe) {
-				return nil
-			}
-			return err
-		}
-		emit(n)
+	transport, err := remote.ParseEndpoint("unix:" + socket)
+	if err != nil {
+		return
+	}
+	provider, err := remote.Connect(ctx, transport)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr,
+			"gh-monitor: could not attach to the shared poller (%v); polling in-process\n", err)
+		return
+	}
+	if err := reg.Use(provider); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: %v; polling in-process\n", err)
 	}
 }

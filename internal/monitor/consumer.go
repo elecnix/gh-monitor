@@ -36,12 +36,6 @@ func (c *PRConsumer) RestoreBaseline(snapshot *PRStatus) {
 	c.prev = snapshot
 }
 
-// ConsumeNotifications is Consume with this package's renderer applied, for
-// callers that want the finished Notification rather than the Update.
-func (c *PRConsumer) ConsumeNotifications(curr *PRStatus, emit func(Notification)) (terminal bool) {
-	return c.Consume(curr, c.opts.renderTo(emit))
-}
-
 // Consume diffs curr against the consumer's baseline and invokes emit for
 // every genuinely-new change, mirroring runPR's per-poll behaviour. It returns
 // terminal=true when the PR is merged or closed (the caller should stop

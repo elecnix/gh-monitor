@@ -8,6 +8,7 @@ package gh
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
@@ -77,6 +78,22 @@ func (p *Provider) runOptions(t backend.Target, opts backend.WatchOptions) monit
 	}
 	if opts.Timeout > 0 {
 		ro.Timeout = opts.Timeout
+	}
+	// The per-watch filters are what a caller on the far side of a backend
+	// boundary can say about what it wants to hear; they override whatever
+	// this process was configured with.
+	if len(opts.IgnoredAuthors) > 0 {
+		ro.Prefs.IgnoredBots = opts.IgnoredAuthors
+	}
+	if len(opts.AnnotationLevels) > 0 {
+		// Parsed rather than constructed directly, so "none" keeps meaning
+		// "report no annotations" instead of "report level none".
+		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
+			ro.AnnotationLevels = levels
+		}
+	}
+	if opts.RepeatUnresolved {
+		ro.Prefs.RetriggerComments = true
 	}
 	return ro
 }

@@ -80,6 +80,17 @@ type WatchOptions struct {
 	// Source that cannot distinguish the two should emit its current state
 	// and close, which is the useful approximation.
 	Once bool `json:"once,omitempty"`
+
+	// IgnoredAuthors drops activity by these logins before it is reported.
+	IgnoredAuthors []string `json:"ignored_authors,omitempty"`
+
+	// AnnotationLevels limits which check-annotation severities are reported
+	// (for example "warning", "failure"). Empty means the backend's default.
+	AnnotationLevels []string `json:"annotation_levels,omitempty"`
+
+	// RepeatUnresolved asks for still-open items to be re-reported on every
+	// observation rather than only when they first appear.
+	RepeatUnresolved bool `json:"repeat_unresolved,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

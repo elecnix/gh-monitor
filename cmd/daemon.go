@@ -1,9 +1,8 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,11 +16,17 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
+
+// DaemonBackendName is the name the daemon announces itself under, and the
+// name to pass to --backend to pin monitoring to it.
+const DaemonBackendName = "daemon"
 
 // newDaemonCommand builds `gh monitor daemon`: a long-lived process that
 // multiplexes one fetch loop per PR identity across many `gh monitor` client
@@ -142,126 +147,57 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	return nil
 }
 
-// serveClient handles one client connection: read its Subscribe request, register
-// a hub subscription, and stream notifications back as newline-delimited JSON
-// until the client disconnects or the PR reaches a terminal state.
-func serveClient(ctx context.Context, h *hub.Hub, conn net.Conn) {
-	// Read the subscribe request, honouring daemon shutdown.
-	req, err := ipc.ReadSubscribeContext(ctx, conn)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: read subscribe: %v\n", err)
-		return
-	}
-	if req.Target != "pr" {
-		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: unsupported target %q\n", req.Target)
-		return
-	}
+// hubSource adapts the shared poller to backend.Source, so the daemon serves
+// the same protocol as any other out-of-process backend.
+type hubSource struct{ hub *hub.Hub }
 
-	interval := time.Duration(req.Interval) * time.Second
-	if interval < 10*time.Second {
-		interval = 60 * time.Second
+func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	if t.Kind != backend.KindPR {
+		return nil, fmt.Errorf("the shared poller only serves pull requests, not %s", t.Kind)
 	}
-	opts := monitor.RunOptions{
-		Identity: req.Identity,
-		Prefs:    req.Prefs,
-		Interval: interval,
-		Timeout:  time.Duration(req.Timeout) * time.Second,
-		Now:      time.Now,
-	}
-
-	subCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ch, unsub := h.SubscribePR(subCtx, opts)
-	defer unsub()
-
-	// Stop streaming when the client disconnects.
-	go func() {
-		_, _ = io.Copy(io.Discard, conn) // block until EOF/error
-		cancel()
-	}()
-
-	w := bufio.NewWriter(conn)
-	defer func() { _ = w.Flush() }()
-	for n := range ch {
-		if err := ipc.WriteNotification(w, n); err != nil {
-			return
-		}
-		if err := w.Flush(); err != nil {
-			return
-		}
-	}
-}
-
-// streamFromDaemon is the client side: connect to a running daemon, send the
-// subscribe request, and pipe newline-delimited JSON notifications to out
-// until the daemon closes the stream or ctx is cancelled. It returns
-// os.ErrNotExist (via ipc.IsAbsent) when no daemon socket is present, so the
-// caller can fall back to in-process polling.
-func streamFromDaemon(ctx context.Context, socket string, req ipc.Subscribe, out io.Writer) error {
-	conn, err := ipc.Dial(socket)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = conn.Close() }()
-	// Close the connection when ctx is cancelled so a blocked read (e.g. an
-	// open PR that produces no new events) unblocks instead of ignoring the
-	// cancellation — the same way the in-process loop honours SIGINT.
+	ch, unsub := s.hub.SubscribePR(ctx, t, opts)
 	go func() {
 		<-ctx.Done()
-		_ = conn.Close()
+		unsub()
 	}()
-	if err := ipc.SendSubscribe(conn, req); err != nil {
-		return fmt.Errorf("send subscribe: %w", err)
-	}
+	return ch, nil
+}
 
-	r := bufio.NewReader(conn)
-	dec := newNDJSONDecoder(r)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
+// serveClient handles one client connection with the shared backend protocol.
+func serveClient(ctx context.Context, h *hub.Hub, conn net.Conn) {
+	// The daemon shares a fetch; it does not read, mutate, or render. Declaring
+	// only what it does is what lets a client fall back to the built-in backend
+	// for everything else.
+	cfg := remote.ServerConfig{
+		Name:   DaemonBackendName,
+		Kinds:  []backend.Kind{backend.KindPR},
+		Source: hubSource{hub: h},
+	}
+	// Reads inside Serve are not context-aware, so closing the connection is
+	// what unblocks them when the daemon shuts down.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
 		}
-		n, err := dec.Decode()
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			return err
-		}
-		if err := writeNDJSON(out, n); err != nil {
-			return err
-		}
+	}()
+
+	if err := remote.Serve(ctx, conn, cfg); err != nil && ctx.Err() == nil && !isDisconnect(err) {
+		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: serve client: %v\n", err)
 	}
 }
 
-// ndJSONDecoder reads one JSON object per line.
-type ndJSONDecoder struct {
-	r *bufio.Reader
-}
-
-func newNDJSONDecoder(r *bufio.Reader) *ndJSONDecoder { return &ndJSONDecoder{r: r} }
-
-func (d *ndJSONDecoder) Decode() (monitor.Notification, error) {
-	line, err := d.r.ReadBytes('\n')
-	if err != nil {
-		return monitor.Notification{}, err
-	}
-	var n monitor.Notification
-	if err := json.Unmarshal(line, &n); err != nil {
-		return n, err
-	}
-	return n, nil
-}
-
-func writeNDJSON(w io.Writer, n monitor.Notification) error {
-	b, err := json.Marshal(n)
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write(b); err != nil {
-		return err
-	}
-	_, err = w.Write([]byte("\n"))
-	return err
+// isDisconnect reports whether err is a client hanging up. Clients probe the
+// socket to see whether a daemon is live and then close, so this is the
+// common case, not a fault — logging it would bury real errors in noise.
+func isDisconnect(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
 }
 
 // spawnDaemonFn spawns a detached daemon bound to socket. It is a package

@@ -88,6 +88,17 @@ func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 		return fmt.Errorf("read request: %w", err)
 	}
 
+	// The client sends nothing after its request, so anything further on the
+	// connection means it has gone away. Watching for that is what releases a
+	// long watch when the client stops caring — without it, a shared poller
+	// would keep fetching for a process that has already exited.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		_, _ = io.Copy(io.Discard, br)
+		cancel()
+	}()
+
 	switch req.Op {
 	case OpWatch:
 		return serveWatch(ctx, conn, cfg, req)

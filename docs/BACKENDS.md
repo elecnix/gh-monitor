@@ -126,13 +126,16 @@ still controls it.
 Every field is advisory. Ignore what you cannot honour rather than failing —
 except `Once`, which changes what the caller is asking for.
 
-| Field      | Meaning                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Since`    | An opaque cursor from an earlier `Update`. Empty means start from now.                                                                      |
-| `Kinds`    | The event types the caller cares about. Empty means all. Delivering more is fine; the caller filters again.                                 |
-| `Interval` | The caller's preferred cadence. Meaningful to a poller, meaningless otherwise.                                                              |
-| `Timeout`  | Stop after this long. Zero means run until terminal or cancelled.                                                                           |
-| `Once`     | Deliver the current actionable state, then close — do not keep watching. If you cannot tell the two apart, emit what is true now and close. |
+| Field              | Meaning                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Since`            | An opaque cursor from an earlier `Update`. Empty means start from now.                                                                      |
+| `Kinds`            | The event types the caller cares about. Empty means all. Delivering more is fine; the caller filters again.                                 |
+| `Interval`         | The caller's preferred cadence. Meaningful to a poller, meaningless otherwise.                                                              |
+| `Timeout`          | Stop after this long. Zero means run until terminal or cancelled.                                                                           |
+| `Once`             | Deliver the current actionable state, then close — do not keep watching. If you cannot tell the two apart, emit what is true now and close. |
+| `IgnoredAuthors`   | Drop activity by these logins before reporting it.                                                                                          |
+| `AnnotationLevels` | Which check-annotation severities to report. Empty means your default; `["none"]` means report none.                                        |
+| `RepeatUnresolved` | Re-report still-open items on every observation, not only when they first appear.                                                           |
 
 ### Say so when you go blind
 
@@ -286,6 +289,23 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 | `degraded`                                                             | A surface could not be read              |
 | `all-clear`                                                            | Everything previously raised is resolved |
 
+## The shared-poller daemon
+
+`gh monitor daemon` is a backend like any other. It speaks the protocol above,
+announcing itself as `daemon` with a single capability (`source`) for a single
+kind (`pr`), because multiplexing one fetch across several watchers is all it
+does. Everything else — reads, mutations, every other target kind — resolves
+past it to the built-in backend.
+
+That is also why it is not special-cased in the client. It registers after the
+built-in backend and before any backend you configured, so an external backend
+you asked for still wins, and a target the daemon does not cover still works.
+
+```sh
+gh monitor --backend daemon 42   # pin to the shared poller
+GH_MONITOR_DAEMON=0 gh monitor 42  # never use it
+```
+
 ## What the built-in backend still owns
 
 The `gh` backend provides every capability for every kind, so it is the
@@ -296,9 +316,3 @@ polling the GitHub API, which no other backend has to think about:
   watchers do not poll in phase
 - GraphQL budget awareness and query tiering, shedding the least valuable
   surfaces first and saying loudly what it stopped watching
-- the shared-poller daemon (`gh monitor daemon`), which multiplexes one fetch
-  per pull request across several `gh monitor` processes
-
-The daemon is used only when the built-in backend is what would otherwise do the
-polling. With an external backend serving a target, `gh monitor` streams from
-that backend directly.

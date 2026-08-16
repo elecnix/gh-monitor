@@ -86,3 +86,27 @@ func (f *AnnotationLevels) Allows(level string) bool {
 	return f.allowed[strings.ToLower(strings.TrimSpace(level))]
 }
 
+
+// Names returns the level names this filter allows, in canonical order, so the
+// filter can cross a process boundary and be rebuilt with
+// ParseAnnotationLevels.
+//
+// A nil filter returns nil, meaning "the default". A filter that allows
+// nothing returns ["none"] — the spelling ParseAnnotationLevels understands —
+// because an empty slice would otherwise read as "default" and quietly turn
+// annotations back on.
+func (a *AnnotationLevels) Names() []string {
+	if a == nil {
+		return nil
+	}
+	var out []string
+	for _, l := range []string{"notice", "warning", "failure"} {
+		if a.allowed[l] {
+			out = append(out, l)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"none"}
+	}
+	return out
+}
