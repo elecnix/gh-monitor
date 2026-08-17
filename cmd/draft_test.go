@@ -73,7 +73,7 @@ func TestDraftMarkCommandOutputsJSON(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftMarkCommand()
+	cmd := newDraftMarkCommand(&backendOptions{})
 	cmd.SetArgs([]string{"5", "-R", "octo/demo"})
 
 	var buf bytes.Buffer
@@ -152,7 +152,7 @@ func TestDraftReadyCommandOutputsJSON(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftReadyCommand()
+	cmd := newDraftReadyCommand(&backendOptions{})
 	cmd.SetArgs([]string{"5", "-R", "octo/demo"})
 
 	var buf bytes.Buffer
@@ -207,7 +207,7 @@ func TestDraftStatusCommandOutputsJSON(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftStatusCommand()
+	cmd := newDraftStatusCommand(&backendOptions{})
 	cmd.SetArgs([]string{"5", "-R", "octo/demo"})
 
 	var buf bytes.Buffer
@@ -276,7 +276,7 @@ func TestDraftListCommandOutputsJSON(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftListCommand()
+	cmd := newDraftListCommand(&backendOptions{})
 	cmd.SetArgs([]string{"-R", "octo/demo"})
 
 	var buf bytes.Buffer
@@ -340,7 +340,7 @@ func TestDraftAlreadyInDesiredState(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftMarkCommand()
+	cmd := newDraftMarkCommand(&backendOptions{})
 	cmd.SetArgs([]string{"5", "-R", "octo/demo"})
 
 	var buf bytes.Buffer
@@ -359,7 +359,7 @@ func TestDraftAlreadyInDesiredState(t *testing.T) {
 }
 
 func TestDraftCommandRequiresPRNumber(t *testing.T) {
-	cmd := newDraftMarkCommand()
+	cmd := newDraftMarkCommand(&backendOptions{})
 	cmd.SetArgs([]string{"-R", "octo/demo"})
 
 	err := cmd.Execute()
@@ -404,7 +404,7 @@ func TestDraftStatusWithSelector(t *testing.T) {
 	}
 	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	cmd := newDraftStatusCommand()
+	cmd := newDraftStatusCommand(&backendOptions{})
 	cmd.SetArgs([]string{"https://github.com/octo/demo/pull/5"})
 
 	var buf bytes.Buffer

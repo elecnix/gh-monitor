@@ -17,55 +17,6 @@ type Service struct {
 // ErrViewerLoginUnavailable indicates the authenticated viewer login could not be resolved via GraphQL.
 var ErrViewerLoginUnavailable = errors.New("viewer login unavailable")
 
-// ReviewState contains metadata about a review after opening or submitting it.
-type ReviewState struct {
-	ID          string  `json:"id"`
-	State       string  `json:"state"`
-	SubmittedAt *string `json:"submitted_at,omitempty"`
-}
-
-// SubmitStatus represents the outcome of a review submission mutation.
-type SubmitStatus struct {
-	Success bool
-	Errors  []ghcli.GraphQLErrorEntry
-}
-
-// ReviewThread represents an inline comment thread added to a pending review.
-type ReviewThread struct {
-	ID         string `json:"id"`
-	Path       string `json:"path"`
-	IsOutdated bool   `json:"is_outdated"`
-	Line       *int   `json:"line,omitempty"`
-}
-
-// ThreadInput describes the inline comment details for AddThread.
-type ThreadInput struct {
-	ReviewID  string
-	Path      string
-	Line      int
-	Side      string
-	StartLine *int
-	StartSide *string
-	Body      string
-}
-
-// SubmitInput contains the payload for submitting a pending review.
-type SubmitInput struct {
-	ReviewID string
-	Event    string
-	Body     string
-}
-
-// UpdateCommentInput contains the payload for updating a comment in a pending review.
-type UpdateCommentInput struct {
-	CommentID string
-	Body      string
-}
-
-type DeleteCommentInput struct {
-	CommentID string
-}
-
 // NewService constructs a review Service.
 func NewService(api ghcli.API) *Service {
 	return &Service{API: api}

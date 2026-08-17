@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/monitor"
-	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,27 +47,26 @@ func prFixture(failing []string) *monitor.PullRequest {
 	}
 }
 
-func testHubOpts() monitor.RunOptions {
-	return monitor.RunOptions{
-		Identity: resolver.Identity{Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
-		Prefs:    prefs.DefaultPreferences(),
-		Interval: 60 * time.Second,
-		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
-	}
+func testHubTarget() backend.Target {
+	return backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7, Host: "github.com"}
 }
 
-// collect reads notification types from ch, waiting up to timeout for each
-// event. It returns as soon as a read times out, so tests stay deterministic
-// once a stable snapshot stops producing events.
-func collect(ch <-chan monitor.Notification, timeout time.Duration) []string {
+func testHubOpts() backend.WatchOptions {
+	return backend.WatchOptions{Interval: 60 * time.Second}
+}
+
+// collect reads event types from ch, waiting up to timeout for each event. It
+// returns as soon as a read times out, so tests stay deterministic once a
+// stable snapshot stops producing events.
+func collect(ch <-chan backend.Update, timeout time.Duration) []string {
 	var out []string
 	for {
 		select {
-		case n, ok := <-ch:
+		case u, ok := <-ch:
 			if !ok {
 				return out
 			}
-			out = append(out, n.Type)
+			out = append(out, string(u.Event.Type))
 		case <-time.After(timeout):
 			return out
 		}
@@ -100,9 +99,9 @@ func TestHub_SingleFetchFansOutToMultipleConsumers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	chA, cancelA := h.SubscribePR(ctx, testHubOpts())
+	chA, cancelA := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelA)
-	chB, cancelB := h.SubscribePR(ctx, testHubOpts())
+	chB, cancelB := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelB)
 
 	gotA := collect(chA, 200*time.Millisecond)
@@ -134,7 +133,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Consumer A subscribes first and consumes the failing-check state.
-	chA, cancelA := h.SubscribePR(ctx, testHubOpts())
+	chA, cancelA := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelA)
 	gotA := collect(chA, 200*time.Millisecond)
 	require.Contains(t, gotA, "first-poll")
@@ -150,7 +149,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 		atomic.AddInt64(&fetches, 1)
 		return current, nil
 	})
-	chB, cancelB := h.SubscribePR(ctx, testHubOpts())
+	chB, cancelB := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelB)
 	gotB := collect(chB, 200*time.Millisecond)
 	require.Contains(t, gotB, "first-poll")
@@ -163,7 +162,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	// diffs against its own baseline (the failing state), so both must see
 	// ci-all-green — independently.
 	current = prFixture(nil)
-	require.NoError(t, h.RefreshPR(testHubOpts().Identity))
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 
 	gotA2 := collect(chA, 200*time.Millisecond)
 	gotB2 := collect(chB, 200*time.Millisecond)
@@ -188,7 +187,7 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	_ = collect(ch, 200*time.Millisecond)
 	first := atomic.LoadInt64(&fetches)
 	require.GreaterOrEqual(t, first, int64(1), "poller fetched at least once")
@@ -229,7 +228,7 @@ func TestPoller_BacksOffWhenQuiet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 	_ = collect(ch, 60*time.Millisecond) // drain the first polls; backoff begins
 
@@ -265,7 +264,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 	_ = collect(ch, 50*time.Millisecond)
 
@@ -279,7 +278,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 	mu.Lock()
 	current = prFixture([]string{"ci-build"})
 	mu.Unlock()
-	require.NoError(t, h.RefreshPR(testHubOpts().Identity))
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 
 	got := collect(ch, 200*time.Millisecond)
 	assert.Contains(t, got, "new-failing-checks",
@@ -304,7 +303,7 @@ func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ch, c := h.SubscribePR(ctx, testHubOpts())
+			ch, c := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 			_ = collect(ch, 100*time.Millisecond)
 			c()
 		}()
@@ -323,7 +322,7 @@ func TestPoller_BroadcastsDegradedOnFetchError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
 	got := collect(ch, 200*time.Millisecond)
@@ -355,7 +354,7 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
 	got := collect(ch, 300*time.Millisecond)
@@ -408,7 +407,7 @@ func TestPoller_ErrorAfterTierSelectionStillBroadcasts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubOpts())
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
 	got := collect(ch, 100*time.Millisecond)

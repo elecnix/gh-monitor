@@ -52,33 +52,6 @@ type Service struct {
 	API ghcli.API
 }
 
-// ReplyOptions contains the payload for replying to a review comment thread.
-type ReplyOptions struct {
-	ThreadID string
-	ReviewID string
-	Body     string
-}
-
-// Reply represents the normalized GraphQL response after adding a thread reply.
-type Reply struct {
-	CommentNodeID    string  `json:"comment_node_id"`
-	DatabaseID       *int    `json:"database_id,omitempty"`
-	ReviewID         *string `json:"review_id,omitempty"`
-	ReviewDatabaseID *int    `json:"review_database_id,omitempty"`
-	ReviewState      *string `json:"review_state,omitempty"`
-	ThreadID         string  `json:"thread_id"`
-	ThreadIsResolved bool    `json:"thread_is_resolved"`
-	ThreadIsOutdated bool    `json:"thread_is_outdated"`
-	ReplyToCommentID *string `json:"reply_to_comment_id,omitempty"`
-	Body             string  `json:"body"`
-	DiffHunk         *string `json:"diff_hunk,omitempty"`
-	Path             string  `json:"path"`
-	HtmlURL          string  `json:"html_url"`
-	AuthorLogin      string  `json:"author_login"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
-}
-
 type commentDetails struct {
 	ID         string  `json:"id"`
 	DatabaseID *int    `json:"databaseId"`

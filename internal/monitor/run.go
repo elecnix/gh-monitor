@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
@@ -283,7 +284,21 @@ func realSleep(ctx context.Context, d time.Duration) error {
 // allowlist are dropped before they reach emit (per-event-kind filtering for
 // orchestrator/automation callers that only care about a subset of events).
 func Run(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
-	emit = filterEmit(opts.EventFilter, emit)
+	return Watch(ctx, svc, opts, opts.renderTo(filterEmit(opts.EventFilter, emit)))
+}
+
+// Watch is Run's backend-facing form: it emits one backend.Update per
+// genuinely-new change instead of a rendered Notification, so a caller can
+// filter, forward, or render on its own terms. Run is Watch plus this
+// package's renderer.
+//
+// Watch deliberately does not apply opts.EventFilter. Filtering is a
+// presentation concern and belongs at the single emit chokepoint the consumer
+// owns; applying it here would silently drop updates a forwarder needs.
+func Watch(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
+	if emit == nil {
+		emit = func(backend.Update) {}
+	}
 	switch opts.Identity.Target {
 	case "ref", "commit":
 		return runRef(ctx, svc, opts, emit)
@@ -302,7 +317,15 @@ func Run(ctx context.Context, svc *Service, opts RunOptions, emit func(Notificat
 // opts.EventFilter is non-nil, notifications whose Type is not in the
 // allowlist are dropped before they reach emit.
 func Once(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
-	emit = filterEmit(opts.EventFilter, emit)
+	return WatchOnce(ctx, svc, opts, opts.renderTo(filterEmit(opts.EventFilter, emit)))
+}
+
+// WatchOnce is Once's backend-facing form: a single fetch emitting
+// backend.Updates rather than rendered Notifications.
+func WatchOnce(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
+	if emit == nil {
+		emit = func(backend.Update) {}
+	}
 	switch opts.Identity.Target {
 	case "ref", "commit":
 		return onceRef(ctx, svc, opts, emit)
@@ -323,7 +346,7 @@ func Once(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifica
 
 // runPR polls the PR until it is merged/closed, the context is cancelled, or
 // the timeout elapses.
-func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	base := opts.Interval
 	if base <= 0 {
 		base = defaultInterval
@@ -433,7 +456,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notific
 	}
 }
 
-func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	resp, err := svc.Fetch(&opts.Identity, opts.Identity.Number)
 	if err != nil {
 		return err
@@ -464,17 +487,17 @@ func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	}
 	isFirstPoll := opts.CursorSnapshot == ""
 	if isFirstPoll {
-		emit(renderNotificationPR(opts, curr, firstPollType, Event{}))
+		emit(opts.update(curr, Event{Type: EventFirstPoll}))
 	}
 	for _, ev := range Diff(baseline, curr) {
 		if isFirstPoll && ev.Type == EventNewCommit {
 			continue // agent just pushed it
 		}
-		emit(renderNotificationPR(opts, curr, string(ev.Type), ev))
+		emit(opts.update(curr, ev))
 	}
 	// ci-all-green never fires against an empty baseline — emit it explicitly.
 	if isFirstPoll && ciAllGreen(curr) {
-		emit(renderNotificationPR(opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
+		emit(opts.update(curr, Event{Type: EventCIAllGreen}))
 	}
 	savePRSnapshot(opts, curr)
 	return nil
@@ -506,7 +529,7 @@ func ciAllGreen(s *PRStatus) bool {
 // runRef polls a ref or commit, emitting CI events until the context is
 // cancelled or timeout elapses. Ref targets never auto-stop (no terminal
 // state), so they run until cancelled or timed out.
-func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	base := opts.Interval
 	if base <= 0 {
 		base = defaultInterval
@@ -601,11 +624,11 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		compare := prev
 		if firstPoll {
 			compare = &RefStatus{}
-			emit(renderNotificationRef(opts, curr, firstPollType, Event{}))
+			emit(opts.update(curr, Event{Type: EventFirstPoll}))
 		}
 		events := DiffRef(compare, curr)
 		for _, ev := range events {
-			emit(renderNotificationRef(opts, curr, string(ev.Type), ev))
+			emit(opts.update(curr, ev))
 		}
 		if len(events) == 0 {
 			noChange++
@@ -631,7 +654,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	}
 }
 
-func onceRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func onceRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	var curr *RefStatus
 	switch opts.Identity.Target {
 	case "commit":
@@ -647,9 +670,9 @@ func onceRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		}
 		curr = SnapshotRef(resp.Repository.Ref)
 	}
-	emit(renderNotificationRef(opts, curr, firstPollType, Event{}))
+	emit(opts.update(curr, Event{Type: EventFirstPoll}))
 	for _, ev := range DiffRef(&RefStatus{}, curr) {
-		emit(renderNotificationRef(opts, curr, string(ev.Type), ev))
+		emit(opts.update(curr, ev))
 	}
 	return nil
 }
@@ -660,7 +683,7 @@ func onceRef(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 
 // runIssue polls an issue, emitting state-change and comment events. Auto-stops
 // when the issue is closed (but not reopened — a reopened issue continues).
-func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	base := opts.Interval
 	if base <= 0 {
 		base = defaultInterval
@@ -717,11 +740,11 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 		compare := prev
 		if firstPoll {
 			compare = &IssueStatus{}
-			emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
+			emit(opts.update(curr, Event{Type: EventFirstPoll}))
 		}
 		events := DiffIssues(compare, curr)
 		for _, ev := range events {
-			emit(renderNotificationIssue(opts, curr, string(ev.Type), ev))
+			emit(opts.update(curr, ev))
 			if ev.Type == EventIssueClosed {
 				terminalEmitted = true
 			}
@@ -736,7 +759,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 
 		if curr.State == "CLOSED" {
 			if firstPoll && !terminalEmitted {
-				emit(renderNotificationIssue(opts, curr, string(EventIssueClosed), Event{Type: EventIssueClosed}))
+				emit(opts.update(curr, Event{Type: EventIssueClosed}))
 			}
 			return nil
 		}
@@ -758,7 +781,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Noti
 	}
 }
 
-func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	resp, err := svc.FetchIssue(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Number)
 	if err != nil {
 		return err
@@ -775,10 +798,10 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(Not
 		}
 	}
 	if isFirstPoll {
-		emit(renderNotificationIssue(opts, curr, firstPollType, Event{}))
+		emit(opts.update(curr, Event{Type: EventFirstPoll}))
 	}
 	for _, ev := range DiffIssues(baseline, curr) {
-		emit(renderNotificationIssue(opts, curr, string(ev.Type), ev))
+		emit(opts.update(curr, ev))
 	}
 	saveIssueSnapshot(opts, curr)
 	return nil
@@ -1130,7 +1153,7 @@ func setCommitVars(vars map[string]string, host string, id resolver.Identity, c 
 // elapses. Unlike ref/commit monitoring (which never auto-stops), a run has a
 // clear terminal state and the loop stops once it is reached — mirroring the PR
 // loop's merged/closed exit.
-func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	base := opts.Interval
 	if base <= 0 {
 		base = defaultInterval
@@ -1178,15 +1201,14 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		compare := prev
 		if firstPoll {
 			compare = &RunStatus{}
-			emit(renderNotificationRun(opts, curr, firstPollType, Event{}))
+			emit(opts.update(curr, Event{Type: EventFirstPoll}))
 		}
 		events := DiffRun(compare, curr)
 		for _, ev := range events {
-			n := renderNotificationRun(opts, curr, string(ev.Type), ev)
 			if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-				n.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
+				ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
 			}
-			emit(n)
+			emit(opts.update(curr, ev))
 			if ev.Type == EventRunCompleted {
 				terminalEmitted = true
 			}
@@ -1201,11 +1223,10 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 		if curr.IsTerminal() {
 			if firstPoll && !terminalEmitted {
 				ev := Event{Type: EventRunCompleted, RunConclusion: curr.Conclusion}
-				n := renderNotificationRun(opts, curr, string(EventRunCompleted), ev)
 				if isRunFailureConclusion(curr.Conclusion) {
-					n.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
+					ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
 				}
-				emit(n)
+				emit(opts.update(curr, ev))
 			}
 			return nil
 		}
@@ -1226,19 +1247,18 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifi
 	}
 }
 
-func onceRun(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func onceRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	resp, err := svc.FetchRun(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.RunID)
 	if err != nil {
 		return err
 	}
 	curr := SnapshotRun(resp)
-	emit(renderNotificationRun(opts, curr, firstPollType, Event{}))
+	emit(opts.update(curr, Event{Type: EventFirstPoll}))
 	for _, ev := range DiffRun(&RunStatus{}, curr) {
-		n := renderNotificationRun(opts, curr, string(ev.Type), ev)
 		if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-			n.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
+			ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
 		}
-		emit(n)
+		emit(opts.update(curr, ev))
 	}
 	return nil
 }
@@ -1322,7 +1342,7 @@ func buildVarsRun(id resolver.Identity, status *RunStatus, ev Event, interval ti
 // When opts.Instance is set, the loop uses the per-instance cursor to filter
 // out items it has already seen across restarts. The cursor is advanced after
 // each poll via opts.AdvanceCursor.
-func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	base := opts.Interval
 	if base <= 0 {
 		base = defaultInterval
@@ -1373,11 +1393,11 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 		compare := prev
 		if firstPoll {
 			compare = &RepoStatus{}
-			emit(renderNotificationRepo(opts, curr, firstPollType, Event{}))
+			emit(opts.update(curr, Event{Type: EventFirstPoll}))
 		}
 		events := DiffRepo(compare, curr)
 		for _, ev := range events {
-			emit(renderNotificationRepo(opts, curr, string(ev.Type), ev))
+			emit(opts.update(curr, ev))
 		}
 		if len(events) == 0 {
 			noChange++
@@ -1413,16 +1433,16 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notif
 	}
 }
 
-func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
+func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	resp, err := svc.FetchRepo(opts.Identity.Owner, opts.Identity.Repo)
 	if err != nil {
 		return err
 	}
 	filtered := filterRepoResponse(resp, opts)
 	curr := SnapshotRepo(filtered)
-	emit(renderNotificationRepo(opts, curr, firstPollType, Event{}))
+	emit(opts.update(curr, Event{Type: EventFirstPoll}))
 	for _, ev := range DiffRepo(&RepoStatus{}, curr) {
-		emit(renderNotificationRepo(opts, curr, string(ev.Type), ev))
+		emit(opts.update(curr, ev))
 	}
 	if opts.AdvanceCursor != nil {
 		if latest := latestRepoCreatedAt(resp); latest != "" {
@@ -1609,18 +1629,12 @@ func degradedLabel(opts RunOptions) string {
 
 // emitDegraded emits a degraded event notification for the given surface and
 // error.
-func emitDegraded(opts RunOptions, surface string, err error, emit func(Notification)) {
-	msg := err.Error()
-
-	label := degradedLabel(opts)
-	message := fmt.Sprintf("⚠️ API degraded (%s) on %s: %s", surface, label, msg)
-
-	emit(Notification{
-		Type:      string(EventDegraded),
-		PRLabel:   label,
-		Message:   message,
-		Timestamp: opts.now(),
-	})
+func emitDegraded(opts RunOptions, surface string, err error, emit func(backend.Update)) {
+	emit(opts.update(nil, Event{
+		Type:            EventDegraded,
+		DegradedSurface: surface,
+		DegradedMessage: err.Error(),
+	}))
 }
 
 // rateLimitResetSeconds extracts the rate-limit reset time from an error.

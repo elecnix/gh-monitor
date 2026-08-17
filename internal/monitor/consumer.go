@@ -1,5 +1,7 @@
 package monitor
 
+import "github.com/elecnix/gh-monitor/backend"
+
 // PRConsumer holds the per-consumer state for a PR monitor: its own baseline
 // snapshot and no-change counter. It is reused by the in-process runPR loop
 // and by the hub's per-consumer goroutines so that consumption by one consumer
@@ -41,7 +43,7 @@ func (c *PRConsumer) RestoreBaseline(snapshot *PRStatus) {
 //
 // The caller is responsible for fetching curr; Consume never touches the
 // network, which is what lets many consumers share a single fetch.
-func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal bool) {
+func (c *PRConsumer) Consume(curr *PRStatus, emit func(backend.Update)) (terminal bool) {
 	diff := Diff
 	if c.opts.Prefs.RetriggerComments {
 		diff = DiffRetrigger
@@ -52,7 +54,7 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal 
 	compare := c.prev
 	if firstPoll {
 		compare = &PRStatus{}
-		emit(renderNotificationPR(c.opts, curr, firstPollType, Event{}))
+		emit(c.opts.update(curr, Event{Type: EventFirstPoll}))
 	}
 	// Shed surfaces keep their last-known values so a tier drop never reads
 	// as "cleared" (see CarryForwardShed).
@@ -62,7 +64,7 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal 
 		if firstPoll && ev.Type == EventNewCommit {
 			continue // the agent just pushed the head commit
 		}
-		emit(renderNotificationPR(c.opts, curr, string(ev.Type), ev))
+		emit(c.opts.update(curr, ev))
 		if ev.Type == EventMerged || ev.Type == EventClosed {
 			terminalEmitted = true
 		}
@@ -72,7 +74,7 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal 
 	// because prevHadWork is always false. Emit it explicitly when CI has
 	// already finished green.
 	if firstPoll && ciAllGreen(curr) {
-		emit(renderNotificationPR(c.opts, curr, string(EventCIAllGreen), Event{Type: EventCIAllGreen}))
+		emit(c.opts.update(curr, Event{Type: EventCIAllGreen}))
 	}
 	if len(events) == 0 {
 		c.noChange++
@@ -87,7 +89,7 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(Notification)) (terminal 
 			if curr.Merged {
 				typ = EventMerged
 			}
-			emit(renderNotificationPR(c.opts, curr, string(typ), Event{Type: typ}))
+			emit(c.opts.update(curr, Event{Type: typ}))
 		}
 		return true
 	}

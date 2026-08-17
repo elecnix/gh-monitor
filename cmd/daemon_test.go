@@ -2,15 +2,17 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -20,214 +22,64 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// closedPR builds a CLOSED PR whose single check suite is COMPLETED/SUCCESS —
-// a real terminal CI state (see AGENTS.md). A closed PR makes the daemon
-// stream terminate naturally, so single-client tests get a clean EOF.
-func closedPR() *monitor.PullRequest {
-	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
-	return &monitor.PullRequest{
-		State:   "CLOSED",
-		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
-			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
-		}}}},
-	}
-}
-
-// openPR builds an OPEN PR with a green check suite. An open PR never
-// settles, so the daemon stream stays open — used by the two-client sharing
-// test to avoid the poller being torn down between subscribers (a flake on
-// slow CI runners where the first client's terminal stream ends before the
-// second subscribes).
-func openPR() *monitor.PullRequest {
-	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
-	return &monitor.PullRequest{
-		State:   "OPEN",
-		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
-			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
-		}}}},
-	}
-}
-
-// startTestDaemon wires a hub with a counting fake fetcher to a real Unix
-// socket, running serveClient for each connection. prFn supplies each fetch's
-// PR payload. It returns the socket path, a fetch-counter, and a cleanup func.
-func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.PullRequest) (socket string, fetches *int64, cleanup func()) {
-	t.Helper()
-	var calls int64
-	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
-		atomic.AddInt64(&calls, 1)
-		return prFn(), nil
-	}
-	h := hub.New(fetcher, nil, time.Hour, nil)
-
-	// macOS limits Unix socket paths to 104 bytes; t.TempDir() lives under a
-	// long /var/folders/... path, so use a short throwaway dir in the system
-	// temp instead.
-	shortDir, err := os.MkdirTemp("", "ghmon-*.d")
-	require.NoError(t, err)
-	sock := filepath.Join(shortDir, "d.sock")
-	listener, err := ipc.Listen(sock)
-	require.NoError(t, err)
-
-	var wg sync.WaitGroup
-	serveCtx, cancel := context.WithCancel(ctx)
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			wg.Add(1)
-			go func(c net.Conn) {
-				defer wg.Done()
-				defer func() { _ = c.Close() }()
-				serveClient(serveCtx, h, c)
-			}(conn)
-		}
-	}()
-
-	cleanup = func() {
-		cancel()
-		_ = listener.Close()
-		wg.Wait()
-		h.Stop()
-		_ = os.RemoveAll(shortDir)
-	}
-	return sock, &calls, cleanup
-}
-
-func daemonSubscribeReq() ipc.Subscribe {
-	return ipc.Subscribe{
-		Target:   "pr",
-		Identity: resolver.Identity{Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
-		Prefs:    prefs.DefaultPreferences(),
-		Interval: 60,
-	}
-}
-
-// TestDaemon_TwoClientsShareOneFetch is the end-to-end acceptance test for
-// issue #34: two `gh monitor` client processes connecting to the daemon must
-// both receive the first-poll notification while the daemon makes exactly one
-// fetch — proving the shared poller works across a real Unix socket.
-//
-// It uses an OPEN PR so neither stream ends early: a closed PR would let the
-// first client finish and tear down the poller before the second subscribes
-// (a flake on slow CI runners, observed as fetches==2).
-func TestDaemon_TwoClientsShareOneFetch(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	sock, fetches, cleanup := startTestDaemon(t, ctx, openPR)
-	t.Cleanup(cleanup)
-
-	runOpts := runOptsFor() // open PR identity; stream stays open until we cancel
-
-	// Each client streams through a collecting emit and signals when it sees
-	// first-poll. The stream stays open (open PR), so we cancel after both have
-	// seen first-poll — context.Canceled is the expected return.
-	type clientState struct {
-		mu        sync.Mutex
-		types     []string
-		firstPoll chan struct{}
-		cctx      context.Context
-		cancel    context.CancelFunc
-	}
-	newClient := func() *clientState {
-		cctx, ccancel := context.WithCancel(ctx)
-		return &clientState{
-			firstPoll: make(chan struct{}),
-			cctx:      cctx,
-			cancel:    ccancel,
-		}
-	}
-	stages := []*clientState{newClient(), newClient()}
-
-	var wg sync.WaitGroup
-	for _, st := range stages {
-		st := st
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var once sync.Once
-			emit := func(n monitor.Notification) {
-				st.mu.Lock()
-				st.types = append(st.types, n.Type)
-				st.mu.Unlock()
-				if n.Type == "first-poll" {
-					once.Do(func() { close(st.firstPoll) })
-				}
-			}
-			_ = streamFromDaemonAndEmit(st.cctx, sock, runOpts, emit)
-			// Returns on cancel with context.Canceled — expected.
-		}()
-	}
-
-	// Wait for both clients to see first-poll from the shared fetch.
-	for i, st := range stages {
-		select {
-		case <-st.firstPoll:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("client %d never saw first-poll", i)
-		}
-	}
-
-	// Both clients received first-poll from a single fetch.
-	for i, st := range stages {
-		st.mu.Lock()
-		saw := contains(st.types, "first-poll")
-		st.mu.Unlock()
-		assert.True(t, saw, "client %d saw first-poll", i)
-	}
-	assert.Equal(t, int64(1), atomic.LoadInt64(fetches),
-		"two daemon clients must share a single fetch")
-
-	// Cancel both clients so their streams end and the goroutines exit.
-	for _, st := range stages {
-		st.cancel()
-	}
-	wg.Wait()
-}
-
-// contains reports whether s contains v.
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-// TestDaemon_FallsBackWhenSocketAbsent verifies the client path returns an
-// os.ErrNotExist-style error when no daemon is running, so runMonitor can
-// fall back to in-process polling.
-func TestDaemon_FallsBackWhenSocketAbsent(t *testing.T) {
-	// Point at a socket that does not exist.
-	missing := filepath.Join(t.TempDir(), "nope.sock")
-	err := streamFromDaemon(context.Background(), missing, daemonSubscribeReq(), &strings.Builder{})
-	assert.True(t, ipc.IsAbsent(err), "expected an absent-socket error, got %v", err)
-}
-
 // init guards against the daemon accidentally respecting a real user socket
 // when tests run on a developer machine.
 func init() {
 	_ = os.Unsetenv("GH_MONITOR_SOCK")
 }
-// runOptsFor is a closed-PR RunOptions whose stream terminates naturally, so
-// streamFromDaemonAndEmit returns instead of blocking forever.
-func runOptsFor() monitor.RunOptions {
-	return monitor.RunOptions{
-		Identity: resolver.Identity{Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
-		Prefs:    prefs.DefaultPreferences(),
-		Interval: 60 * time.Second,
-		Now:      time.Now,
+
+// closedPR builds a CLOSED PR whose single check suite is COMPLETED/SUCCESS —
+// a real terminal CI state (see AGENTS.md). A closed PR makes the daemon
+// stream terminate naturally, so single-client tests get a clean end.
+func closedPR() *monitor.PullRequest {
+	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
+	return &monitor.PullRequest{
+		State: "CLOSED",
+		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
+			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
+		}}}},
 	}
 }
 
+// openPR builds an OPEN PR with a green check suite. An open PR never settles,
+// so the daemon stream stays open — used by the two-client sharing test to
+// avoid the poller being torn down between subscribers.
+func openPR() *monitor.PullRequest {
+	suite := monitor.CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: monitor.AppInfo{Name: "ci"}}
+	return &monitor.PullRequest{
+		State: "OPEN",
+		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
+			Oid: "aaaaaaa", CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{suite}},
+		}}}},
+	}
+}
+
+func daemonTarget() backend.Target {
+	return backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7, Host: "github.com"}
+}
+
+// shortSocket returns a socket path under a short directory: macOS caps Unix
+// socket paths near 104 bytes, and t.TempDir() is already most of that.
+func shortSocket(t *testing.T, prefix string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", prefix)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "d.sock")
+}
+
+// unusedBuiltin is a built-in backend that fails if consulted, so a test
+// expecting the daemon to serve cannot pass by silently falling back.
+func unusedBuiltin(reg *backend.Registry) {
+	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
+		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+			return nil, errors.New("built-in backend was consulted")
+		}))
+}
+
 // bindTestServer starts an in-process daemon (hub + accept loop) bound to
-// socket, returning the listener for cleanup. It is the test substitute for
-// the real spawnDaemon re-exec.
-func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string) net.Listener {
+// socket. It is the test substitute for the real spawnDaemon re-exec.
+func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string) {
 	t.Helper()
 	l, err := ipc.Listen(socket)
 	require.NoError(t, err)
@@ -250,64 +102,225 @@ func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string
 			}(conn)
 		}
 	}()
-	return l
+}
+
+// startTestDaemon wires a hub with a counting fake fetcher to a real Unix
+// socket. prFn supplies each fetch's PR payload.
+func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.PullRequest) (socket string, fetches *int64) {
+	t.Helper()
+	var calls int64
+	fetcher := func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		atomic.AddInt64(&calls, 1)
+		return prFn(), nil
+	}
+	h := hub.New(fetcher, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	sock := shortSocket(t, "ghmon-*.d")
+	bindTestServer(t, ctx, h, sock)
+	return sock, &calls
+}
+
+// collectUntil streams updates until it sees want, returning every event type
+// it saw. It fails the test rather than blocking forever.
+func collectUntil(t *testing.T, ch <-chan backend.Update, want backend.EventType) []string {
+	t.Helper()
+	var got []string
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case u, open := <-ch:
+			if !open {
+				return got
+			}
+			got = append(got, string(u.Event.Type))
+			if u.Event.Type == want {
+				return got
+			}
+		case <-deadline:
+			t.Fatalf("never saw %q; got %v", want, got)
+			return got
+		}
+	}
+}
+
+// TestDaemon_TwoClientsShareOneFetch is the end-to-end acceptance test for
+// issue #34: two `gh monitor` client processes connecting to the daemon must
+// both receive the first-poll update while the daemon makes exactly one fetch
+// — proving the shared poller works across a real Unix socket.
+//
+// It uses an OPEN PR so neither stream ends early: a closed PR would let the
+// first client finish and tear down the poller before the second subscribes.
+func TestDaemon_TwoClientsShareOneFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, fetches := startTestDaemon(t, ctx, openPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	reg := backend.NewRegistry()
+	unusedBuiltin(reg)
+	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+
+	source, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	require.Equal(t, DaemonBackendName, name, "the daemon must serve a pull request when it is running")
+
+	// Both clients must be subscribed at once: the poller stops when its last
+	// consumer leaves, so tearing the first down before the second attaches
+	// would legitimately cost a second fetch.
+	cctx, ccancel := context.WithCancel(ctx)
+	defer ccancel()
+
+	channels := make([]<-chan backend.Update, 2)
+	for i := range channels {
+		ch, err := source.Watch(cctx, daemonTarget(), backend.WatchOptions{Interval: time.Minute})
+		require.NoError(t, err)
+		channels[i] = ch
+	}
+	for i, ch := range channels {
+		assert.Contains(t, collectUntil(t, ch, backend.EventFirstPoll), "first-poll",
+			"client %d saw first-poll", i)
+	}
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(fetches),
+		"two daemon clients must share a single fetch")
+}
+
+// TestDaemon_ClientRendersWithItsOwnTemplates is the point of replacing the old
+// protocol: the daemon ships events, and the process the operator ran turns
+// them into text with that operator's templates.
+func TestDaemon_ClientRendersWithItsOwnTemplates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, _ := startTestDaemon(t, ctx, closedPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	reg := backend.NewRegistry()
+	unusedBuiltin(reg)
+	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+
+	source, _, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	ch, err := source.Watch(ctx, daemonTarget(), backend.WatchOptions{Interval: time.Minute})
+	require.NoError(t, err)
+
+	custom := prefs.DefaultPreferences()
+	custom.Templates["first-poll"] = "WATCHING {owner}/{repo}#{number}"
+
+	var messages []string
+	for u := range ch {
+		messages = append(messages, monitor.Render(u, custom, time.Minute).Message)
+	}
+
+	assert.Contains(t, messages, "WATCHING o/r#7",
+		"the client's own template must be what the operator sees")
+}
+
+// TestDaemon_NotUsedWhenSocketAbsent verifies that with no daemon listening and
+// autostart off, nothing is registered — so the built-in backend serves.
+func TestDaemon_NotUsedWhenSocketAbsent(t *testing.T) {
+	t.Setenv("GH_MONITOR_AUTOSTART", "0")
+	t.Setenv("GH_MONITOR_SOCK", shortSocket(t, "ghmon-absent-*.d")) // never bound
+
+	reg := backend.NewRegistry()
+	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
+		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+			return nil, nil
+		}))
+	attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+
+	_, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, gh.Name, name, "with no daemon the built-in backend must serve")
+}
+
+// TestDaemon_OptedOutByEnv verifies GH_MONITOR_DAEMON=0 keeps the daemon out of
+// the registry even when one is listening.
+func TestDaemon_OptedOutByEnv(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, _ := startTestDaemon(t, ctx, openPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+	t.Setenv("GH_MONITOR_DAEMON", "0")
+
+	reg := backend.NewRegistry()
+	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
+		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+			return nil, nil
+		}))
+	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+
+	_, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, gh.Name, name, "GH_MONITOR_DAEMON=0 must keep the daemon unused")
+}
+
+// TestDaemon_OnlyServesPullRequests verifies the daemon is not registered for
+// kinds it cannot serve, so those keep polling in-process.
+func TestDaemon_OnlyServesPullRequests(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, _ := startTestDaemon(t, ctx, openPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	reg := backend.NewRegistry()
+	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
+		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+			return nil, nil
+		}))
+	issue := backend.Target{Kind: backend.KindIssue, Owner: "o", Repo: "r", Number: 3}
+	attachDaemon(ctx, reg, issue, time.Minute)
+
+	_, name, err := reg.SourceFor(issue)
+	require.NoError(t, err)
+	assert.Equal(t, gh.Name, name, "the shared poller only serves pull requests")
 }
 
 // TestAutoStart_SpawnsDaemonWhenAbsent verifies the autostart wiring: when no
-// daemon is listening, streamFromDaemonAndEmit spawns one (via the injectable
-// spawnDaemonFn) and streams the first-poll from it.
+// daemon is listening, attachDaemon spawns one via the injectable
+// spawnDaemonFn and registers it.
 func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
-	var fetches int64
-	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
-		atomic.AddInt64(&fetches, 1)
-		return closedPR(), nil
-	}
-	h := hub.New(fetcher, nil, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+
+	h := hub.New(func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return closedPR(), nil
+	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
 
-	shortDir, err := os.MkdirTemp("", "ghmon-autostart-*.d")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
-	sock := filepath.Join(shortDir, "d.sock")
+	t.Setenv("GH_MONITOR_SOCK", shortSocket(t, "ghmon-autostart-*.d"))
 
 	var spawned int64
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(socket string, interval time.Duration) error {
+	spawnDaemonFn = func(socket string, _ time.Duration) error {
 		atomic.AddInt64(&spawned, 1)
 		bindTestServer(t, ctx, h, socket)
 		return nil
 	}
 	t.Cleanup(func() { spawnDaemonFn = orig })
 
-	var got []string
-	emit := func(n monitor.Notification) { got = append(got, n.Type) }
+	reg := backend.NewRegistry()
+	unusedBuiltin(reg)
+	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
 
-	err = streamFromDaemonAndEmit(ctx, sock, runOptsFor(), emit)
-	require.NoError(t, err)
 	assert.Equal(t, int64(1), atomic.LoadInt64(&spawned), "autostart spawned the daemon once")
-	assert.Contains(t, got, "first-poll", "client streamed first-poll from the autostarted daemon")
+	_, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, DaemonBackendName, name)
 }
 
 // TestAutoStart_SkipsSpawnWhenDaemonRunning verifies autostart does not spawn a
 // second daemon when one is already listening.
 func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
-	var fetches int64
-	fetcher := func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
-		atomic.AddInt64(&fetches, 1)
-		return closedPR(), nil
-	}
-	h := hub.New(fetcher, nil, time.Hour, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	t.Cleanup(h.Stop)
 
-	shortDir, err := os.MkdirTemp("", "ghmon-running-*.d")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
-	sock := filepath.Join(shortDir, "d.sock")
-	bindTestServer(t, ctx, h, sock) // daemon already up
+	sock, _ := startTestDaemon(t, ctx, closedPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
 
 	var spawned int64
 	orig := spawnDaemonFn
@@ -317,25 +330,21 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 	}
 	t.Cleanup(func() { spawnDaemonFn = orig })
 
-	var got []string
-	emit := func(n monitor.Notification) { got = append(got, n.Type) }
+	reg := backend.NewRegistry()
+	unusedBuiltin(reg)
+	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
 
-	err = streamFromDaemonAndEmit(ctx, sock, runOptsFor(), emit)
-	require.NoError(t, err)
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when a daemon is already running")
-	assert.Contains(t, got, "first-poll")
+	_, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, DaemonBackendName, name)
 }
 
-// TestAutoStart_DisabledByEnv verifies that GH_MONITOR_AUTOSTART=0 suppresses
-// spawning and surfaces an absent-socket error so runMonitor falls back to
-// in-process polling.
+// TestAutoStart_DisabledByEnv verifies GH_MONITOR_AUTOSTART=0 suppresses
+// spawning, leaving the built-in backend to poll in-process.
 func TestAutoStart_DisabledByEnv(t *testing.T) {
 	t.Setenv("GH_MONITOR_AUTOSTART", "0")
-
-	shortDir, err := os.MkdirTemp("", "ghmon-disabled-*.d")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
-	sock := filepath.Join(shortDir, "d.sock") // never bound
+	t.Setenv("GH_MONITOR_SOCK", shortSocket(t, "ghmon-disabled-*.d")) // never bound
 
 	var spawned int64
 	orig := spawnDaemonFn
@@ -345,8 +354,15 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 	}
 	t.Cleanup(func() { spawnDaemonFn = orig })
 
-	emit := func(monitor.Notification) {}
-	err = streamFromDaemonAndEmit(context.Background(), sock, runOptsFor(), emit)
-	assert.True(t, ipc.IsAbsent(err), "expected an absent-socket error, got %v", err)
+	reg := backend.NewRegistry()
+	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
+		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+			return nil, nil
+		}))
+	attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when autostart is disabled")
+	_, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, gh.Name, name)
 }

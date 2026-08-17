@@ -17,25 +17,6 @@ func NewService(api ghcli.API) *Service {
 	return &Service{API: api}
 }
 
-// ActionOptions controls draft/ready operations.
-type ActionOptions struct {
-	PRNumber int
-}
-
-// ActionResult captures the outcome of a draft/ready mutation.
-type ActionResult struct {
-	PRNumber int    `json:"pr_number"`
-	IsDraft  bool   `json:"is_draft"`
-	Status   string `json:"status"`
-}
-
-// DraftInfo contains information about a PR's draft status.
-type DraftInfo struct {
-	PRNumber int    `json:"pr_number"`
-	IsDraft  bool   `json:"is_draft"`
-	Title    string `json:"title"`
-}
-
 // Draft marks a pull request as draft when permissions allow it.
 func (s *Service) Draft(pr resolver.Identity, opts ActionOptions) (ActionResult, error) {
 	return s.changeDraftState(pr, opts, true)

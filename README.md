@@ -26,6 +26,7 @@ GitHub's built-in `gh` tool does not show inline comments, review threads, or th
 - Manage pull request draft status (mark as draft/ready for review)
 - List all draft pull requests in a repository
 - Continuously monitor a PR and stream one event per change (`monitor`) — designed to be wrapped by [Claude Code](https://claude.com/claude-code)'s persistent `Monitor` tool for live, agent-driven PR notifications
+- Swap the monitoring backend for your own, as a Go library or a separate process ([docs/BACKENDS.md](docs/BACKENDS.md))
 
 ## Installation
 
@@ -70,6 +71,7 @@ npx skills add elecnix/gh-monitor
 | `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch |
 | `instances list`                | List all named instance cursors                                            |
 | `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                  |
+| `backends`                      | List the monitoring backends and the target kinds they cover               |
 
 ### Filters
 
@@ -85,9 +87,16 @@ npx skills add elecnix/gh-monitor
 | `--include-resolved`        | Include resolved threads (overrides --unresolved)                                            |
 | `--mine`                    | Show only threads involving or resolvable by the viewer (threads list only)                  |
 
+### Backend selection
+
+| Flag                       | Purpose                                                                            |
+| -------------------------- | ---------------------------------------------------------------------------------- |
+| `--backend <name>`         | Pin monitoring to a named backend                                                  |
+| `--backend-endpoint <uri>` | Connect an external backend: `unix:<path>`, `tcp:<host:port>`, or `exec:<command>` |
+
 **Note**: Commands accepting `--body` also support `--body-file <path>` to read from a file. Use `--body-file -` to read from stdin. These flags are mutually exclusive.
 
-See [skills/references/USAGE.md](skills/references/USAGE.md) for detailed usage. See [docs/SCHEMAS.md](docs/SCHEMAS.md) for JSON response schemas.
+See [skills/references/USAGE.md](skills/references/USAGE.md) for detailed usage. See [docs/SCHEMAS.md](docs/SCHEMAS.md) for JSON response schemas. See [docs/BACKENDS.md](docs/BACKENDS.md) for writing a monitoring backend.
 
 ## Usage
 

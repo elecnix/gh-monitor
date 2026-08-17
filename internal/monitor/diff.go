@@ -1,102 +1,5 @@
 package monitor
 
-import "strconv"
-
-// EventType is a stable identifier for a kind of detected change.
-type EventType string
-
-const (
-	EventNewFailingChecks       EventType = "new-failing-checks"
-	EventCIAllGreen             EventType = "ci-all-green"
-	EventNewUnresolvedThreads   EventType = "new-unresolved-threads"
-	EventNewGeneralComments     EventType = "new-general-comments"
-	EventConflict               EventType = "conflict"
-	EventReviewApproved         EventType = "review-approved"
-	EventReviewChangesRequested EventType = "review-changes-requested"
-	EventReviewDismissed        EventType = "review-dismissed"
-	EventNewCommit              EventType = "new-commit"
-	EventMerged                 EventType = "merged"
-	EventClosed                 EventType = "closed"
-
-	// Issue monitoring events
-	EventIssueClosed     EventType = "issue-closed"
-	EventIssueReopened   EventType = "issue-reopened"
-	EventIssueNewComment EventType = "issue-new-comment"
-	EventIssueMention    EventType = "issue-mention"
-
-	// Workflow-run monitoring events
-	EventRunQueued     EventType = "run-queued"
-	EventRunInProgress EventType = "run-in-progress"
-	EventRunCompleted  EventType = "run-completed"
-
-	// Repo monitoring events
-	EventRepoNewPR        EventType = "repo-new-pr"
-	EventRepoNewIssue     EventType = "repo-new-issue"
-	EventCheckAnnotations EventType = "check-annotations"
-
-	// Readiness view event (issue #31)
-	EventRepoReadiness EventType = "readiness"
-
-	// EventDegraded signals that an API surface (rest, graphql, or both)
-	// could not be read. The previous snapshot is retained; no inferred
-	// state replaces it. Rate-limit details are carried when known.
-	EventDegraded EventType = "degraded"
-)
-
-// Event describes a single genuinely-new change between two snapshots. Only the
-// fields relevant to Type are populated.
-type Event struct {
-	Type EventType `json:"type"`
-
-	// Checks holds the newly-failing check names (EventNewFailingChecks).
-	Checks []string `json:"checks,omitempty"`
-
-	// Threads holds the new/updated unresolved threads (EventNewUnresolvedThreads).
-	Threads []ThreadSummary `json:"threads,omitempty"`
-
-	// Comments holds the new general comments (EventNewGeneralComments).
-	Comments []GeneralComment `json:"comments,omitempty"`
-
-	// ReviewState / ReviewAuthor describe a review transition
-	// (EventReviewApproved / EventReviewChangesRequested / EventReviewDismissed).
-	ReviewState  string `json:"review_state,omitempty"`
-	ReviewAuthor string `json:"review_author,omitempty"`
-
-	// Commit is the new head commit (EventNewCommit).
-	Commit *CommitSummary `json:"commit,omitempty"`
-
-	// IssueComments holds the new issue comments (EventIssueNewComment, EventIssueMention).
-	IssueComments []IssueCommentSummary `json:"issue_comments,omitempty"`
-
-	// RunConclusion is the terminal conclusion of a workflow run
-	// (EventRunCompleted): success, failure, timed_out, cancelled, etc.
-	RunConclusion string `json:"run_conclusion,omitempty"`
-
-	// RepoItems holds the new PRs or issues (EventRepoNewPR, EventRepoNewIssue).
-	RepoItems []RepoItemSummary `json:"repo_items,omitempty"`
-
-	// Annotations holds the check-run annotations (EventCheckAnnotations).
-	Annotations []AnnotationSummary `json:"annotations,omitempty"`
-
-	// AnnotationsTruncated is true when the annotation set may be incomplete.
-	AnnotationsTruncated bool `json:"annotations_truncated,omitempty"`
-
-	// AnnotationsURL is the check run's permalink when annotations are
-	// truncated, so a consumer can view the full set.
-	AnnotationsURL string `json:"annotations_url,omitempty"`
-
-	// DegradedSurface is set on EventDegraded to indicate which API surface
-	// could not be read: "rest", "graphql", or "both".
-	DegradedSurface string `json:"degraded_surface,omitempty"`
-
-	// DegradedMessage carries the error detail for EventDegraded.
-	DegradedMessage string `json:"degraded_message,omitempty"`
-
-	// DegradedResetAt is an ISO 8601 timestamp of the rate-limit reset (when
-	// known). When set, the caller should back off until this time.
-	DegradedResetAt string `json:"degraded_reset_at,omitempty"`
-}
-
 // CarryForwardShed retains the last-known values for surfaces the current
 // snapshot's tier no longer fetches (listed in curr.ShedSurfaces), so Diff
 // sees "not watched" rather than "cleared": a shed review decision must not
@@ -453,16 +356,6 @@ func DiffRepo(prev, curr *RepoStatus) []Event {
 // Annotation types and helpers
 // ---------------------------------------------------------------------------
 
-// AnnotationSummary is a distilled check-run annotation.
-type AnnotationSummary struct {
-	CheckName string `json:"check_name"`
-	Path      string `json:"path"`
-	Line      int    `json:"line"`
-	Level     string `json:"level"`
-	Title     string `json:"title"`
-	Message   string `json:"message"`
-}
-
 // diffAnnotations returns annotations in curr that are not in prev.
 // Annotations are matched by (check_name, path, line, level, title, message).
 // Level filtering is performed at snapshot time via AnnotationLevels; the
@@ -483,6 +376,4 @@ func diffAnnotations(prev, curr []AnnotationSummary) []AnnotationSummary {
 
 // annotationKey returns a stable dedup key for an annotation: check,
 // path, line, level, title, and message combined.
-func annotationKey(a AnnotationSummary) string {
-	return a.CheckName + "\x00" + a.Path + "\x00" + strconv.Itoa(a.Line) + "\x00" + a.Level + "\x00" + a.Title + "\x00" + a.Message
-}
+func annotationKey(a AnnotationSummary) string { return a.Key() }

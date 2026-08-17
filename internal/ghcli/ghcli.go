@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/elecnix/gh-monitor/backend"
 )
 
 // Client executes GitHub API requests through the `gh` CLI to reuse
@@ -61,11 +63,10 @@ func IsGitHubErrorBody(body []byte) (*GitHubErrorBody, bool) {
 	return nil, false
 }
 
-// GraphQLErrorEntry captures a single GraphQL error payload.
-type GraphQLErrorEntry struct {
-	Message string        `json:"message"`
-	Path    []interface{} `json:"path,omitempty"`
-}
+// GraphQLErrorEntry captures a single GraphQL error payload. It is the
+// backend-facing APIErrorEntry: a review submission reports these to callers,
+// so the type has to be one an out-of-tree backend can construct.
+type GraphQLErrorEntry = backend.APIErrorEntry
 
 // GraphQLError represents GraphQL-level errors returned alongside a response.
 type GraphQLError struct {

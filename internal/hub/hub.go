@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
@@ -73,33 +74,51 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget 
 	}
 }
 
-// SubscribePR registers a consumer for the PR identified by opts.Identity and
-// returns a channel of notifications plus a cancel function. The consumer
-// receives the poller's current snapshot immediately (as a first-poll against
-// an empty baseline), then deltas on every subsequent fetch. Each consumer
-// keeps its own baseline, so one consumer advancing never affects another.
+// SubscribePR registers a consumer for the PR named by t and returns a channel
+// of updates plus a cancel function. The consumer receives the poller's current
+// snapshot immediately (as a first-poll against an empty baseline), then deltas
+// on every subsequent fetch. Each consumer keeps its own baseline and its own
+// snapshot filters, so one consumer never affects another.
+//
+// The hub emits backend.Update, not rendered notifications: it shares a fetch,
+// it does not decide how anything reads. Rendering belongs to whoever owns the
+// user's templates, which is the process the operator ran.
 //
 // cancel() detaches the consumer; the underlying poller stops once its last
 // consumer leaves. cancel is idempotent and safe to call from multiple
 // goroutines.
-func (h *Hub) SubscribePR(ctx context.Context, opts monitor.RunOptions) (<-chan monitor.Notification, func()) {
-	key := prKey{opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Number}
+func (h *Hub) SubscribePR(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, func()) {
+	identity := monitor.IdentityOf(t)
+	key := prKey{identity.Owner, identity.Repo, identity.Number}
 
 	h.mu.Lock()
 	p := h.pollers[key]
 	if p == nil {
-		p = newPRPoller(h, opts.Identity, h.interval)
+		p = newPRPoller(h, identity, h.interval)
 		h.pollers[key] = p
 		go p.run()
 	}
 	h.mu.Unlock()
 
+	// The consumer only needs enough run configuration to diff and to stamp
+	// the updates it emits; templates never reach the daemon.
+	ro := monitor.RunOptions{Identity: identity}
+	ro.Prefs.RetriggerComments = opts.RepeatUnresolved
+
+	snapOpts := monitor.SnapshotOptions{IgnoredBots: opts.IgnoredAuthors}
+	if len(opts.AnnotationLevels) > 0 {
+		// Parsed, so "none" keeps meaning "report no annotations".
+		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
+			snapOpts.AnnotationLevels = levels
+		}
+	}
+
 	sub := &prSub{
-		consumer:   monitor.NewPRConsumer(opts),
-		snapOpts:   monitor.SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots, AnnotationLevels: opts.AnnotationLevels},
+		consumer:   monitor.NewPRConsumer(ro),
+		snapOpts:   snapOpts,
 		snapshotCh: make(chan *monitor.PullRequest, 1),
-		notifCh:    make(chan monitor.Notification, 4),
-		out:        make(chan monitor.Notification, 16),
+		notifCh:    make(chan backend.Update, 4),
+		out:        make(chan backend.Update, 16),
 		done:       make(chan struct{}),
 	}
 	go sub.loop()
@@ -328,11 +347,10 @@ func (p *prPoller) fetchOnce() {
 			// Degrade loudly: a fetch error must reach subscribers, never
 			// vanish — a silently blind watcher reads as "all clear". The
 			// previous snapshot is retained; no inference replaces it.
-			p.broadcast(monitor.Notification{
-				Type:      string(monitor.EventDegraded),
-				PRLabel:   p.label(),
-				Message:   fmt.Sprintf("⚠️ API degraded (graphql) on %s: %v", p.label(), err),
-				Timestamp: time.Now(),
+			p.broadcast(monitor.Event{
+				Type:            monitor.EventDegraded,
+				DegradedSurface: "graphql",
+				DegradedMessage: fmt.Sprintf("%v", err),
 			})
 			return
 		}
@@ -393,24 +411,24 @@ func (p *prPoller) applyTier(tier monitor.QueryTier) {
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
 	}
-	p.broadcast(monitor.Notification{
-		Type:      string(monitor.EventDegraded),
-		PRLabel:   p.label(),
-		Message:   msg,
-		Timestamp: time.Now(),
-	})
+	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
 }
 
-// broadcast fans a notification out to every subscriber's notification
-// channel. Sends are non-blocking: a consumer that has not drained its
-// previous notice drops the intermediate one, which is acceptable for
-// state-change notices (the next tier change or error re-notifies).
-func (p *prPoller) broadcast(n monitor.Notification) {
+// broadcast fans a loop-level event out to every subscriber. Sends are
+// non-blocking: a consumer that has not drained its previous notice drops the
+// intermediate one, which is acceptable for state-change notices (the next
+// tier change or error re-notifies).
+func (p *prPoller) broadcast(ev monitor.Event) {
+	u := backend.Update{
+		Target: monitor.TargetOf(p.identity),
+		Event:  ev,
+		At:     time.Now(),
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for s := range p.subs {
 		select {
-		case s.notifCh <- n:
+		case s.notifCh <- u:
 		default:
 		}
 	}
@@ -422,14 +440,14 @@ func (p *prPoller) label() string {
 }
 
 // prSub is one consumer's handle: its own PRConsumer (baseline), a buffered
-// snapshot inbox, a notification channel for loop-level notices (degraded /
-// tier-shed), and an output channel of notifications.
+// snapshot inbox, a channel for loop-level notices (degraded / tier-shed), and
+// an output channel of updates.
 type prSub struct {
 	consumer   *monitor.PRConsumer
 	snapOpts   monitor.SnapshotOptions
 	snapshotCh chan *monitor.PullRequest
-	notifCh    chan monitor.Notification
-	out        chan monitor.Notification
+	notifCh    chan backend.Update
+	out        chan backend.Update
 	done       chan struct{}
 }
 
@@ -448,9 +466,9 @@ func (s *prSub) loop() {
 				return
 			}
 			curr := monitor.Snapshot(raw, s.snapOpts)
-			terminal := s.consumer.Consume(curr, func(n monitor.Notification) {
+			terminal := s.consumer.Consume(curr, func(u backend.Update) {
 				select {
-				case s.out <- n:
+				case s.out <- u:
 				case <-s.done:
 				}
 			})
@@ -458,10 +476,10 @@ func (s *prSub) loop() {
 				close(s.out)
 				return
 			}
-		case n := <-s.notifCh:
+		case u := <-s.notifCh:
 			// Loop-level notices (degraded, tier-shed) pass straight through.
 			select {
-			case s.out <- n:
+			case s.out <- u:
 			case <-s.done:
 			}
 		case <-s.done:

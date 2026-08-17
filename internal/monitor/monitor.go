@@ -681,36 +681,6 @@ func (s *Service) FetchIssue(owner, repo string, number int) (*IssueQueryRespons
 // Snapshot types
 // ---------------------------------------------------------------------------
 
-// ThreadSummary is a distilled unresolved review thread.
-type ThreadSummary struct {
-	ID         string   `json:"id"`
-	Path       string   `json:"path,omitempty"`
-	Line       *int     `json:"line,omitempty"`
-	CommentIDs []string `json:"comment_ids"`
-	// Author and Body come from the thread's LAST comment (the most recent
-	// point of the conversation); DiffHunk comes from the FIRST comment (the
-	// anchor the thread was opened against). All present only for detail bodies.
-	Author   string `json:"author,omitempty"`
-	Body     string `json:"body,omitempty"`
-	DiffHunk string `json:"diff_hunk,omitempty"`
-}
-
-// GeneralComment is a distilled, actionable general PR comment.
-type GeneralComment struct {
-	ID     string `json:"id"`
-	Author string `json:"author"`
-	Body   string `json:"body"`
-}
-
-// CommitSummary describes the head commit, including parsed co-authors.
-type CommitSummary struct {
-	Oid             string   `json:"oid"`
-	ShortOid        string   `json:"short_oid"`
-	Author          string   `json:"author"`
-	Coauthors       []string `json:"coauthors,omitempty"`
-	MessageHeadline string   `json:"message_headline"`
-}
-
 // PRStatus is the stable snapshot the change detector diffs.
 type PRStatus struct {
 	State             string           `json:"state"`
@@ -1304,13 +1274,6 @@ func pendingChecksFromCommit(pr *PullRequest) []string {
 // Issue snapshot types
 // ---------------------------------------------------------------------------
 
-// IssueCommentSummary is a distilled, actionable issue comment.
-type IssueCommentSummary struct {
-	ID     string `json:"id"`
-	Author string `json:"author"`
-	Body   string `json:"body"`
-}
-
 // IssueStatus is the stable snapshot for an issue target.
 type IssueStatus struct {
 	State    string                `json:"state"`
@@ -1389,14 +1352,6 @@ type RepoIssue struct {
 	Author    struct {
 		Login string `json:"login"`
 	} `json:"author"`
-}
-
-// RepoItemSummary is a distilled repo item (PR or issue) used in events.
-type RepoItemSummary struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Author string `json:"author"`
-	URL    string `json:"url"`
 }
 
 // RepoStatus is the stable snapshot for a repo target.

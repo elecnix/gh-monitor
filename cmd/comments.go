@@ -7,12 +7,14 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/internal/comments"
+	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 type commentsOptions struct {
-	Repo string
-	Pull int
+	Repo    string
+	Pull    int
+	Backend backendOptions
 }
 
 func newCommentsCommand() *cobra.Command {
@@ -32,6 +34,7 @@ func newCommentsCommand() *cobra.Command {
 
 	cmd.PersistentFlags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
 	cmd.PersistentFlags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addPersistentBackendFlags(cmd, &opts.Backend)
 
 	cmd.AddCommand(newCommentsReplyCommand(opts))
 
@@ -55,7 +58,7 @@ func newCommentsReplyCommand(parent *commentsOptions) *cobra.Command {
 			if opts.Pull == 0 {
 				opts.Pull = parent.Pull
 			}
-			return runCommentsReply(cmd, opts)
+			return runCommentsReply(cmd, parent, opts)
 		},
 	}
 
@@ -81,7 +84,7 @@ type commentsReplyOptions struct {
 	BodyFile string
 }
 
-func runCommentsReply(cmd *cobra.Command, opts *commentsReplyOptions) error {
+func runCommentsReply(cmd *cobra.Command, parent *commentsOptions, opts *commentsReplyOptions) error {
 	body, err := resolveBody(opts.Body, opts.BodyFile)
 	if err != nil {
 		return err
@@ -102,9 +105,17 @@ func runCommentsReply(cmd *cobra.Command, opts *commentsReplyOptions) error {
 		return err
 	}
 
-	service := comments.NewService(apiClientFactory(identity.Host))
+	target := monitor.TargetOf(identity)
+	reg, err := actorRegistry(cmd.Context(), &parent.Backend)
+	if err != nil {
+		return err
+	}
+	actor, _, err := reg.CommentsFor(target)
+	if err != nil {
+		return err
+	}
 
-	reply, err := service.Reply(identity, comments.ReplyOptions{
+	reply, err := actor.ReplyToThread(cmd.Context(), target, comments.ReplyOptions{
 		ThreadID: opts.ThreadID,
 		ReviewID: opts.ReviewID,
 		Body:     opts.Body,

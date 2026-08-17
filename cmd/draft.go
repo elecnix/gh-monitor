@@ -7,26 +7,40 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/draft"
+	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 func newDraftCommand() *cobra.Command {
+	bo := &backendOptions{}
 	cmd := &cobra.Command{
 		Use:   "draft",
 		Short: "Manage pull request draft status",
 	}
+	addPersistentBackendFlags(cmd, bo)
 
-	cmd.AddCommand(newDraftMarkCommand())
-	cmd.AddCommand(newDraftReadyCommand())
-	cmd.AddCommand(newDraftStatusCommand())
-	cmd.AddCommand(newDraftListCommand())
+	cmd.AddCommand(newDraftMarkCommand(bo))
+	cmd.AddCommand(newDraftReadyCommand(bo))
+	cmd.AddCommand(newDraftStatusCommand(bo))
+	cmd.AddCommand(newDraftListCommand(bo))
 
 	return cmd
 }
 
+// draftActorFor resolves the draft capability for a target.
+func draftActorFor(cmd *cobra.Command, bo *backendOptions, target backend.Target) (backend.DraftActor, error) {
+	reg, err := actorRegistry(cmd.Context(), bo)
+	if err != nil {
+		return nil, err
+	}
+	actor, _, err := reg.DraftFor(target)
+	return actor, err
+}
+
 // draft mark [<number>]
-func newDraftMarkCommand() *cobra.Command {
+func newDraftMarkCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
@@ -41,7 +55,7 @@ func newDraftMarkCommand() *cobra.Command {
 					opts.Selector = args[0]
 				}
 			}
-			return runDraftMark(cmd, opts)
+			return runDraftMark(cmd, bo, opts)
 		},
 	}
 
@@ -52,7 +66,7 @@ func newDraftMarkCommand() *cobra.Command {
 }
 
 // draft ready [<number>]
-func newDraftReadyCommand() *cobra.Command {
+func newDraftReadyCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
@@ -67,7 +81,7 @@ func newDraftReadyCommand() *cobra.Command {
 					opts.Selector = args[0]
 				}
 			}
-			return runDraftReady(cmd, opts)
+			return runDraftReady(cmd, bo, opts)
 		},
 	}
 
@@ -78,7 +92,7 @@ func newDraftReadyCommand() *cobra.Command {
 }
 
 // draft status [<number>]
-func newDraftStatusCommand() *cobra.Command {
+func newDraftStatusCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
@@ -93,7 +107,7 @@ func newDraftStatusCommand() *cobra.Command {
 					opts.Selector = args[0]
 				}
 			}
-			return runDraftStatus(cmd, opts)
+			return runDraftStatus(cmd, bo, opts)
 		},
 	}
 
@@ -104,7 +118,7 @@ func newDraftStatusCommand() *cobra.Command {
 }
 
 // draft list
-func newDraftListCommand() *cobra.Command {
+func newDraftListCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftListOptions{}
 
 	cmd := &cobra.Command{
@@ -112,7 +126,7 @@ func newDraftListCommand() *cobra.Command {
 		Short: "List all draft pull requests",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDraftList(cmd, opts)
+			return runDraftList(cmd, bo, opts)
 		},
 	}
 
@@ -132,15 +146,15 @@ type draftListOptions struct {
 	Repo string
 }
 
-func runDraftMark(cmd *cobra.Command, opts *draftActionOptions) error {
-	return runDraftAction(cmd, opts, true)
+func runDraftMark(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions) error {
+	return runDraftAction(cmd, bo, opts, true)
 }
 
-func runDraftReady(cmd *cobra.Command, opts *draftActionOptions) error {
-	return runDraftAction(cmd, opts, false)
+func runDraftReady(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions) error {
+	return runDraftAction(cmd, bo, opts, false)
 }
 
-func runDraftAction(cmd *cobra.Command, opts *draftActionOptions, markAsDraft bool) error {
+func runDraftAction(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions, markAsDraft bool) error {
 	var err error
 	var selector string
 
@@ -170,16 +184,12 @@ func runDraftAction(cmd *cobra.Command, opts *draftActionOptions, markAsDraft bo
 		return err
 	}
 
-	service := draft.NewService(apiClientFactory(identity.Host))
-	actionOpts := draft.ActionOptions{PRNumber: identity.Number}
-
-	var result draft.ActionResult
-	if markAsDraft {
-		result, err = service.Draft(identity, actionOpts)
-	} else {
-		result, err = service.Ready(identity, actionOpts)
+	target := monitor.TargetOf(identity)
+	actor, err := draftActorFor(cmd, bo, target)
+	if err != nil {
+		return err
 	}
-
+	result, err := actor.SetDraft(cmd.Context(), target, draft.ActionOptions{PRNumber: identity.Number}, markAsDraft)
 	if err != nil {
 		return err
 	}
@@ -187,7 +197,7 @@ func runDraftAction(cmd *cobra.Command, opts *draftActionOptions, markAsDraft bo
 	return encodeJSON(cmd, result)
 }
 
-func runDraftStatus(cmd *cobra.Command, opts *draftActionOptions) error {
+func runDraftStatus(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions) error {
 	var err error
 	var selector string
 
@@ -214,10 +224,12 @@ func runDraftStatus(cmd *cobra.Command, opts *draftActionOptions) error {
 		return err
 	}
 
-	service := draft.NewService(apiClientFactory(identity.Host))
-	statusOpts := draft.ActionOptions{PRNumber: identity.Number}
-
-	result, err := service.Status(identity, statusOpts)
+	target := monitor.TargetOf(identity)
+	actor, err := draftActorFor(cmd, bo, target)
+	if err != nil {
+		return err
+	}
+	result, err := actor.DraftStatus(cmd.Context(), target, draft.ActionOptions{PRNumber: identity.Number})
 	if err != nil {
 		return err
 	}
@@ -225,7 +237,7 @@ func runDraftStatus(cmd *cobra.Command, opts *draftActionOptions) error {
 	return encodeJSON(cmd, result)
 }
 
-func runDraftList(cmd *cobra.Command, opts *draftListOptions) error {
+func runDraftList(cmd *cobra.Command, bo *backendOptions, opts *draftListOptions) error {
 	inferRepo(&opts.Repo)
 
 	// Use a dummy selector for list operations
@@ -241,8 +253,12 @@ func runDraftList(cmd *cobra.Command, opts *draftListOptions) error {
 		return err
 	}
 
-	service := draft.NewService(apiClientFactory(identity.Host))
-	result, err := service.List(identity)
+	target := monitor.TargetOf(identity)
+	actor, err := draftActorFor(cmd, bo, target)
+	if err != nil {
+		return err
+	}
+	result, err := actor.ListDrafts(cmd.Context(), target)
 	if err != nil {
 		return err
 	}

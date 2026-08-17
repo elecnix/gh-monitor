@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 )
 
@@ -162,7 +163,7 @@ func (o *RunOptions) currentTier() QueryTier {
 // (naming exactly what is no longer being watched) or recovers. A watcher
 // that quietly sheds surfaces would turn a missing signal into an apparent
 // all-clear; this is the loud half of that rule.
-func emitTierNotice(opts RunOptions, tier QueryTier, emit func(Notification)) {
+func emitTierNotice(opts RunOptions, tier QueryTier, emit func(backend.Update)) {
 	label := degradedLabel(opts)
 	var msg string
 	if shed := tier.ShedSurfaces(); len(shed) > 0 {
@@ -172,12 +173,7 @@ func emitTierNotice(opts RunOptions, tier QueryTier, emit func(Notification)) {
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", label)
 	}
-	emit(Notification{
-		Type:      string(EventDegraded),
-		PRLabel:   label,
-		Message:   msg,
-		Timestamp: opts.now(),
-	})
+	emit(opts.notice(msg))
 }
 
 // isQueryCostError reports whether a GraphQL error is a per-query resource
@@ -197,7 +193,7 @@ func IsQueryCostError(err error) bool {
 // applyBudgetStretch consults the loop's BudgetGuard (when set), emits a loud
 // notice on transitions into/out of the low state, and returns the delay with
 // any stretch added, capped at the idle-backoff ceiling.
-func applyBudgetStretch(opts RunOptions, d time.Duration, emit func(Notification)) time.Duration {
+func applyBudgetStretch(opts RunOptions, d time.Duration, emit func(backend.Update)) time.Duration {
 	if opts.Budget == nil {
 		return d
 	}
@@ -215,7 +211,7 @@ func applyBudgetStretch(opts RunOptions, d time.Duration, emit func(Notification
 // emitBudgetNotice emits a degraded-type notification on a budget transition:
 // entering the low state says the cadence is being stretched (loud, so a
 // slow-down is never silent); leaving it says normal cadence resumes.
-func emitBudgetNotice(opts RunOptions, st BudgetState, emit func(Notification)) {
+func emitBudgetNotice(opts RunOptions, st BudgetState, emit func(backend.Update)) {
 	label := degradedLabel(opts)
 	var msg string
 	if st.Low {
@@ -225,10 +221,5 @@ func emitBudgetNotice(opts RunOptions, st BudgetState, emit func(Notification)) 
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming normal poll cadence", label)
 	}
-	emit(Notification{
-		Type:      string(EventDegraded),
-		PRLabel:   label,
-		Message:   msg,
-		Timestamp: opts.now(),
-	})
+	emit(opts.notice(msg))
 }

@@ -7,12 +7,14 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/reactions"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 func newReactCommand() *cobra.Command {
 	var reactionType string
+	bo := &backendOptions{}
 
 	cmd := &cobra.Command{
 		Use:   "react <node-id>",
@@ -38,8 +40,18 @@ Valid reaction types: ` + strings.Join(reactions.ValidReactionNames(), ", "),
 				return fmt.Errorf("--type: %w", err)
 			}
 
-			api := apiClientFactory(resolver.SanitizeHost(os.Getenv("GH_HOST")))
-			if err := reactions.React(api, nodeID, reactionType); err != nil {
+			// A reaction targets a node id directly, so the only thing the
+			// target carries is the host to reach it on.
+			target := backend.Target{Kind: backend.KindPR, Host: resolver.SanitizeHost(os.Getenv("GH_HOST"))}
+			reg, err := actorRegistry(cmd.Context(), bo)
+			if err != nil {
+				return err
+			}
+			actor, _, err := reg.ReactionsFor(target)
+			if err != nil {
+				return err
+			}
+			if err := actor.React(cmd.Context(), target, nodeID, reactionType); err != nil {
 				return err
 			}
 
@@ -53,6 +65,7 @@ Valid reaction types: ` + strings.Join(reactions.ValidReactionNames(), ", "),
 	}
 
 	cmd.Flags().StringVar(&reactionType, "type", "", "Reaction type (required): "+strings.Join(reactions.ValidReactionNames(), ", "))
+	addBackendFlags(cmd, bo)
 	_ = cmd.MarkFlagRequired("type")
 
 	return cmd

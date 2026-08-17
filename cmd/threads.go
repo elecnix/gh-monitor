@@ -7,49 +7,66 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/threads"
 )
 
 func newThreadsCommand() *cobra.Command {
+	bo := &backendOptions{}
 	cmd := &cobra.Command{
 		Use:   "threads",
 		Short: "Inspect and resolve pull request review threads",
 	}
+	addPersistentBackendFlags(cmd, bo)
 
-	cmd.AddCommand(newThreadsListCommand())
-	cmd.AddCommand(newThreadsResolveCommand())
-	cmd.AddCommand(newThreadsUnresolveCommand())
-	cmd.AddCommand(newThreadsViewCommand())
+	cmd.AddCommand(newThreadsListCommand(bo))
+	cmd.AddCommand(newThreadsResolveCommand(bo))
+	cmd.AddCommand(newThreadsUnresolveCommand(bo))
+	cmd.AddCommand(newThreadsViewCommand(bo))
 
 	return cmd
 }
 
 // threads view [<thread-id> ...]
-func newThreadsViewCommand() *cobra.Command {
+func newThreadsViewCommand(bo *backendOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "view <thread-id> [<thread-id> ...]",
 		Short: "View one or more review threads with comments",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runThreadsView(cmd, args)
+			return runThreadsView(cmd, bo, args)
 		},
 	}
 	return cmd
 }
 
-func runThreadsView(cmd *cobra.Command, threadIDs []string) error {
-	// Use the default API client (host from env or default)
-	hostEnv := os.Getenv("GH_HOST")
-	service := threads.NewService(apiClientFactory(hostEnv))
-	threadsWithComments, err := service.GetThreadsByID(threadIDs)
+func runThreadsView(cmd *cobra.Command, bo *backendOptions, threadIDs []string) error {
+	// Viewing threads by ID needs no pull request context, only a host.
+	target := backend.Target{Kind: backend.KindPR, Host: os.Getenv("GH_HOST")}
+	actor, err := threadActorFor(cmd, bo, target)
+	if err != nil {
+		return err
+	}
+	threadsWithComments, err := actor.ViewThreads(cmd.Context(), target, threadIDs)
 	if err != nil {
 		return err
 	}
 	return encodeJSON(cmd, threadsWithComments)
 }
 
-func newThreadsListCommand() *cobra.Command {
+// threadActorFor resolves the review-thread capability for a target.
+func threadActorFor(cmd *cobra.Command, bo *backendOptions, target backend.Target) (backend.ThreadActor, error) {
+	reg, err := actorRegistry(cmd.Context(), bo)
+	if err != nil {
+		return nil, err
+	}
+	actor, _, err := reg.ThreadsFor(target)
+	return actor, err
+}
+
+func newThreadsListCommand(bo *backendOptions) *cobra.Command {
 	opts := &threadsListOptions{}
 
 	cmd := &cobra.Command{
@@ -60,7 +77,7 @@ func newThreadsListCommand() *cobra.Command {
 			if len(args) > 0 {
 				opts.Selector = args[0]
 			}
-			return runThreadsList(cmd, opts)
+			return runThreadsList(cmd, bo, opts)
 		},
 	}
 
@@ -80,7 +97,7 @@ type threadsListOptions struct {
 	MineOnly       bool
 }
 
-func runThreadsList(cmd *cobra.Command, opts *threadsListOptions) error {
+func runThreadsList(cmd *cobra.Command, bo *backendOptions, opts *threadsListOptions) error {
 	inferPR(opts.Selector, &opts.Pull)
 	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
 	if err != nil {
@@ -94,8 +111,12 @@ func runThreadsList(cmd *cobra.Command, opts *threadsListOptions) error {
 		return err
 	}
 
-	service := threads.NewService(apiClientFactory(identity.Host))
-	payload, err := service.List(identity, threads.ListOptions{
+	target := monitor.TargetOf(identity)
+	actor, err := threadActorFor(cmd, bo, target)
+	if err != nil {
+		return err
+	}
+	payload, err := actor.ListThreads(cmd.Context(), target, threads.ListOptions{
 		OnlyUnresolved: opts.UnresolvedOnly,
 		MineOnly:       opts.MineOnly,
 	})
@@ -106,15 +127,15 @@ func runThreadsList(cmd *cobra.Command, opts *threadsListOptions) error {
 	return encodeJSON(cmd, payload)
 }
 
-func newThreadsResolveCommand() *cobra.Command {
-	return newThreadsMutationCommand(true)
+func newThreadsResolveCommand(bo *backendOptions) *cobra.Command {
+	return newThreadsMutationCommand(bo, true)
 }
 
-func newThreadsUnresolveCommand() *cobra.Command {
-	return newThreadsMutationCommand(false)
+func newThreadsUnresolveCommand(bo *backendOptions) *cobra.Command {
+	return newThreadsMutationCommand(bo, false)
 }
 
-func newThreadsMutationCommand(resolve bool) *cobra.Command {
+func newThreadsMutationCommand(bo *backendOptions, resolve bool) *cobra.Command {
 	opts := &threadsMutationOptions{}
 
 	use := "resolve"
@@ -136,9 +157,9 @@ func newThreadsMutationCommand(resolve bool) *cobra.Command {
 				return err
 			}
 			if resolve {
-				return runThreadsResolve(cmd, opts)
+				return runThreadsResolve(cmd, bo, opts)
 			}
-			return runThreadsUnresolve(cmd, opts)
+			return runThreadsUnresolve(cmd, bo, opts)
 		},
 	}
 
@@ -163,15 +184,15 @@ func (o *threadsMutationOptions) Validate() error {
 	return nil
 }
 
-func runThreadsResolve(cmd *cobra.Command, opts *threadsMutationOptions) error {
-	return runThreadsMutation(cmd, opts, true)
+func runThreadsResolve(cmd *cobra.Command, bo *backendOptions, opts *threadsMutationOptions) error {
+	return runThreadsMutation(cmd, bo, opts, true)
 }
 
-func runThreadsUnresolve(cmd *cobra.Command, opts *threadsMutationOptions) error {
-	return runThreadsMutation(cmd, opts, false)
+func runThreadsUnresolve(cmd *cobra.Command, bo *backendOptions, opts *threadsMutationOptions) error {
+	return runThreadsMutation(cmd, bo, opts, false)
 }
 
-func runThreadsMutation(cmd *cobra.Command, opts *threadsMutationOptions, resolve bool) error {
+func runThreadsMutation(cmd *cobra.Command, bo *backendOptions, opts *threadsMutationOptions, resolve bool) error {
 	inferPR(opts.Selector, &opts.Pull)
 	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
 	if err != nil {
@@ -185,14 +206,18 @@ func runThreadsMutation(cmd *cobra.Command, opts *threadsMutationOptions, resolv
 		return err
 	}
 
-	service := threads.NewService(apiClientFactory(identity.Host))
+	target := monitor.TargetOf(identity)
+	actor, err := threadActorFor(cmd, bo, target)
+	if err != nil {
+		return err
+	}
 	action := threads.ActionOptions{ThreadID: strings.TrimSpace(opts.ThreadID)}
 
 	var result threads.ActionResult
 	if resolve {
-		result, err = service.Resolve(identity, action)
+		result, err = actor.ResolveThread(cmd.Context(), target, action)
 	} else {
-		result, err = service.Unresolve(identity, action)
+		result, err = actor.UnresolveThread(cmd.Context(), target, action)
 	}
 	if err != nil {
 		return err
