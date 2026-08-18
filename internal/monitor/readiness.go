@@ -45,7 +45,7 @@ const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: 
                   app { name slug }
                   checkRuns(last: 10) {
                     totalCount
-                    nodes { name conclusion status }
+                    nodes { name conclusion status startedAt completedAt }
                   }
                 }
               }

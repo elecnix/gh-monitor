@@ -1048,6 +1048,51 @@ func TestSnapshot_RulesetError(t *testing.T) {
 	})
 }
 
+func TestSnapshot_CancelledBesideSuccessIsNotFailing(t *testing.T) {
+	// Measured 2026-08-18 on a live PR: every name carrying a cancelled or skipped run
+	// ALSO carried a successful one, and the event reported them all as FAILING. The
+	// classification must be PER NAME ACROSS ALL RUNS, and the NON-VERDICT row here is
+	// the NEWER one (00:18:22 vs 00:18:01) — ordering by time alone would yield
+	// "cancelled", which is not the answer either. The full rule: a non-verdict never
+	// overrides a verdict, whichever is newer.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "terraform-test"}},
+	)
+	pr.Commits.Nodes[0].Commit.CheckSuites.Nodes[0].CheckRuns = RunNodes{Nodes: []CheckRun{
+		{Name: "terraform-test", Status: "COMPLETED", Conclusion: "SUCCESS",
+			StartedAt: "2026-08-18T00:18:01Z", CompletedAt: "2026-08-18T00:18:01Z"},
+		{Name: "terraform-test", Status: "COMPLETED", Conclusion: "CANCELLED",
+			StartedAt: "2026-08-18T00:18:22Z", CompletedAt: "2026-08-18T00:18:22Z"},
+	}}
+	s := Snapshot(pr, SnapshotOptions{
+		RulesetChecks: &RulesetChecks{Contexts: []string{"terraform-test"}},
+	})
+	assert.NotContains(t, s.FailingChecks, "terraform-test", "a newer cancelled beside a success is NOT a failure")
+	assert.Contains(t, s.SuccessfulChecks, "terraform-test")
+	assert.False(t, s.Conflict)
+	assert.NotEmpty(t, s.SuccessfulChecks, "the success must still be counted as positive evidence")
+}
+
+func TestSnapshot_LatestVerdictWinsAmongVerdicts(t *testing.T) {
+	// The second half of the rule, learned the hard way on a live PR: the `review`
+	// check had TWO conclusive runs on one head — success at 02:45, FAILURE at 02:47
+	// (the re-run after the reviewer posted its findings). "Any success wins" is the
+	// mirror of the laundered-red trap: it launders a red with an earlier green.
+	pr := mkPRWithCheckSuites(CheckSuite{Status: "COMPLETED", App: AppInfo{Name: "review"}})
+	pr.Commits.Nodes[0].Commit.CheckSuites.Nodes[0].CheckRuns = RunNodes{Nodes: []CheckRun{
+		{Name: "review", Status: "COMPLETED", Conclusion: "SUCCESS",
+			StartedAt: "2026-08-18T02:45:20Z", CompletedAt: "2026-08-18T02:45:29Z"},
+		{Name: "review", Status: "COMPLETED", Conclusion: "FAILURE",
+			StartedAt: "2026-08-18T02:47:26Z", CompletedAt: "2026-08-18T02:47:36Z"},
+	}}
+	s := Snapshot(pr, SnapshotOptions{
+		RulesetChecks: &RulesetChecks{Contexts: []string{"review"}},
+	})
+	assert.Contains(t, s.FailingChecks, "review", "among VERDICTS the latest wins — the re-run failure is the verdict")
+	assert.NotContains(t, s.SuccessfulChecks, "review")
+	assert.False(t, ciAllGreen(s), "a PR with a failing verdict is not green")
+}
+
 func TestSnapshot_CancelledRequiredCheckIsFailure(t *testing.T) {
 	// CANCELLED on a check that ran does not count as a pass. It is already in
 	// failureConclusions, which failingChecks catches. This test proves the

@@ -294,6 +294,8 @@ type CheckRun struct {
 	Name        string          `json:"name"`
 	Conclusion  string          `json:"conclusion"`
 	Status      string          `json:"status"`
+	StartedAt   string          `json:"startedAt"`
+	CompletedAt string          `json:"completedAt"`
 	DetailsURL  string          `json:"detailsUrl"`
 	Permalink   string          `json:"permalink"`
 	Annotations AnnotationNodes `json:"annotations"`
@@ -848,6 +850,55 @@ var failureConclusions = map[string]bool{
 	"FAILURE": true, "ERROR": true, "TIMED_OUT": true, "CANCELLED": true, "ACTION_REQUIRED": true,
 }
 
+// nonVerdictConclusions are terminal conclusions that are NOT results: the run was
+// superseded or deliberately not executed, so it never overrides a verdict, whichever
+// is newer. Measured 2026-08-18: a name carrying a cancelled run beside a successful
+// one was reported as FAILING — the cancelled row was classified per-run instead of
+// per name. The mirror trap (a newer skipped hiding an older failure) is the fleet's
+// laundered-red case. One rule covers both signs: a non-verdict never overrides a
+// verdict, in either direction.
+var nonVerdictConclusions = map[string]bool{
+	"SKIPPED": true, "CANCELLED": true, "STALE": true,
+}
+
+// runVerdict selects the newest VERDICT among a name's runs. A non-verdict
+// (skipped/cancelled/stale) never overrides a verdict, whichever is newer; AMONG
+// VERDICTS the latest wins, so a re-review that found a defect is the real verdict,
+// not the earlier green. A run lacking a parseable completion time sorts oldest (it
+// cannot prove it is newer), and document order breaks ties.
+func runVerdict(runs []CheckRun) (CheckRun, bool) {
+	var best CheckRun
+	found := false
+	var bestT time.Time
+	for i := range runs {
+		r := &runs[i]
+		if r.Status != "COMPLETED" || nonVerdictConclusions[r.Conclusion] {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, r.CompletedAt)
+		if err != nil {
+			t = time.Time{}   // unparseable cannot prove it is newer
+		}
+		if !found || t.After(bestT) {
+			best = *r
+			bestT = t
+			found = true
+		}
+	}
+	return best, found
+}
+
+// isFailureVerdict reports whether a VERDICT conclusion is a failure. CANCELLED is
+// deliberately absent: it is a non-verdict (superseded attempt), used only as a
+// fallback when the name has no verdict at all.
+func isFailureVerdict(c string) bool {
+	switch c {
+	case "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+		return true
+	}
+	return false
+}
+
 // successConclusions are the terminal conclusions that count as "this check
 // passed" — SKIPPED and NEUTRAL are not failures and nothing more will happen
 // to them, so they settle the check just as SUCCESS does.
@@ -961,6 +1012,10 @@ func failingChecks(pr *PullRequest) []string {
 			out = append(out, name)
 		}
 	}
+	// Per-name across ALL suites on the head: a cancelled run beside a successful one
+	// for the same name is a superseded attempt, not a verdict. Classification is per
+	// NAME across all runs, never per run (measured 2026-08-18).
+	byName := map[string][]CheckRun{}
 	for i := range pr.Commits.Nodes {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
@@ -969,12 +1024,12 @@ func failingChecks(pr *PullRequest) []string {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
-				if isFailureConclusion(run.Conclusion) {
-					name := run.Name
-					if name == "" {
-						name = suiteName(suite)
-					}
-					add(name)
+				name := run.Name
+				if name == "" {
+					name = suiteName(suite)
+				}
+				if name != "" {
+					byName[name] = append(byName[name], run)
 				}
 			}
 		}
@@ -983,6 +1038,22 @@ func failingChecks(pr *PullRequest) []string {
 				if failureCommitStates[ctx.State] {
 					add(ctx.Context)
 				}
+			}
+		}
+	}
+	for name, runs := range byName {
+		if v, ok := runVerdict(runs); ok {
+			if isFailureVerdict(v.Conclusion) {
+				add(name)
+			}
+			continue
+		}
+		// No verdict at all: fall back to any failure-shaped conclusion (a cancelled
+		// suite that ran and was the only record still reads red, never green).
+		for _, r := range runs {
+			if isFailureConclusion(r.Conclusion) {
+				add(name)
+				break
 			}
 		}
 	}
@@ -1004,6 +1075,9 @@ func successfulChecks(pr *PullRequest) []string {
 			out = append(out, name)
 		}
 	}
+	// Same per-name rule as failingChecks: the latest VERDICT decides. A name whose
+	// latest verdict is a failure is NOT successful even if an earlier run passed.
+	byName := map[string][]CheckRun{}
 	for i := range pr.Commits.Nodes {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
@@ -1012,12 +1086,12 @@ func successfulChecks(pr *PullRequest) []string {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
-				if isSuccessConclusion(run.Conclusion) {
-					name := run.Name
-					if name == "" {
-						name = suiteName(suite)
-					}
-					add(name)
+				name := run.Name
+				if name == "" {
+					name = suiteName(suite)
+				}
+				if name != "" {
+					byName[name] = append(byName[name], run)
 				}
 			}
 		}
@@ -1026,6 +1100,20 @@ func successfulChecks(pr *PullRequest) []string {
 				if successCommitStates[ctx.State] {
 					add(ctx.Context)
 				}
+			}
+		}
+	}
+	for name, runs := range byName {
+		if v, ok := runVerdict(runs); ok {
+			if isSuccessConclusion(v.Conclusion) {
+				add(name)
+			}
+			continue
+		}
+		for _, r := range runs {
+			if isSuccessConclusion(r.Conclusion) {
+				add(name)
+				break
 			}
 		}
 	}
