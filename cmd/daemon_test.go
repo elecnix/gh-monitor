@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
+	"github.com/elecnix/gh-monitor/internal/subdaemon"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -365,4 +367,60 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 	_, name, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
 	assert.Equal(t, gh.Name, name)
+}
+
+// TestDaemon_SubdaemonMode_SkipsPolling verifies that when a sub-daemon config
+// file lists at least one entry, runDaemon enters sub-daemon mode and does NOT
+// bind the polling socket — the sub-daemons own it. It overrides the launcher
+// to a fake whose child exits as a not-found start, so the supervisor gives up
+// immediately and runDaemon returns without binding anything.
+func TestDaemon_SubdaemonMode_SkipsPolling(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemons.conf")
+	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
+	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
+	// A socket path that, if polling mode ran, would be bound by ipc.Listen.
+	// Use a never-created path so that if runDaemon incorrectly binds it, the
+	// test can detect the leftover file.
+	sock := filepath.Join(dir, "polling.sock")
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	orig := subdaemonLauncherFn
+	t.Cleanup(func() { subdaemonLauncherFn = orig })
+	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
+		// Instant, no-real-process launcher: every entry's binary is missing,
+		// so superviseOne logs once and returns without spawning anything.
+		return &subdaemon.Launcher{
+			Entries:       entries,
+			Out:           out,
+			MinBackoff:    time.Millisecond,
+			MaxBackoff:    time.Millisecond,
+			MaxRapidFails: 1,
+			Sleep:         func(time.Duration) {},
+		}
+	}
+
+	cmd := newDaemonCommand()
+	cmd.SetArgs([]string{"--socket", sock, "--interval", "10"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+
+	// The polling socket must NOT have been bound in sub-daemon mode.
+	_, statErr := os.Stat(sock)
+	assert.True(t, os.IsNotExist(statErr),
+		"sub-daemon mode must not bind the polling socket; stat err=%v", statErr)
+}
+
+// TestDaemon_NoConfigFallsBackToPolling verifies that with no sub-daemon config
+// file, the daemon's sub-daemon loader is a no-op and the polling path is
+// unchanged. This is a guard against a regression that reads the config even
+// when the file is absent and accidentally enters sub-daemon mode.
+func TestDaemon_NoConfigFallsBackToPolling(t *testing.T) {
+	// Point the config path at a path that does not exist.
+	t.Setenv("GH_MONITOR_SUBDAEMONS", filepath.Join(t.TempDir(), "absent.conf"))
+
+	loaded, ok, err := subdaemon.Load(subdaemon.DefaultConfigPath())
+	require.NoError(t, err)
+	assert.False(t, ok, "absent config must read as not-configured, not an error")
+	assert.Empty(t, loaded)
 }
