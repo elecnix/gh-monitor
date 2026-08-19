@@ -22,7 +22,9 @@ func newRootCommand() *cobra.Command {
 		Long:          "Default command: continuously watch a pull request, emitting one event per genuinely-new change.\n\nWith --repo alone, watches the entire repository for new PRs and issues.\n\nRun 'gh monitor --help' for subcommands.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Args:          cobra.MaximumNArgs(1),
+		// Setting Version is what wires up --version (and -v, which is free).
+		Version: versionString(readBuildDetails()),
+		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
 				monitorOpts.Selector = args[0]
@@ -31,8 +33,13 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
+	// Cobra's default template prefixes the command name and the word
+	// "version"; the string is already self-describing.
+	cmd.SetVersionTemplate("{{.Version}}\n")
+
 	addMonitorFlags(cmd, monitorOpts)
 
+	cmd.AddCommand(newVersionCommand())
 	cmd.AddCommand(newCommentsCommand())
 	cmd.AddCommand(newDraftCommand())
 	cmd.AddCommand(newReviewCommand())

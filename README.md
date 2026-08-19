@@ -72,6 +72,7 @@ npx skills add elecnix/gh-monitor
 | `instances list`                | List all named instance cursors                                            |
 | `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                  |
 | `backends`                      | List the monitoring backends and the target kinds they cover               |
+| `version` / `--version`         | Print the running binary's version, VCS revision, and build time           |
 
 ### Filters
 
@@ -439,6 +440,27 @@ gh monitor prefs path
 ```
 
 The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+
+### Checking which build is running
+
+After an upgrade, ask the binary itself:
+
+```sh
+gh monitor --version
+gh monitor version      # same output
+```
+
+```
+gh monitor v1.17.0 (55d9154, 2026-08-11T15:24:54Z, go1.22.12)
+```
+
+`gh extension list` reports the install **manifest** instead. That is whatever the installer wrote there; it is not derived from the executable and does not change if the executable is replaced by a local build, a partially-applied upgrade, or a manual copy. `--version` reads the running binary's own stamp, so it is the one that answers "did my upgrade actually land?".
+
+Reading the output:
+
+- The version is stamped at release time. A locally built binary prints `(devel)` rather than a tag.
+- The revision is the short commit the binary was built from, suffixed `-dirty` when the working tree was not clean.
+- `unknown revision` means the build stripped its VCS metadata — `go build -buildvcs=false`, which is what a build inside a linked worktree needs.
 
 ### Additional Flags
 
