@@ -364,6 +364,37 @@ Concurrent auto-starts are race-safe: at most one daemon binds a socket (a secon
 
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (so a client falls back to in-process polling when no daemon is running instead of spawning one). `--once` and non-PR targets always use the in-process loop.
 
+#### Broker transport (optional)
+
+The daemon can subscribe to an external GitHub-webhook fan-out broker (AWS IoT Core MQTT, or any broker publishing the same normalized event envelope) and treat each event as a wake signal that triggers an immediate fetch, instead of waiting for the next tick. It is entirely opt-in and additive: no `monitor` client, skill, or workflow changes — the daemon still fetches ground truth through the exact same GraphQL/REST path either way; a broker event only ever decides _when_ that fetch runs, never what it returns. A watcher never derives PR or CI state from the event stream itself, because that stream can drop messages across a long disconnect with no reliable replay.
+
+Enable it by setting the endpoint before starting the daemon:
+
+```sh
+export GH_MONITOR_BROKER_ENDPOINT=your-iot-endpoint.iot.us-east-1.amazonaws.com
+export GH_MONITOR_BROKER_TOPIC=github/+/+/+       # default; narrow to your org/repo if your broker's IAM policy is scoped
+export GH_MONITOR_BROKER_REGION=us-east-1         # default
+export GH_MONITOR_BROKER_IDLE_CAP=1800            # seconds; default 1800 (30m)
+
+gh monitor daemon
+```
+
+The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an assumed role, etc.) via SigV4-presigned WebSocket credentials — nothing broker-specific to configure beyond the four variables above. The event envelope this transport expects:
+
+```json
+{
+  "source": "github",
+  "repository_owner": "my-org",
+  "repository_name": "my-repo",
+  "event_type": "pull_request",
+  "pr_number": 42
+}
+```
+
+**Health is loud, on purpose.** While the broker is connected, a quiet PR's idle-poll ceiling stretches from the default 300s up to `GH_MONITOR_BROKER_IDLE_CAP` — polling becomes a rare safety net because a real change now arrives as an immediate wake. The moment the connection drops, every subscriber gets a `degraded`-type notification and the ceiling reverts to the default within one poll cycle — normal interval polling, not silence. A subscriber that only ever reads "no event arrived" as "nothing changed" would be trading tonight's failure mode for a new transport instead of fixing it, so this transport is built to make that impossible: it always keeps polling underneath, just less often when the broker is doing its job.
+
+An event that names a repository but no `pr_number` (check-run/check-suite events, which key off a commit SHA rather than a PR) wakes every PR this daemon is currently watching for that repository, rather than guessing which one changed.
+
 ### Managing preferences
 
 `gh monitor prefs` views and edits the notification templates and config stored in `~/.config/gh-monitor/preferences.json` (the legacy `~/.config/gh-pr-monitor/preferences.json` is read as a fallback). Editing via `prefs` always writes to the canonical path, so it migrates a legacy config on first use.
