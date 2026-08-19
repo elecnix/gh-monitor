@@ -87,19 +87,20 @@ Flags: `--interval` (default 60s, min 10), `--timeout` (default 0 = forever), `-
 
 **Event types:**
 
-| Type                       | Description             |
-| -------------------------- | ----------------------- |
-| `new-unresolved-threads`   | New review threads      |
-| `new-general-comments`     | New general PR comments |
-| `new-failing-checks`       | Newly failing CI        |
-| `ci-all-green`             | All CI passing          |
-| `conflict`                 | Merge conflicts         |
-| `review-approved`          | PR approved             |
-| `review-changes-requested` | Changes requested       |
-| `review-dismissed`         | Review dismissed        |
-| `new-commit`               | New commit pushed       |
-| `merged`                   | PR merged               |
-| `closed`                   | PR closed               |
+| Type                       | Description                                                               |
+| -------------------------- | ------------------------------------------------------------------------- |
+| `new-unresolved-threads`   | New review threads                                                        |
+| `new-general-comments`     | New general PR comments                                                   |
+| `new-failing-checks`       | Newly failing CI                                                          |
+| `ci-all-green`             | All CI passing                                                            |
+| `conflict`                 | Merge conflicts                                                           |
+| `review-approved`          | PR approved                                                               |
+| `review-changes-requested` | Changes requested                                                         |
+| `review-dismissed`         | Review dismissed                                                          |
+| `new-commit`               | New commit pushed                                                         |
+| `merged`                   | PR merged                                                                 |
+| `closed`                   | PR closed                                                                 |
+| `degraded`                 | API surface unreadable (one per episode: degrade, error change, recovery) |
 
 **Claude Code integration:** Wrap in a persistent `Monitor` tool — each NDJSON line becomes a session notification:
 
