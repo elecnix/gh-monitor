@@ -95,6 +95,20 @@ func TestEventFilter_RejectsUnknownKind(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestEventFilter_DegradedIsARecognisedKind confirms degraded is a first-class
+// notification kind (issue #66): it parses, it can be allowlisted, and it is
+// rejected like any other typo-adjacent spelling.
+func TestEventFilter_DegradedIsARecognisedKind(t *testing.T) {
+	f, err := ParseEventFilter("degraded")
+	require.NoError(t, err, "--events degraded must be accepted")
+	assert.True(t, f.Allows("degraded"))
+	assert.False(t, f.Allows("merged"))
+
+	f, err = ParseEventFilter("merged,DEGRADED")
+	require.NoError(t, err)
+	assert.True(t, f.Allows("degraded"), "matching is case-insensitive")
+}
+
 // TestEventFilter_EmptyInputSuppressesAll confirms an empty input string to
 // ParseEventFilter yields a non-nil filter that suppresses everything (the
 // "mute all" case), distinct from a nil EventFilter (emit everything).

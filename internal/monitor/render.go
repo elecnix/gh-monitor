@@ -76,11 +76,22 @@ func Render(u backend.Update, p prefs.Preferences, interval time.Duration) Notif
 	}
 	if u.Event.Type == EventDegraded {
 		label := degradedLabel(opts)
+		// degraded is a first-class kind: like every other kind it has a
+		// prefs template, so a consumer can reword or mute it. Callers that
+		// render with zero Prefs get the built-in sentence.
+		msg := prefs.Interpolate(p.Templates[string(EventDegraded)], map[string]string{
+			"prLabel":         label,
+			"degradedSurface": u.Event.DegradedSurface,
+			"degradedMessage": u.Event.DegradedMessage,
+		})
+		if msg == "" {
+			msg = fmt.Sprintf("⚠️ API degraded (%s) on %s: %s",
+				u.Event.DegradedSurface, label, u.Event.DegradedMessage)
+		}
 		return Notification{
-			Type:    string(EventDegraded),
-			PRLabel: label,
-			Message: fmt.Sprintf("⚠️ API degraded (%s) on %s: %s",
-				u.Event.DegradedSurface, label, u.Event.DegradedMessage),
+			Type:      string(EventDegraded),
+			PRLabel:   label,
+			Message:   msg,
 			Timestamp: u.At,
 		}
 	}
