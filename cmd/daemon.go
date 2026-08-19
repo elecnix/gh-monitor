@@ -23,6 +23,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
+	"github.com/elecnix/gh-monitor/internal/subdaemon"
 )
 
 // DaemonBackendName is the name the daemon announces itself under, and the
@@ -83,6 +84,20 @@ normal interval polling within one cycle, never silence. See the README's
 }
 
 func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error {
+	// Sub-daemon mode: if the operator has configured sub-daemons, the daemon
+	// launches and supervises them instead of running the polling hub. The
+	// sub-daemons are expected to bind the socket themselves (they are
+	// backends that speak the backend/remote protocol) — so in this mode the
+	// daemon does not bind it, avoiding contention. With no config file, the
+	// daemon works exactly as it does today (pure polling).
+	entries, cfgOK, subErr := subdaemon.Load(subdaemon.DefaultConfigPath())
+	if subErr != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon config: %v\n", subErr)
+	}
+	if cfgOK && len(entries) > 0 {
+		return runSubdaemonMode(cmd, entries)
+	}
+
 	listener, err := ipc.Listen(socket)
 	if err != nil {
 		return err
@@ -162,6 +177,37 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+// subdaemonLauncherFn builds the launcher runSubdaemonMode runs. It is a
+// package variable so tests can substitute a launcher that does not spawn
+// real processes.
+var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
+	return &subdaemon.Launcher{Entries: entries, Out: out}
+}
+
+// runSubdaemonMode launches and supervises the configured sub-daemons and
+// nothing else — it does not bind the polling socket, so the sub-daemons own
+// it. On SIGTERM/SIGINT it signals every child and returns.
+func runSubdaemonMode(cmd *cobra.Command, entries []subdaemon.Entry) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+		"gh-monitor daemon: sub-daemon mode — launching %d sub-daemon(s) (polling hub off; sub-daemons own the socket)\n",
+		len(entries))
+	return subdaemonLauncherFn(entries, cmd.ErrOrStderr()).Run(ctx)
 }
 
 // hubSource adapts the shared poller to backend.Source, so the daemon serves

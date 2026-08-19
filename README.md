@@ -395,6 +395,26 @@ The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an a
 
 An event that names a repository but no `pr_number` (check-run/check-suite events, which key off a commit SHA rather than a PR) wakes every PR this daemon is currently watching for that repository, rather than guessing which one changed.
 
+#### Sub-daemons (optional)
+
+The daemon can launch and supervise **sub-daemon** processes configured by the operator. Each sub-daemon is a separate process — typically a backend that speaks the `backend/remote` protocol and binds `$GH_MONITOR_SOCK` itself — that the daemon keeps alive with exponential backoff (reset after a stable run). The launcher is generic: it reads a list and launches processes. It does not know what a sub-daemon does or which protocol it speaks, so a proprietary backend can be started from this public repo without carrying any proprietary code.
+
+Configure it with a line-delimited file, one sub-daemon per line (`<name> <executable> [args...]`, `#` comments and blank lines ignored, double-quoted fields may contain spaces):
+
+```sh
+# ~/.config/gh-monitor/daemons.conf
+# Each line: <name> <executable> [args...]
+broker-subscriber /usr/local/bin/broker-subscriber daemon --repo my-org/my-repo
+```
+
+The config path is `$GH_MONITOR_SUBDAEMONS`, otherwise `<user config dir>/gh-monitor/daemons.conf`. When the file exists and lists at least one entry, the daemon enters **sub-daemon mode**: it launches the configured sub-daemons and does **not** run the polling hub, so the sub-daemons own the socket without contention. When the file is absent or empty, the daemon works exactly as it does today (pure polling) — the polling path is the fallback for machines with no sub-daemon config. A sub-daemon that fails to start (binary not found) is logged once and not retried; one that crashes restarts with backoff, and after repeated rapid crashes the launcher gives up on that entry and continues with the rest.
+
+```sh
+# Override the config path
+export GH_MONITOR_SUBDAEMONS=/etc/gh-monitor/daemons.conf
+gh monitor daemon
+```
+
 ### Managing preferences
 
 `gh monitor prefs` views and edits the notification templates and config stored in `~/.config/gh-monitor/preferences.json` (the legacy `~/.config/gh-pr-monitor/preferences.json` is read as a fallback). Editing via `prefs` always writes to the canonical path, so it migrates a legacy config on first use.
