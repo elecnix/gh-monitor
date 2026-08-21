@@ -1,0 +1,46 @@
+# PR body format check (https://github.com/elecnix/gh-pr-body-action).
+#
+# Flags a pull-request description that will render badly on GitHub: prose
+# hard-wrapped mid-sentence, list items broken onto a second line, collapsed
+# tables, and mermaid diagrams the mermaid parser rejects.
+#
+# Deliberately advisory: wire it as checked but NOT required in branch
+# protection, so the check goes red without blocking the merge.
+
+name: pr-body-format
+
+on:
+  pull_request:
+    branches:
+      - main
+    # `edited` re-runs the check once the author fixes the body — without it
+    # the original red result stands.
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-body-format:
+    runs-on: arc-runners
+    steps:
+      # The arc-runners image is minimal: no gh, no wget. Both checkers of
+      # gh-pr-body-action shell out to `gh`, so install it first (apt route,
+      # per https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
+      # curl replaces wget; every command runs under pipefail so a failed
+      # download cannot leave an empty keyring behind.
+      - name: Install gh CLI
+        run: |
+          set -euo pipefail
+          SUDO=""
+          [ "$(id -u)" != 0 ] && SUDO="sudo"
+          $SUDO install -d -m 755 /etc/apt/keyrings
+          $SUDO curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+            https://cli.github.com/packages/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | $SUDO tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          $SUDO apt-get update
+          $SUDO apt-get install -y gh
+      # No actions/checkout needed — the action reads the body via the API.
+      - uses: elecnix/gh-pr-body-action@v1
