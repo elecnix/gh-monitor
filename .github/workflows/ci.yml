@@ -61,3 +61,7 @@ jobs:
           # The merge-base has to be reachable for the delta scan.
           fetch-depth: 0
       - uses: elecnix/dupdelta@v0.1.0
+        with:
+          # actions/checkout does not create a local branch for the base, so
+          # compare against the remote-tracking ref fetched by fetch-depth: 0.
+          base: origin/main
