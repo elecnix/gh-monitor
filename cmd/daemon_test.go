@@ -570,3 +570,37 @@ func TestMonitor_ReexecSkippedForOnce(t *testing.T) {
 	_ = root.Execute()
 	assert.Equal(t, 0, calls, "--once must not relaunch from a runtime copy")
 }
+
+// TestDaemon_NeverShutsDownOnIdle is the explicit guarantee issue #69 asks
+// for: once started, the daemon has no idle timeout — it keeps serving with
+// zero attached clients, so a fleet of short-lived watchers never has to
+// re-bootstrap it. The test leaves the daemon completely idle for a window,
+// then attaches a client as if it were a brand-new watcher and expects to be
+// served immediately.
+func TestDaemon_NeverShutsDownOnIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, fetches := startTestDaemon(t, ctx, openPR)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	// Idle window: no client attaches. If the daemon had an idle timeout —
+	// even one much longer than this wait — the design would be broken; the
+	// point is that nothing in the accept loop or hub teardown references
+	// connected-client count.
+	time.Sleep(150 * time.Millisecond)
+	assert.Equal(t, int64(0), atomic.LoadInt64(fetches), "an idle daemon must not poll GitHub")
+
+	reg := backend.NewRegistry()
+	unusedBuiltin(reg)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+
+	source, name, err := reg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	require.Equal(t, DaemonBackendName, name, "the daemon must still be listening after idling")
+
+	ch, err := source.Watch(ctx, daemonTarget(), backend.WatchOptions{Interval: time.Minute})
+	require.NoError(t, err)
+	assert.Contains(t, collectUntil(t, ch, backend.EventFirstPoll), "first-poll",
+		"a client attaching after an idle window must be served immediately")
+}

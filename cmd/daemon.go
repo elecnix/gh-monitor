@@ -59,13 +59,21 @@ func newDaemonCommand() *cobra.Command {
 Client ` + "`gh monitor`" + ` processes detect the daemon via its Unix socket and stream
 notifications from the shared poller instead of each polling GitHub. The
 shared poller multiplexes every target kind — pull requests, refs, commits,
-issues, workflow runs, and whole repositories. Watch mode requires it: if no
+issues, workflow runs, and whole repositories. Watching requires it: if no
 daemon can be attached, the client fails with an error rather than polling
-in-process. Watching requires the daemon: if none can be attached, the client
-fails with an error rather than polling in-process.
+in-process.
+
+The daemon is persistent once started: it has no idle timeout and never exits
+for lack of attached clients — a fleet of short-lived watchers never has to
+re-bootstrap it. It serves until SIGTERM/SIGINT, or until a successor daemon
+completes an upgrade handoff.
 
 The daemon honours $GH_MONITOR_SOCK, $XDG_RUNTIME_DIR, and a per-user cache
 dir for the socket path. Send SIGTERM/SIGINT to stop it cleanly.
+
+Set $GH_MONITOR_SELFUPDATE=1 (or a duration, e.g. 30m) to have the daemon run
+"gh extension upgrade gh-monitor" on a cadence and hand off to the new binary
+when one lands.
 
 Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
 broker: matching events wake the affected PR's fetch immediately instead of
@@ -171,9 +179,16 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		}
 	}()
 
+	// The daemon is persistent once started (issue #69): it has no idle
+	// timeout and never exits for lack of attached clients. Auto-start (the
+	// first client bootstraps it) only works if the daemon outlives that
+	// client — a fleet of short-lived watchers must not bootstrap a fresh
+	// daemon on every invocation. It serves until SIGTERM/SIGINT, or until a
+	// successor daemon completes an upgrade handoff.
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s)\n", socket, interval)
 	startBrokerTransport(ctx, cmd, h)
 	startUpgradeWatcher(ctx, cmd, socket, interval)
+	startSelfUpdate(ctx, cmd)
 
 	srv := &daemonServer{
 		hub:       h,

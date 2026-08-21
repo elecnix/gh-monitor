@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elecnix/gh-monitor/internal/reexec"
@@ -97,6 +98,89 @@ func watchInstalledBinary(ctx context.Context, installed, socket string, interva
 // buildUpgradeCommand assembles the successor daemon's invocation.
 func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec.Cmd {
 	return exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+}
+
+// ---------------------------------------------------------------------------
+// Self-update (issue #69): the daemon pulls new releases itself
+// ---------------------------------------------------------------------------
+
+// selfUpdateEnv controls whether a resident daemon checks for new releases of
+// gh-monitor and upgrades the installed binary itself. Unset or "0" disables
+// it; "1" or "true" uses selfUpdateDefaultInterval; any Go duration ("30m",
+// "2h") sets the cadence. Off by default: auto-upgrading a CLI under the
+// operator's feet is an explicit choice, not a default.
+const selfUpdateEnv = "GH_MONITOR_SELFUPDATE"
+
+// selfUpdateDefaultInterval is the release-check cadence when self-update is
+// enabled without an explicit duration. The issue asks for roughly hourly —
+// slow enough to be invisible, fast enough that agents never run long against
+// a stale binary.
+var selfUpdateDefaultInterval = time.Hour
+
+// extensionUpgradeFn runs `gh extension upgrade` for this extension. Package
+// variable so tests observe the call instead of shelling out. An upgrade
+// that finds nothing newer succeeds quietly; one that lands rewrites the
+// installed binary in place — which is exactly what the stat watcher above
+// is waiting to notice, closing the loop: check → upgrade → handoff.
+var extensionUpgradeFn = func() error {
+	out, err := exec.Command("gh", "extension", "upgrade", "gh-monitor").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("gh extension upgrade gh-monitor: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// selfUpdateIntervalFromEnv parses GH_MONITOR_SELFUPDATE. Zero means off.
+func selfUpdateIntervalFromEnv() time.Duration {
+	v := strings.TrimSpace(os.Getenv(selfUpdateEnv))
+	if v == "" || v == "0" || v == "false" {
+		return 0
+	}
+	if v == "1" || v == "true" {
+		return selfUpdateDefaultInterval
+	}
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	return 0 // unparseable values disable rather than guess
+}
+
+// startSelfUpdate launches the optional release-check loop. It only runs when
+// two things are true: the operator asked for it via GH_MONITOR_SELFUPDATE,
+// and the daemon was launched through the runtime-copy launcher — otherwise
+// the running image maps the installed file and an upgrade could not land
+// anyway (the write would fail with ETXTBSY).
+func startSelfUpdate(ctx context.Context, cmd *cobra.Command) {
+	every := selfUpdateIntervalFromEnv()
+	if every <= 0 {
+		return
+	}
+	if os.Getenv(reexec.InstalledBinEnv) == "" {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"gh-monitor daemon: %s is set but the daemon was not launched from a runtime copy; self-update disabled\n", selfUpdateEnv)
+		return
+	}
+	go checkForReleases(ctx, every, cmd.ErrOrStderr())
+}
+
+// checkForReleases runs the extension upgrade on the configured cadence. A
+// check that finds nothing newer is a quiet no-op; a landed upgrade rewrites
+// the installed binary and the stat watcher hands the daemon off; a failed
+// check is logged and retried on the next tick — never fatal, never
+// disruptive to serving.
+func checkForReleases(ctx context.Context, every time.Duration, stderr io.Writer) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := extensionUpgradeFn(); err != nil {
+				_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: self-update check failed (%v); retrying on the next tick\n", err)
+			}
+		}
+	}
 }
 
 // spawnUpgradedDaemon starts the successor detached, so it outlives this
