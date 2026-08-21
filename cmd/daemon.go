@@ -82,6 +82,12 @@ is off by default. It is a global-only setting: it is read from the operator's
 preferences.json and nowhere else, because self-upgrading the installed binary
 is a machine-wide act.
 
+Self-update works in both daemon modes: in polling mode an upgrade hands off
+seamlessly over the socket; in sub-daemon mode the launcher stops its children
+(releasing their sockets), starts the successor, and exits once the successor
+proves it stays up — relaunching the old children if the successor fails, so
+service always converges.
+
 Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
 broker: matching events wake the affected PR's fetch immediately instead of
 waiting for the next tick, so a quiet PR polls far less often. It is purely
@@ -127,7 +133,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon config: %v\n", subErr)
 	}
 	if cfgOK && len(entries) > 0 {
-		return runSubdaemonMode(cmd, entries)
+		return runSubdaemonMode(cmd.Context(), cmd, entries, socket, interval)
 	}
 
 	listener, adopted, err := listenOrAdopt(cmd.Context(), socket)
@@ -242,8 +248,16 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdae
 // runSubdaemonMode launches and supervises the configured sub-daemons and
 // nothing else — it does not bind the polling socket, so the sub-daemons own
 // it. On SIGTERM/SIGINT it signals every child and returns.
-func runSubdaemonMode(cmd *cobra.Command, entries []subdaemon.Entry) error {
-	ctx, cancel := context.WithCancel(context.Background())
+//
+// It also arms self-update (issue #84): the launcher is as resident as the
+// polling hub, so it runs the release checker and, when the installed binary
+// changes, hands the whole fleet to a successor — stopping its children first
+// so they release their sockets, then exiting once the successor proves it
+// stays up. A successor that fails to spawn or dies within the grace window
+// is answered by relaunching the children on the old binary: service always
+// converges to some running generation.
+func runSubdaemonMode(ctx context.Context, cmd *cobra.Command, entries []subdaemon.Entry, socket string, interval time.Duration) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
@@ -260,7 +274,33 @@ func runSubdaemonMode(cmd *cobra.Command, entries []subdaemon.Entry) error {
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 		"gh-monitor daemon: sub-daemon mode — launching %d sub-daemon(s) (polling hub off; sub-daemons own the socket)\n",
 		len(entries))
-	return subdaemonLauncherFn(entries, cmd.ErrOrStderr()).Run(ctx)
+
+	var takingOver atomic.Bool
+	for {
+		takingOver.Store(false)
+		genCtx, genCancel := context.WithCancel(ctx)
+		startSelfUpdate(genCtx, cmd)
+		decision := startSubdaemonUpgradeWatcher(genCtx, cmd, socket, interval, genCancel, &takingOver)
+
+		_ = subdaemonLauncherFn(entries, cmd.ErrOrStderr()).Run(genCtx)
+		genCancel()
+		if ctx.Err() != nil {
+			return nil // operator SIGTERM/SIGINT: done
+		}
+		if !takingOver.Load() {
+			return nil // every entry gave up on its own; nothing to hand off
+		}
+		select {
+		case d := <-decision:
+			if d == upgradeTakeover {
+				return nil // the successor owns the service now
+			}
+			// upgradeRelaunch: loop into the next generation on the old binary.
+		case <-time.After(2 * upgradeTakeoverTimeout):
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				"gh-monitor daemon: upgrade watcher never reported a decision; relaunching sub-daemons\n")
+		}
+	}
 }
 
 // handleHandoffOp serves the upgrade handoff's two protocol extensions
