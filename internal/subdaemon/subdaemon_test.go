@@ -97,6 +97,42 @@ func TestDefaultConfigPath_Default(t *testing.T) {
 	assert.Equal(t, filepath.Join(base, "gh-monitor", "daemons.conf"), DefaultConfigPath())
 }
 
+// --- Config path resolution ---
+//
+// ResolveConfigPath layers project config over global config so a repository
+// can pin its own sub-daemons without disturbing the operator's machine-wide
+// setup. Precedence is explicit: an env override wins, then a per-project
+// file in the working directory, then the global user config.
+
+func TestResolveConfigPath_EnvOverride(t *testing.T) {
+	t.Setenv(envConfigPath, "/custom/path.conf")
+	assert.Equal(t, "/custom/path.conf", ResolveConfigPath("/any/cwd"))
+}
+
+func TestResolveConfigPath_ProjectFile(t *testing.T) {
+	t.Setenv(envConfigPath, "")
+	dir := t.TempDir()
+	proj := filepath.Join(dir, projectConfigFile)
+	require.NoError(t, os.WriteFile(proj, []byte("x /bin/true\n"), 0o644))
+	assert.Equal(t, proj, ResolveConfigPath(dir))
+}
+
+func TestResolveConfigPath_NoProjectFallsBackToGlobal(t *testing.T) {
+	t.Setenv(envConfigPath, "")
+	base, err := os.UserConfigDir()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(base, "gh-monitor", "daemons.conf"), ResolveConfigPath(t.TempDir()))
+}
+
+func TestResolveConfigPath_UnknownCwdFallsBackToGlobal(t *testing.T) {
+	t.Setenv(envConfigPath, "")
+	base, err := os.UserConfigDir()
+	require.NoError(t, err)
+	// An unwritable/unknown working directory must not prevent resolution:
+	// with no project file reachable, the global config still applies.
+	assert.Equal(t, filepath.Join(base, "gh-monitor", "daemons.conf"), ResolveConfigPath(""))
+}
+
 // --- Launcher / supervision ---
 //
 // fakeProcess and fakeSpawn let tests drive the restart loop deterministically

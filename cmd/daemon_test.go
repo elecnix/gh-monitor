@@ -415,6 +415,42 @@ func TestDaemon_SubdaemonMode_SkipsPolling(t *testing.T) {
 		"sub-daemon mode must not bind the polling socket; stat err=%v", statErr)
 }
 
+func TestDaemon_SubdaemonMode_FromProjectFile(t *testing.T) {
+	// A per-project .gh-monitor.conf in the working directory must enter
+	// sub-daemon mode even when no global or env config points anywhere — the
+	// project file is resolved before the operator's machine-wide one.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gh-monitor.conf"), []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
+	// Disable any ambient env override so resolution reaches the project file.
+	t.Setenv("GH_MONITOR_SUBDAEMONS", "")
+	t.Chdir(dir)
+	// A socket path that, if polling mode ran, would be bound by ipc.Listen.
+	sock := filepath.Join(dir, "polling.sock")
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	orig := subdaemonLauncherFn
+	t.Cleanup(func() { subdaemonLauncherFn = orig })
+	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
+		return &subdaemon.Launcher{
+			Entries:       entries,
+			Out:           out,
+			MinBackoff:    time.Millisecond,
+			MaxBackoff:    time.Millisecond,
+			MaxRapidFails: 1,
+			Sleep:         func(time.Duration) {},
+		}
+	}
+
+	cmd := newDaemonCommand()
+	cmd.SetArgs([]string{"--socket", sock, "--interval", "10"})
+	err := cmd.Execute()
+	require.NoError(t, err)
+
+	_, statErr := os.Stat(sock)
+	assert.True(t, os.IsNotExist(statErr),
+		"project sub-daemon mode must not bind the polling socket; stat err=%v", statErr)
+}
+
 // TestDaemon_NoConfigFallsBackToPolling verifies that with no sub-daemon config
 // file, the daemon's sub-daemon loader is a no-op and the polling path is
 // unchanged. This is a guard against a regression that reads the config even

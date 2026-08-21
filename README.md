@@ -430,7 +430,13 @@ Configure it with a line-delimited file, one sub-daemon per line (`<name> <execu
 broker-subscriber /usr/local/bin/broker-subscriber daemon --repo my-org/my-repo
 ```
 
-The config path is `$GH_MONITOR_SUBDAEMONS`, otherwise `<user config dir>/gh-monitor/daemons.conf`. When the file exists and lists at least one entry, the daemon enters **sub-daemon mode**: it launches the configured sub-daemons and does **not** run the polling hub, so the sub-daemons own the socket without contention. When the file is absent or empty, the daemon works exactly as it does today (pure polling) — the polling path is the fallback for machines with no sub-daemon config. A sub-daemon that fails to start (binary not found) is logged once and not retried; one that crashes restarts with backoff, and after repeated rapid crashes the launcher gives up on that entry and continues with the rest.
+The config path resolves in precedence order — an explicit env override, then a per-project file, then the operator's global config:
+
+1. `$GH_MONITOR_SUBDAEMONS`, if set (an admin override)
+2. `./.gh-monitor.conf` in the current working directory → a **project** can pin its own sub-daemons
+3. `<user config dir>/gh-monitor/daemons.conf` (the global default)
+
+Precedence is replacement, not merge: the first existing file is used whole. To pin a repository, drop a `daemons.conf`-format `.gh-monitor.conf` in its root. When no file exists, the daemon works exactly as it does today (pure polling). When the resolved file exists and lists at least one entry, the daemon enters **sub-daemon mode**: it launches the configured sub-daemons and does **not** run the polling hub, so the sub-daemons own the socket without contention. A sub-daemon that fails to start (binary not found) is logged once and not retried; one that crashes restarts with backoff, and after repeated rapid crashes the launcher gives up on that entry and continues with the rest.
 
 ```sh
 # Override the config path
