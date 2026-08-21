@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
+	"github.com/elecnix/gh-monitor/internal/mux"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
@@ -108,6 +110,78 @@ func bindTestServerOn(t *testing.T, ctx context.Context, h *hub.Hub, l net.Liste
 	t.Cleanup(func() {
 		// Cancel first: serveWatch returns only when its context is done, so
 		// waiting for the serve goroutines before cancelling would deadlock.
+		cancel()
+		_ = l.Close()
+		wg.Wait()
+	})
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func(c net.Conn) {
+				defer wg.Done()
+				defer func() { _ = c.Close() }()
+				serveClient(serveCtx, srv, c)
+			}(conn)
+		}
+	}()
+	return srv
+}
+
+// recordingDaemonSource is a backend.Source that emits its updates once and
+// closes — the watch payload a fake sub-daemon serves.
+type recordingDaemonSource struct {
+	updates []backend.Update
+}
+
+func (s *recordingDaemonSource) Watch(ctx context.Context, _ backend.Target, _ backend.WatchOptions) (<-chan backend.Update, error) {
+	ch := make(chan backend.Update, len(s.updates))
+	for _, u := range s.updates {
+		ch <- u
+	}
+	close(ch)
+	return ch, nil
+}
+
+// startFakeSubdaemon serves the remote protocol on sockPath as a sub-daemon
+// binary would after the launcher points it at a private socket.
+func startFakeSubdaemon(t *testing.T, ctx context.Context, sockPath string, kinds []backend.Kind, src backend.Source) {
+	t.Helper()
+	l, err := net.Listen("unix", sockPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				_ = remote.Serve(ctx, c, remote.ServerConfig{Name: "fakebroker", Kinds: kinds, Source: src})
+			}(conn)
+		}
+	}()
+}
+
+// bindTestServerOnWithRoutes is bindTestServerOn for a daemon that also routes
+// kinds to discovered sub-daemons (issue #88).
+func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry) *daemonServer {
+	t.Helper()
+	serveCtx, cancel := context.WithCancel(ctx)
+	var handedOff atomic.Bool
+	srv := &daemonServer{
+		hub:       h,
+		listener:  l,
+		routes:    routes,
+		handedOff: &handedOff,
+		shutdown:  func() { cancel(); _ = l.Close() },
+	}
+	var wg sync.WaitGroup
+	t.Cleanup(func() {
 		cancel()
 		_ = l.Close()
 		wg.Wait()
@@ -373,27 +447,70 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 	assert.Equal(t, gh.Name, name)
 }
 
-// TestDaemon_SubdaemonMode_SkipsPolling verifies that when a sub-daemon config
-// file lists at least one entry, runDaemon enters sub-daemon mode and does NOT
-// bind the polling socket — the sub-daemons own it. It overrides the launcher
-// to a fake whose child exits as a not-found start, so the supervisor gives up
-// immediately and runDaemon returns without binding anything.
-func TestDaemon_SubdaemonMode_SkipsPolling(t *testing.T) {
+// startDaemonCommand runs `gh monitor daemon` in the background against sock
+// and returns a stop function. The daemon registers its SIGTERM handler before
+// it binds the socket, so once the socket answers, SIGTERM terminates the
+// daemon — and only the daemon, the test process keeps running.
+func startDaemonCommand(t *testing.T, sock string, interval string) (stop func(), done <-chan struct{}) {
+	t.Helper()
+	cmd := newDaemonCommand()
+	cmd.SetArgs([]string{"--socket", sock, "--interval", interval})
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		_ = cmd.Execute()
+	}()
+	return func() {
+		require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+		select {
+		case <-doneCh:
+		case <-time.After(10 * time.Second):
+			t.Fatal("daemon did not stop after SIGTERM")
+		}
+	}, doneCh
+}
+
+// probeDaemonHello connects to sock like a client would and returns the
+// backend name and kinds the daemon advertises.
+func probeDaemonHello(t *testing.T, sock string) (string, []backend.Kind) {
+	t.Helper()
+	ctx := context.Background()
+	tr, err := remote.ParseEndpoint("unix:" + sock)
+	require.NoError(t, err)
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		p, err := remote.Connect(ctx, tr)
+		if err == nil {
+			return p.Name(), p.Kinds()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon never advertised on %s: %v", sock, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TestDaemon_SubdaemonConfig_OwnsSocketAndServes verifies the issue #88
+// contract: with sub-daemons configured, gh-monitor itself binds the daemon
+// socket and serves the full protocol on it — the sub-daemons get private
+// sockets and gh-monitor routes to them. The old behaviour (v1.19.0–v1.22.0)
+// conceded the public socket to the sub-daemons, which served only their own
+// kinds and left every other target unservable.
+func TestDaemon_SubdaemonConfig_OwnsSocketAndServes(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "daemons.conf")
 	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
 	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
-	// A socket path that, if polling mode ran, would be bound by ipc.Listen.
-	// Use a never-created path so that if runDaemon incorrectly binds it, the
-	// test can detect the leftover file.
-	sock := filepath.Join(dir, "polling.sock")
+	sock := shortSocket(t, "ghmon-owns-*.d")
 	t.Setenv("GH_MONITOR_SOCK", sock)
 
 	orig := subdaemonLauncherFn
 	t.Cleanup(func() { subdaemonLauncherFn = orig })
-	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
-		// Instant, no-real-process launcher: every entry's binary is missing,
-		// so superviseOne logs once and returns without spawning anything.
+	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir string) *subdaemon.Launcher {
+		// Instant, no-real-process launcher: the entry's binary is missing, so
+		// superviseOne logs once and returns without spawning anything.
+		require.Equal(t, filepath.Dir(sock), sockDir,
+			"sub-daemon private sockets live next to the daemon socket")
 		return &subdaemon.Launcher{
 			Entries:       entries,
 			Out:           out,
@@ -404,33 +521,28 @@ func TestDaemon_SubdaemonMode_SkipsPolling(t *testing.T) {
 		}
 	}
 
-	cmd := newDaemonCommand()
-	cmd.SetArgs([]string{"--socket", sock, "--interval", "10"})
-	err := cmd.Execute()
-	require.NoError(t, err)
+	stop, _ := startDaemonCommand(t, sock, "10")
+	name, kinds := probeDaemonHello(t, sock)
+	stop()
 
-	// The polling socket must NOT have been bound in sub-daemon mode.
-	_, statErr := os.Stat(sock)
-	assert.True(t, os.IsNotExist(statErr),
-		"sub-daemon mode must not bind the polling socket; stat err=%v", statErr)
+	assert.Equal(t, DaemonBackendName, name, "gh-monitor must own the socket and announce itself")
+	assert.ElementsMatch(t, backend.AllKinds(), kinds,
+		"gh-monitor must serve every kind even with sub-daemons configured")
 }
 
-func TestDaemon_SubdaemonMode_FromProjectFile(t *testing.T) {
-	// A per-project .gh-monitor.conf in the working directory must enter
-	// sub-daemon mode even when no global or env config points anywhere — the
-	// project file is resolved before the operator's machine-wide one.
+// TestDaemon_SubdaemonConfig_ProjectFileOwnsSocket verifies the same contract
+// when the sub-daemon config comes from a per-project .gh-monitor.conf.
+func TestDaemon_SubdaemonConfig_ProjectFileOwnsSocket(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gh-monitor.conf"), []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
-	// Disable any ambient env override so resolution reaches the project file.
 	t.Setenv("GH_MONITOR_SUBDAEMONS", "")
 	t.Chdir(dir)
-	// A socket path that, if polling mode ran, would be bound by ipc.Listen.
-	sock := filepath.Join(dir, "polling.sock")
+	sock := shortSocket(t, "ghmon-proj-*.d")
 	t.Setenv("GH_MONITOR_SOCK", sock)
 
 	orig := subdaemonLauncherFn
 	t.Cleanup(func() { subdaemonLauncherFn = orig })
-	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
+	subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir string) *subdaemon.Launcher {
 		return &subdaemon.Launcher{
 			Entries:       entries,
 			Out:           out,
@@ -441,14 +553,72 @@ func TestDaemon_SubdaemonMode_FromProjectFile(t *testing.T) {
 		}
 	}
 
-	cmd := newDaemonCommand()
-	cmd.SetArgs([]string{"--socket", sock, "--interval", "10"})
-	err := cmd.Execute()
-	require.NoError(t, err)
+	stop, _ := startDaemonCommand(t, sock, "10")
+	name, kinds := probeDaemonHello(t, sock)
+	stop()
 
-	_, statErr := os.Stat(sock)
-	assert.True(t, os.IsNotExist(statErr),
-		"project sub-daemon mode must not bind the polling socket; stat err=%v", statErr)
+	assert.Equal(t, DaemonBackendName, name)
+	assert.ElementsMatch(t, backend.AllKinds(), kinds)
+}
+
+// TestDaemon_RoutesSubdaemonKinds pins the end-to-end multiplexing contract
+// (issue #88): a client watching a kind a live sub-daemon serves gets the
+// sub-daemon's updates through the daemon socket, while the hub is never
+// consulted for it — and gh-monitor still owns and advertises the socket.
+func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
+	serveCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock := shortSocket(t, "ghmon-route-*.d")
+	brokerSock := shortSocket(t, "ghmon-route-broker-*.d")
+
+	// The fake sub-daemon: a pr-only backend/remote server on its private
+	// socket, streaming one update per watch.
+	want := backend.Update{At: time.Now()}
+	startFakeSubdaemon(t, serveCtx, brokerSock, []backend.Kind{backend.KindPR}, &recordingDaemonSource{updates: []backend.Update{want}})
+
+	// The hub under the daemon's routing layer: a fetch that fails the test
+	// if it is ever consulted — a pr watch must go to the sub-daemon.
+	hubCalled := false
+	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		hubCalled = true
+		return nil, errors.New("hub must not be consulted while the sub-daemon serves pr")
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	reg := mux.NewRegistry(io.Discard)
+	tr, err := remote.ParseEndpoint("unix:" + brokerSock)
+	require.NoError(t, err)
+	reg.Track("broker", tr)
+	reg.Probe(serveCtx)
+	require.NotNil(t, reg.Provider(backend.KindPR), "fake sub-daemon must be discovered before serving")
+
+	l, err := ipc.Listen(sock)
+	require.NoError(t, err)
+	bindTestServerOnWithRoutes(t, serveCtx, h, l, reg)
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	clientReg := backend.NewRegistry()
+	unusedBuiltin(clientReg)
+	ctx, cancelClient := context.WithTimeout(serveCtx, 15*time.Second)
+	t.Cleanup(cancelClient)
+	require.NoError(t, attachDaemon(ctx, clientReg, daemonTarget(), time.Minute))
+
+	src, name, err := clientReg.SourceFor(daemonTarget())
+	require.NoError(t, err)
+	assert.Equal(t, DaemonBackendName, name)
+
+	ch, err := src.Watch(ctx, daemonTarget(), backend.WatchOptions{})
+	require.NoError(t, err)
+	select {
+	case got := <-ch:
+		if !got.At.Equal(want.At) {
+			t.Fatalf("update At = %v, want the sub-daemon's %v", got.At, want.At)
+		}
+	case <-ctx.Done():
+		t.Fatal("the sub-daemon's update never reached the client through the daemon socket")
+	}
+	assert.False(t, hubCalled, "the hub must not poll for a kind the sub-daemon serves")
 }
 
 // TestDaemon_NoConfigFallsBackToPolling verifies that with no sub-daemon config
@@ -555,41 +725,40 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 // (issue #73): an upgrade must be able to rewrite the installed file in place,
 // which requires the resident image to map some other inode.
 func TestDaemon_ReexecsFromRuntimeCopy(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "daemons.conf")
+	cfgPath := filepath.Join(t.TempDir(), "daemons.conf")
 	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
 	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
-	t.Setenv("GH_MONITOR_SOCK", filepath.Join(dir, "unused.sock"))
+	sock := shortSocket(t, "ghmon-reexec-*.d")
 
 	var calls int
 	orig := maybeReexecFn
 	t.Cleanup(func() { maybeReexecFn = orig })
 	maybeReexecFn = func() error { calls++; return nil }
 
-	// Sub-daemon mode with a missing child binary returns immediately, so the
-	// command exercises RunE's preamble without binding anything.
-	cmd := newDaemonCommand()
-	cmd.SetArgs([]string{"--socket", filepath.Join(dir, "unused.sock"), "--interval", "10"})
-	require.NoError(t, cmd.Execute())
+	// The relaunch happens in RunE's preamble, before the socket comes up — so
+	// once the socket answers, exactly one attempt has been made.
+	stop, _ := startDaemonCommand(t, sock, "10")
+	probeDaemonHello(t, sock)
+	stop()
 	assert.Equal(t, 1, calls, "daemon must attempt the relaunch from a runtime copy exactly once")
 }
 
 // TestDaemon_ReexecFailureIsNotFatal verifies a failed relaunch only logs and
 // the daemon still starts (in place) rather than refusing to run.
 func TestDaemon_ReexecFailureIsNotFatal(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "daemons.conf")
+	cfgPath := filepath.Join(t.TempDir(), "daemons.conf")
 	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
 	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
-	t.Setenv("GH_MONITOR_SOCK", filepath.Join(dir, "unused.sock"))
+	sock := shortSocket(t, "ghmon-reexfail-*.d")
 
 	orig := maybeReexecFn
 	t.Cleanup(func() { maybeReexecFn = orig })
 	maybeReexecFn = func() error { return errors.New("boom") }
 
-	cmd := newDaemonCommand()
-	cmd.SetArgs([]string{"--socket", filepath.Join(dir, "unused.sock"), "--interval", "10"})
-	require.NoError(t, cmd.Execute(), "a failed relaunch must not stop the daemon")
+	stop, _ := startDaemonCommand(t, sock, "10")
+	name, _ := probeDaemonHello(t, sock) // serving in place despite the failed relaunch
+	stop()
+	assert.Equal(t, DaemonBackendName, name)
 }
 
 // TestMonitor_ReexecSkippedForOnce verifies a one-shot read never relaunches:

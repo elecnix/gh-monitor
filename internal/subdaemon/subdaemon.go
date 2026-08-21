@@ -198,6 +198,12 @@ type Launcher struct {
 	Entries []Entry
 	// Out receives log lines (warnings, lifecycle). Defaults to os.Stderr.
 	Out io.Writer
+	// ChildEnv, when set, builds the environment for one entry's child
+	// process; whatever it returns becomes the child's env, whole. The daemon
+	// uses it to point each sub-daemon at its own private socket via
+	// GH_MONITOR_SOCK (issue #88) — the sub-daemon binary needs no knowledge
+	// of the arrangement. Nil inherits the launcher's own environment.
+	ChildEnv func(entry Entry) []string
 	// Spawn starts one sub-daemon. Production re-execs the binary; tests
 	// inject a fake. A Spawn that returns an error wrapping exec.ErrNotFound
 	// stops that entry immediately (no retry) — a missing binary will never
@@ -254,7 +260,10 @@ func (l *Launcher) Run(ctx context.Context) error {
 	}
 	spawn := l.Spawn
 	if spawn == nil {
-		spawn = execEntry
+		childEnv := l.ChildEnv
+		spawn = func(ctx context.Context, e Entry) (Process, error) {
+			return startChild(ctx, e, childEnv, out)
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -358,17 +367,29 @@ func isNotFound(err error) bool {
 	return errors.Is(err, exec.ErrNotFound)
 }
 
-// execEntry is the production Spawn: it starts one sub-daemon as a child
-// process. It inherits the launcher's environment so the sub-daemon can read
-// its own config (e.g. GH_MONITOR_SOCK, IOT_ENDPOINT). Stderr passes through
-// so the sub-daemon's diagnostics stay visible alongside the daemon's.
-func execEntry(_ context.Context, e Entry) (Process, error) {
+// applyChildEnv builds a child's environment: the base env when no hook is
+// set, whatever the hook returns otherwise.
+func applyChildEnv(base []string, hook func(Entry) []string, e Entry) []string {
+	if hook == nil {
+		return base
+	}
+	return hook(e)
+}
+
+// startChild is the production spawn: it starts one sub-daemon as a child
+// process. It applies the launcher's ChildEnv hook (nil inherits this
+// process's environment) so the daemon can redirect $GH_MONITOR_SOCK to a
+// private per-entry socket without the sub-daemon knowing (issue #88).
+// Diagnostics pass through to out so a sub-daemon's logs stay visible
+// alongside the daemon's.
+func startChild(_ context.Context, e Entry, childEnv func(Entry) []string, out io.Writer) (Process, error) {
 	if len(e.Cmd) == 0 {
 		return nil, fmt.Errorf("empty command for %q", e.Name)
 	}
 	cmd := exec.Command(e.Cmd[0], e.Cmd[1:]...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stderr
+	cmd.Env = applyChildEnv(os.Environ(), childEnv, e)
+	cmd.Stderr = out
+	cmd.Stdout = out
 	// Stdin is nil → /dev/null; sub-daemons are not interactive.
 	if err := cmd.Start(); err != nil {
 		return nil, err

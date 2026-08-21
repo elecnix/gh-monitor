@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
+	"github.com/elecnix/gh-monitor/internal/mux"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
 )
@@ -82,11 +84,21 @@ is off by default. It is a global-only setting: it is read from the operator's
 preferences.json and nowhere else, because self-upgrading the installed binary
 is a machine-wide act.
 
-Self-update works in both daemon modes: in polling mode an upgrade hands off
-seamlessly over the socket; in sub-daemon mode the launcher stops its children
-(releasing their sockets), starts the successor, and exits once the successor
-proves it stays up — relaunching the old children if the successor fails, so
-service always converges.
+Self-update works in both daemon configurations, because there is only one:
+the daemon always owns the socket and the polling hub. An upgrade hands off
+seamlessly over the socket — watched targets and connected watchers carry
+over (issue #73) — and the daemon relaunches its configured sub-daemons on
+the new binary as it exits.
+
+Sub-daemon backends (issue #88): a daemons.conf that lists entries makes the
+daemon launch and supervise those processes as children. They no longer take
+over the socket: each child is pointed at its own private socket next to the
+daemon's ($GH_MONITOR_SOCK is set for it), gh-monitor discovers which target
+kinds each live child serves from its protocol hello, and watches for those
+kinds are routed to the child while every other kind — and every resumable
+watch — is served by the polling hub on the public socket. A child that dies
+is restarted by the supervisor; meanwhile its kinds fall back to hub polling,
+so a target is degraded-but-covered instead of unmonitored.
 
 Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
 broker: matching events wake the affected PR's fetch immediately instead of
@@ -119,12 +131,31 @@ normal interval polling within one cycle, never silence. See the README's
 }
 
 func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error {
-	// Sub-daemon mode: if the operator has configured sub-daemons, the daemon
-	// launches and supervises them instead of running the polling hub. The
-	// sub-daemons are expected to bind the socket themselves (they are
-	// backends that speak the backend/remote protocol) — so in this mode the
-	// daemon does not bind it, avoiding contention. With no config file, the
-	// daemon works exactly as it does today (pure polling). The config path
+	// Cancellation and signal handling come first: everything below — the
+	// socket bind, the hub, sub-daemon supervision — stops through this ctx,
+	// and registering the handler before binding means a client that sees the
+	// socket come up can always stop the daemon with SIGTERM.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-sigCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	// Sub-daemon backends (issue #88): if the operator configured sub-daemons,
+	// the daemon launches and supervises them as children — but it no longer
+	// concedes the socket to them (the v1.19.0–v1.22.0 behaviour, which left
+	// every non-sub-daemon target kind unservable). Each child is pointed at
+	// its own private socket next to the daemon socket, and watches for the
+	// kinds a live child serves are routed to it; everything else — and every
+	// resumable watch — is served by the polling hub below. The config path
 	// resolves per-project first: <cwd>/.gh-monitor.conf if it exists, then
 	// the operator's <user config dir>/gh-monitor/daemons.conf.
 	esc, _ := os.Getwd()
@@ -132,14 +163,42 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	if subErr != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon config: %v\n", subErr)
 	}
+	var routes *mux.Registry
+	var launcherDone <-chan struct{}
 	if cfgOK && len(entries) > 0 {
-		return runSubdaemonMode(cmd.Context(), cmd, entries, socket, interval)
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"gh-monitor daemon: launching %d sub-daemon backend(s); gh-monitor owns %s and routes to them\n",
+			len(entries), socket)
+		routes = mux.NewRegistry(cmd.ErrOrStderr())
+		for _, e := range entries {
+			tr, terr := remote.ParseEndpoint("unix:" + mux.SocketPath(filepath.Dir(socket), e.Name))
+			if terr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon %q: %v\n", e.Name, terr)
+				continue
+			}
+			routes.Track(e.Name, tr)
+		}
+		l := subdaemonLauncherFn(entries, cmd.ErrOrStderr(), filepath.Dir(socket))
+		done := make(chan struct{})
+		launcherDone = done
+		go func() {
+			defer close(done)
+			_ = l.Run(ctx) // returns after every child has been signaled and waited
+		}()
+		go routes.Run(ctx, mux.ProbeInterval)
 	}
 
-	listener, adopted, err := listenOrAdopt(cmd.Context(), socket)
+	listener, adopted, err := listenOrAdopt(ctx, socket)
 	if err != nil {
 		return err
 	}
+	// Closing the listener is what unblocks Accept when the daemon stops —
+	// the signal goroutine above only cancels, because it is registered
+	// before the listener exists.
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
 	defer func() { _ = listener.Close() }()
 	// Remove the socket on clean shutdown so clients fall back promptly —
 	// unless it was handed off to a successor daemon, which now owns the
@@ -180,21 +239,6 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		select {
-		case <-sigCh:
-			cancel()
-			_ = listener.Close()
-		case <-ctx.Done():
-		}
-	}()
-
 	// The daemon is persistent once started (issue #69): it has no idle
 	// timeout and never exits for lack of attached clients. Auto-start (the
 	// first client bootstraps it) only works if the daemon outlives that
@@ -209,6 +253,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	srv := &daemonServer{
 		hub:       h,
 		listener:  listener,
+		routes:    routes,
 		handedOff: &handedOff,
 		shutdown:  func() { cancel(); _ = listener.Close() },
 	}
@@ -235,71 +280,34 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 
 	<-ctx.Done()
 	wg.Wait()
+	// Give the launcher a bounded window to signal and reap its children so a
+	// successor (upgrade handoff) or the operator is not left with orphans
+	// holding the private sockets. A child that ignores SIGINT for this long
+	// is left to die on its own rather than stalling the daemon's exit.
+	if launcherDone != nil {
+		select {
+		case <-launcherDone:
+		case <-time.After(5 * time.Second):
+		}
+	}
 	return nil
 }
 
-// subdaemonLauncherFn builds the launcher runSubdaemonMode runs. It is a
-// package variable so tests can substitute a launcher that does not spawn
-// real processes.
-var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer) *subdaemon.Launcher {
-	return &subdaemon.Launcher{Entries: entries, Out: out}
-}
-
-// runSubdaemonMode launches and supervises the configured sub-daemons and
-// nothing else — it does not bind the polling socket, so the sub-daemons own
-// it. On SIGTERM/SIGINT it signals every child and returns.
-//
-// It also arms self-update (issue #84): the launcher is as resident as the
-// polling hub, so it runs the release checker and, when the installed binary
-// changes, hands the whole fleet to a successor — stopping its children first
-// so they release their sockets, then exiting once the successor proves it
-// stays up. A successor that fails to spawn or dies within the grace window
-// is answered by relaunching the children on the old binary: service always
-// converges to some running generation.
-func runSubdaemonMode(ctx context.Context, cmd *cobra.Command, entries []subdaemon.Entry, socket string, interval time.Duration) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		select {
-		case <-sigCh:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-		"gh-monitor daemon: sub-daemon mode — launching %d sub-daemon(s) (polling hub off; sub-daemons own the socket)\n",
-		len(entries))
-
-	var takingOver atomic.Bool
-	for {
-		takingOver.Store(false)
-		genCtx, genCancel := context.WithCancel(ctx)
-		startSelfUpdate(genCtx, cmd)
-		decision := startSubdaemonUpgradeWatcher(genCtx, cmd, socket, interval, genCancel, &takingOver)
-
-		_ = subdaemonLauncherFn(entries, cmd.ErrOrStderr()).Run(genCtx)
-		genCancel()
-		if ctx.Err() != nil {
-			return nil // operator SIGTERM/SIGINT: done
-		}
-		if !takingOver.Load() {
-			return nil // every entry gave up on its own; nothing to hand off
-		}
-		select {
-		case d := <-decision:
-			if d == upgradeTakeover {
-				return nil // the successor owns the service now
-			}
-			// upgradeRelaunch: loop into the next generation on the old binary.
-		case <-time.After(2 * upgradeTakeoverTimeout):
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-				"gh-monitor daemon: upgrade watcher never reported a decision; relaunching sub-daemons\n")
-		}
+// subdaemonLauncherFn builds the launcher runDaemon runs for configured
+// sub-daemon entries. It is a package variable so tests can substitute a
+// launcher that does not spawn real processes. sockDir is where the daemon's
+// own socket lives: each child's private socket is placed next to it.
+var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir string) *subdaemon.Launcher {
+	return &subdaemon.Launcher{
+		Entries: entries,
+		Out:     out,
+		// Point the child at its private socket (issue #88): sub-daemons bind
+		// $GH_MONITOR_SOCK wherever it points, so this redirects them without
+		// any change in the sub-daemon binary. gh-monitor keeps the public
+		// socket and routes to these.
+		ChildEnv: func(e subdaemon.Entry) []string {
+			return append(os.Environ(), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
+		},
 	}
 }
 
@@ -472,24 +480,32 @@ func listenOrAdopt(ctx context.Context, socket string) (net.Listener, *hub.State
 }
 
 // daemonServer carries what serving one connection needs beyond the hub: the
-// listener (for the upgrade handoff's fd pass) and the shutdown hook that
-// lets a successor daemon take over mid-flight (issue #73).
+// listener (for the upgrade handoff's fd pass), the shutdown hook that lets a
+// successor daemon take over mid-flight (issue #73), and — when sub-daemons
+// are configured — the registry that routes kinds to them (issue #88).
 type daemonServer struct {
 	hub       *hub.Hub
 	listener  net.Listener
+	routes    *mux.Registry
 	handedOff *atomic.Bool
 	shutdown  func()
 }
 
 // serveClient handles one client connection with the shared backend protocol.
 func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
-	// The daemon shares a fetch; it does not read, mutate, or render. Declaring
+	// The hub shares a fetch; it does not read, mutate, or render. Declaring
 	// only what it does is what lets a client fall back to the built-in backend
 	// for everything else.
+	var src backend.Source = hubSource{hub: srv.hub}
+	if srv.routes != nil {
+		// Sub-daemon kinds go to their owning sub-daemon; everything else —
+		// and every resumable watch — stays on the hub.
+		src = mux.RoutingSource{Reg: srv.routes, Fallback: hubSource{hub: srv.hub}}
+	}
 	cfg := remote.ServerConfig{
 		Name:   DaemonBackendName,
 		Kinds:  backend.AllKinds(),
-		Source: hubSource{hub: srv.hub},
+		Source: src,
 		// Watchers survive a daemon upgrade: the hello announces that a
 		// dropped stream can be re-established with the same ResumeID, and
 		// the handoff ops below transfer this daemon's state to its
