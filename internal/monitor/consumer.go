@@ -29,6 +29,12 @@ func NewPRConsumer(opts RunOptions) *PRConsumer {
 // this consumer. It drives idleInterval's backoff.
 func (c *PRConsumer) NoChange() int { return c.noChange }
 
+// Snapshot returns the consumer's current baseline: the last PRStatus it
+// consumed, or nil before the first poll. The daemon's upgrade handoff uses it
+// to carry a watcher's baseline to the next daemon, so the watcher resumes
+// diffing where it left off instead of replaying what it already reported.
+func (c *PRConsumer) Snapshot() *PRStatus { return c.prev }
+
 // RestoreBaseline sets the consumer's baseline to a previously-stored snapshot
 // so the next Consume call diffs from that restored baseline instead of an
 // empty one. This is the resume path for named instances (issue #32): a restart

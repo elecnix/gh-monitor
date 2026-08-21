@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,7 +22,7 @@ import (
 	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/broker"
-
+	"github.com/elecnix/gh-monitor/internal/handoff"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -74,6 +76,13 @@ normal interval polling within one cycle, never silence. See the README's
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// The daemon is the most resident process gh-monitor runs: keep the
+			// installed binary's image unmapped so upgrades can rewrite it, and
+			// let an upgraded binary take over via handoff (issue #73).
+			if err := maybeReexecFn(); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"gh-monitor daemon: could not relaunch from a runtime copy (%v); running from the installed binary\n", err)
+			}
 			if socket == "" {
 				socket = ipc.DefaultSocketPath()
 			}
@@ -103,13 +112,20 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		return runSubdaemonMode(cmd, entries)
 	}
 
-	listener, err := ipc.Listen(socket)
+	listener, adopted, err := listenOrAdopt(cmd.Context(), socket)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = listener.Close() }()
-	// Remove the socket on clean shutdown so clients fall back promptly.
-	defer func() { _ = os.Remove(socket) }()
+	// Remove the socket on clean shutdown so clients fall back promptly —
+	// unless it was handed off to a successor daemon, which now owns the
+	// path (issue #73).
+	var handedOff atomic.Bool
+	defer func() {
+		if !handedOff.Load() {
+			_ = os.Remove(socket)
+		}
+	}()
 
 	// One fetch function per identity, dispatching on the identity's target
 	// kind (see gh.Fetch). The hub fans the single result out to every
@@ -130,6 +146,15 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	h := hub.New(fetch, rulesetFn, interval, budget,
 		hub.WithFailedRunLogFetcher(gh.FailedRunLogs(apiClientFactory)))
 	defer h.Stop()
+	if adopted != nil {
+		if err := h.RestoreState(*adopted); err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: ignoring unusable handoff state (%v)\n", err)
+		} else {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				"gh-monitor daemon: adopted %d watched PR(s) and %d connected watcher(s) from the previous daemon\n",
+				len(adopted.Pollers), len(adopted.Resumes))
+		}
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -148,6 +173,14 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s)\n", socket, interval)
 	startBrokerTransport(ctx, cmd, h)
+	startUpgradeWatcher(ctx, cmd, socket, interval)
+
+	srv := &daemonServer{
+		hub:       h,
+		listener:  listener,
+		handedOff: &handedOff,
+		shutdown:  func() { cancel(); _ = listener.Close() },
+	}
 
 	var wg sync.WaitGroup
 	go func() {
@@ -164,7 +197,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 			go func(c net.Conn) {
 				defer wg.Done()
 				defer func() { _ = c.Close() }()
-				serveClient(ctx, h, c)
+				serveClient(ctx, srv, c)
 			}(conn)
 		}
 	}()
@@ -203,6 +236,46 @@ func runSubdaemonMode(cmd *cobra.Command, entries []subdaemon.Entry) error {
 		"gh-monitor daemon: sub-daemon mode — launching %d sub-daemon(s) (polling hub off; sub-daemons own the socket)\n",
 		len(entries))
 	return subdaemonLauncherFn(entries, cmd.ErrOrStderr()).Run(ctx)
+}
+
+// handleHandoffOp serves the upgrade handoff's two protocol extensions
+// (issue #73). OpHandoff returns this daemon's transferable watching state to
+// the successor. OpHandoffFD — which only arrives after the state has been
+// delivered — passes the listening socket itself, then shuts this daemon down
+// without removing the socket path, which the successor now owns. The
+// successor is serving on the adopted fd before this process exits, so
+// clients re-connecting see the same socket, and their watchers resume from
+// the baselines the state carried.
+func (srv *daemonServer) handleHandoffOp(ctx context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
+	switch req.Op {
+	case handoff.OpHandoff:
+		state := srv.hub.ExportState()
+		raw, err := json.Marshal(state)
+		if err != nil {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: fmt.Sprintf("encode handoff state: %v", err)})
+			return true, nil
+		}
+		return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+
+	case handoff.OpHandoffFD:
+		uconn, ok := conn.(*net.UnixConn)
+		if !ok {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: "handoff fd pass requires a Unix socket"})
+			return true, nil
+		}
+		srv.handedOff.Store(true)
+		if err := handoff.SendListener(uconn, srv.listener); err != nil {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: err.Error()})
+			return true, err
+		}
+		// The successor now holds the listening socket: stop serving. Closing
+		// the listener and cancelling ctx ends the accept loop and every
+		// client connection; runDaemon's defers skip the socket removal
+		// because handedOff is set.
+		srv.shutdown()
+		return true, nil
+	}
+	return false, nil
 }
 
 // hubSource adapts the shared poller to backend.Source, so the daemon serves
@@ -310,15 +383,56 @@ func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.Wat
 	return out, nil
 }
 
+// listenOrAdopt binds the daemon socket. When a live daemon already owns it
+// (the normal state after an upgrade: the old binary is still resident), the
+// new daemon performs an in-memory handoff instead — it receives the old
+// daemon's watching state and its listening socket, and serves in its place
+// with no gap on the path and no file written (issue #73). A handoff that
+// cannot be completed (predecessor too old to speak it, or it stopped
+// answering) returns the original "in use" error, which is today's
+// behaviour.
+func listenOrAdopt(ctx context.Context, socket string) (net.Listener, *hub.State, error) {
+	listener, err := ipc.Listen(socket)
+	if err == nil {
+		return listener, nil, nil
+	}
+	if !errors.Is(err, ipc.ErrLiveDaemon) || ctx == nil {
+		return nil, nil, err
+	}
+	adopted, state, aerr := handoff.Adopt(ctx, socket)
+	if aerr != nil {
+		return nil, nil, fmt.Errorf("%w (upgrade handoff failed: %v)", err, aerr)
+	}
+	return adopted, &state, nil
+}
+
+// daemonServer carries what serving one connection needs beyond the hub: the
+// listener (for the upgrade handoff's fd pass) and the shutdown hook that
+// lets a successor daemon take over mid-flight (issue #73).
+type daemonServer struct {
+	hub       *hub.Hub
+	listener  net.Listener
+	handedOff *atomic.Bool
+	shutdown  func()
+}
+
 // serveClient handles one client connection with the shared backend protocol.
-func serveClient(ctx context.Context, h *hub.Hub, conn net.Conn) {
+func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 	// The daemon shares a fetch; it does not read, mutate, or render. Declaring
 	// only what it does is what lets a client fall back to the built-in backend
 	// for everything else.
 	cfg := remote.ServerConfig{
 		Name:   DaemonBackendName,
 		Kinds:  backend.AllKinds(),
-		Source: hubSource{hub: h},
+		Source: hubSource{hub: srv.hub},
+		// Watchers survive a daemon upgrade: the hello announces that a
+		// dropped stream can be re-established with the same ResumeID, and
+		// the handoff ops below transfer this daemon's state to its
+		// successor when an upgraded daemon starts (issue #73).
+		Resumable: true,
+		HandleOp: func(ctx context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
+			return srv.handleHandoffOp(ctx, conn, req)
+		},
 	}
 	// Reads inside Serve are not context-aware, so closing the connection is
 	// what unblocks them when the daemon shuts down.

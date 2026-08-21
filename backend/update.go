@@ -96,6 +96,14 @@ type WatchOptions struct {
 	// observation rather than only when they first appear.
 	RepeatUnresolved bool `json:"repeat_unresolved,omitempty"`
 
+	// ResumeID identifies one continuous watch across reconnects. A client
+	// that re-establishes a dropped stream re-sends the same ID, and a backend
+	// that kept the watcher's state (the shared-poller daemon, across an
+	// upgrade handoff) resumes from the baseline it saw last instead of
+	// replaying everything it currently knows. Empty means the watch has no
+	// history to resume.
+	ResumeID string `json:"resume_id,omitempty"`
+
 	// Baseline is a JSON-encoded Status from a previous watch — the
 	// per-instance cursor snapshot (issue #32). When set, the backend diffs
 	// its first observation against this baseline instead of an empty one, so

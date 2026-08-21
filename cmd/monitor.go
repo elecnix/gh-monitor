@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,6 +111,17 @@ func (o *monitorOptions) Validate() error {
 func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	if err := opts.Validate(); err != nil {
 		return err
+	}
+
+	// A continuous watch is resident: it keeps the running image mapped for
+	// as long as it polls. Launch it from a runtime copy of the binary so the
+	// installed file stays free for `gh extension upgrade` to rewrite in
+	// place (issue #73). One-shot reads exit immediately and need nothing.
+	if !opts.Once {
+		if err := maybeReexecFn(); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"gh-monitor: could not relaunch from a runtime copy (%v); running from the installed binary\n", err)
+		}
 	}
 
 	inferRepo(&opts.Repo)
@@ -318,6 +331,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return err
 	}
 
+	// A continuous watch gets a ResumeID: if the shared-poller daemon hands
+	// off to an upgraded daemon (issue #73), the watcher re-establishes its
+	// stream under the same ID and resumes from the baseline it was last
+	// shown, instead of replaying what it already reported.
+	var resumeID string
+	if !opts.Once {
+		resumeID = newResumeID()
+	}
+
 	watchOpts := backend.WatchOptions{
 		Interval:         runOpts.Interval,
 		Timeout:          time.Duration(opts.Timeout) * time.Second,
@@ -327,6 +349,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
 		AnnotationLevels: runOpts.AnnotationLevels.Names(),
 		Baseline:         cursorSnapshot,
+		ResumeID:         resumeID,
 	}
 	// A named repo instance with no cursor yet starts at "now" (issue #32):
 	// the daemon polls on the far side of the wire, so the client computes
@@ -361,6 +384,19 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 // for tests.
 func daemonSocketPath() string {
 	return ipc.DefaultSocketPath()
+}
+
+// newResumeID generates the identifier one continuous watch keeps across
+// daemon reconnects (issue #73). Cryptographically random so concurrent
+// watchers can never collide; hex so it rides any protocol untouched.
+func newResumeID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// No entropy is not fatal: an empty ID just means a reconnect after a
+		// handoff replays current state instead of resuming a baseline.
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // ---------------------------------------------------------------------------

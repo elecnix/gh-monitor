@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+// ErrLiveDaemon reports that a live daemon owns the socket. The daemon uses
+// it to decide whether a start should attempt an upgrade handoff (issue
+// #73) rather than fail.
+var ErrLiveDaemon = errors.New("socket already in use by a live daemon")
+
 // DefaultSocketPath returns the daemon socket path. It honours
 // $GH_MONITOR_SOCK, then $XDG_RUNTIME_DIR, then a per-user cache dir.
 func DefaultSocketPath() string {
@@ -46,7 +51,7 @@ func Listen(path string) (net.Listener, error) {
 		// A socket file is present. Probe it before touching it.
 		if c, derr := net.Dial("unix", path); derr == nil {
 			_ = c.Close()
-			return nil, fmt.Errorf("socket %s already in use by a live daemon", path)
+			return nil, fmt.Errorf("socket %s: %w", path, ErrLiveDaemon)
 		}
 		// Stale socket from a crashed daemon — safe to reclaim.
 		_ = os.Remove(path)

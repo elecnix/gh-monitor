@@ -41,6 +41,11 @@ type diffConsumer[S any] struct {
 // NoChange reports the number of consecutive polls that produced no events.
 func (c *diffConsumer[S]) NoChange() int { return c.noChange }
 
+// Snapshot returns the consumer's current baseline: the last status it
+// consumed, or nil before the first poll. The daemon's upgrade handoff uses
+// it to carry a watcher's baseline to the next daemon (issue #73).
+func (c *diffConsumer[S]) Snapshot() *S { return c.prev }
+
 // RestoreBaseline sets the consumer's baseline to a previously-stored
 // snapshot.
 func (c *diffConsumer[S]) RestoreBaseline(snapshot *S) { c.prev = snapshot }
@@ -96,6 +101,11 @@ func NewIssueConsumer(opts RunOptions) *IssueConsumer {
 
 // NoChange reports the number of consecutive polls that produced no events.
 func (c *IssueConsumer) NoChange() int { return c.noChange }
+
+// Snapshot returns the consumer's current baseline: the last status it
+// consumed, or nil before the first poll (the daemon's upgrade handoff uses
+// it, issue #73).
+func (c *IssueConsumer) Snapshot() *IssueStatus { return c.prev }
 
 // RestoreBaseline sets the consumer's baseline to a previously-stored
 // snapshot so the next Consume call diffs from that restored baseline instead
@@ -166,6 +176,11 @@ func NewRunConsumer(opts RunOptions) *RunConsumer {
 
 // NoChange reports the number of consecutive polls that produced no events.
 func (c *RunConsumer) NoChange() int { return c.noChange }
+
+// Snapshot returns the consumer's current baseline: the last status it
+// consumed, or nil before the first poll (the daemon's upgrade handoff uses
+// it, issue #73).
+func (c *RunConsumer) Snapshot() *RunStatus { return c.prev }
 
 // RestoreBaseline sets the consumer's baseline to a previously-stored
 // snapshot.

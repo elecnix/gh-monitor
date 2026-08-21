@@ -80,6 +80,11 @@ type Hub struct {
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
 
+	// resumes holds watchers' baselines carried over from a predecessor
+	// daemon (issue #73 handoff), keyed by the watcher's ResumeID, until the
+	// watcher reconnects and claims it.
+	resumes map[string]resumeEntry
+
 	// brokerMu guards the optional broker-transport health flag and its
 	// extended idle-poll ceiling. See SetBrokerHealth and SetBrokerIdleCap.
 	brokerMu      sync.RWMutex
@@ -134,6 +139,7 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget 
 		interval:  interval,
 		budget:    budget,
 		pollers:   make(map[pollerKey]*poller),
+		resumes:   make(map[string]resumeEntry),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -165,9 +171,16 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	if p == nil {
 		p = newPoller(h, identity, h.interval)
 		h.pollers[key] = p
+	}
+	// A poller restored from a handoff already exists but has not started;
+	// whether fresh or restored, it starts with its first subscriber.
+	start := !p.started
+	p.started = true
+	h.mu.Unlock()
+
+	if start {
 		go p.run()
 	}
-	h.mu.Unlock()
 
 	// The consumer only needs enough run configuration to diff and to stamp
 	// the updates it emits; templates never reach the daemon.
@@ -184,13 +197,28 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 
 	sub := &sub{
 		distill:    traits.distill(t, opts),
-		consume:    traits.consumer(h, ro, opts),
+		handle:     traits.consumer(h, ro, opts),
 		cursorOf:   traits.cursorOf,
 		snapOpts:   snapOpts,
 		snapshotCh: make(chan any, 1),
 		notifCh:    make(chan backend.Update, 4),
 		out:        make(chan backend.Update, 16),
 		done:       make(chan struct{}),
+		resumeID:   opts.ResumeID,
+		target:     t,
+		watchOpts:  opts,
+	}
+
+	// A watcher reconnecting after a daemon handoff claims the baseline its
+	// predecessor's daemon held for it, so it resumes diffing where it left
+	// off instead of replaying what it already reported (issue #73).
+	if opts.ResumeID != "" {
+		if raw, ok := h.takeResume(opts.ResumeID); ok && len(raw) > 0 {
+			st := newStatusForKind(key.kind)
+			if err := json.Unmarshal(raw, st); err == nil {
+				sub.handle.restore(st)
+			}
+		}
 	}
 	go sub.loop()
 
@@ -199,6 +227,11 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	if p.ruleset != nil && p.ruleset.Error == "" {
 		sub.snapOpts.RulesetChecks = p.ruleset
 	}
+	// Start at the poller's current tier. A poller restored from a handoff
+	// may already be at TierFull, in which case applyTier never fires for
+	// this sub — and distilling its snapshots at the zero tier would silently
+	// shed comments and reviews exactly as if the budget had run out.
+	sub.snapOpts.Tier = p.tier
 	p.subs[sub] = struct{}{}
 	if p.latest != nil {
 		select {
@@ -329,7 +362,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		}
 
 		distill := traits.distill(t, opts)
-		consume := traits.consumer(h, ro, opts)
+		handle := traits.consumer(h, ro, opts)
 		cursorOf := traits.cursorOf
 		emit := func(u backend.Update) {
 			if cursorOf != nil {
@@ -340,7 +373,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			case <-ctx.Done():
 			}
 		}
-		consume(distill(raw, snapOpts), emit)
+		handle.consume(distill(raw, snapOpts), emit)
 	}()
 	return out
 }
@@ -466,9 +499,11 @@ type kindTraits struct {
 	distill func(t backend.Target, opts backend.WatchOptions) func(raw any, snapOpts monitor.SnapshotOptions) backend.Status
 
 	// consumer builds the subscriber's diff engine — one of the monitor
-	// package's per-kind consumers — as a kind-agnostic consume closure.
-	// The closure returns true when the target reached a terminal state.
-	consumer func(h *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(curr backend.Status, emit func(backend.Update)) bool
+	// package's per-kind consumers — wrapped in a kind-agnostic handle. The
+	// handle's consume closure returns true when the target reached a
+	// terminal state; its baseline accessors exist for the upgrade handoff
+	// (issue #73).
+	consumer func(h *Hub, ro monitor.RunOptions, opts backend.WatchOptions) consumerHandle
 
 	// fingerprint covers every field the kind's diff can fire on. It runs on
 	// the poller's raw payload once per fetch.
@@ -483,19 +518,79 @@ type kindTraits struct {
 	cursorOf func(raw any) string
 }
 
-// restore decodes a stored baseline JSON into the consumer's own status type
-// and restores it, for the kinds whose loops honour cursor snapshots (PR and
-// issue — the kinds whose original loops honoured cursor snapshots). Other
-// kinds start from an empty baseline.
-func restore[T any](c interface{ RestoreBaseline(*T) }, baseline string) {
-	if baseline == "" {
-		return
+// consumerHandle is one subscriber's diff engine: the consume closure over a
+// typed monitor consumer, plus the baseline access the upgrade handoff needs
+// (issue #73) — baseline reads the last state shown to this watcher, restore
+// seeds it so a reconnecting watcher resumes where its predecessor's stream
+// left off instead of replaying what it already reported.
+type consumerHandle struct {
+	consume  func(curr backend.Status, emit func(backend.Update)) bool
+	baseline func() backend.Status
+	restore  func(backend.Status)
+}
+
+// newHandle wraps a constructed typed consumer into a consumerHandle,
+// optionally seeding its baseline from stored JSON (the WatchOptions.Baseline
+// resume path, issue #32).
+func newHandle[S any, P interface {
+	*S
+	backend.Status
+}](c interface {
+	Consume(P, func(backend.Update)) bool
+	RestoreBaseline(P)
+	Snapshot() P
+}, baseline string) consumerHandle {
+	if baseline != "" {
+		var stored S
+		if err := json.Unmarshal([]byte(baseline), &stored); err == nil {
+			c.RestoreBaseline(&stored)
+		}
 	}
-	var stored T
-	if err := json.Unmarshal([]byte(baseline), &stored); err == nil {
-		c.RestoreBaseline(&stored)
+	return consumerHandle{
+		consume:  consumeVia(c),
+		baseline: func() backend.Status { return c.Snapshot() },
+		restore:  func(st backend.Status) { c.RestoreBaseline(st.(P)) },
 	}
 }
+
+// newStatusForKind returns the zero-valued distilled status for a kind, so a
+// handoff-carried baseline (JSON) can be decoded without knowing the kind at
+// the call site.
+func newStatusForKind(kind backend.Kind) backend.Status {
+	switch kind {
+	case backend.KindRef, backend.KindCommit:
+		return &monitor.RefStatus{}
+	case backend.KindIssue:
+		return &monitor.IssueStatus{}
+	case backend.KindRun:
+		return &monitor.RunStatus{}
+	case backend.KindRepo:
+		return &monitor.RepoStatus{}
+	default:
+		return &monitor.PRStatus{}
+	}
+}
+
+// rawForKind returns a zero-valued raw payload of the kind a fetch for this
+// identity returns, so a handoff-carried snapshot (JSON) can be decoded into
+// the concrete type the poller's traits expect.
+func rawForKind(kind backend.Kind) any {
+	switch kind {
+	case backend.KindRef:
+		return &monitor.RefQueryResponse{}
+	case backend.KindCommit:
+		return &monitor.CommitQueryResponse{}
+	case backend.KindIssue:
+		return &monitor.IssueQueryResponse{}
+	case backend.KindRun:
+		return &monitor.WorkflowRun{}
+	case backend.KindRepo:
+		return &monitor.RepoQueryResponse{}
+	default:
+		return &monitor.PullRequest{}
+	}
+}
+
 
 // traitsFor returns the trait table for a target kind. The per-kind pieces
 // are named package functions (below) rather than inline closures so each
@@ -520,40 +615,36 @@ func traitsFor(kind backend.Kind) kindTraits {
 	case backend.KindIssue:
 		return kindTraits{
 			distill: snapDistill(distillIssue),
-			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-				c := monitor.NewIssueConsumer(ro)
-				restore(c, opts.Baseline)
-				return consumeVia(c)
+			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) consumerHandle {
+				return newHandle(monitor.NewIssueConsumer(ro), opts.Baseline)
 			},
 			fingerprint: fingerprintIssueResp,
 		}
 	case backend.KindRun:
 		return kindTraits{
 			distill: plainDistill(distillRun),
-			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
 				c := monitor.NewRunConsumer(ro)
 				// The failed-run log snippet is fetched through the gh CLI,
 				// which lives on the daemon side of the wire; the consumer
 				// only needs the distilled detail.
 				c.FailedLogDetail = h.failedRunLogDetail(ro.Identity)
-				return consumeVia(c)
+				return newHandle(c, "")
 			},
 			fingerprint: fingerprintRunResp,
 		}
 	case backend.KindRepo:
 		return kindTraits{
 			distill:     repoDistill,
-			consumer:    repoConsumer,
+			consumer:    repoConsumerHandle,
 			fingerprint: fingerprintRepoResp,
 			cursorOf:    repoCursor,
 		}
 	default: // backend.KindPR
 		return kindTraits{
 			distill: snapDistill(distillPR),
-			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-				c := monitor.NewPRConsumer(ro)
-				restore(c, opts.Baseline)
-				return consumeVia(c)
+			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) consumerHandle {
+				return newHandle(monitor.NewPRConsumer(ro), opts.Baseline)
 			},
 			fingerprint: func(raw any) string {
 				return monitor.Fingerprint(raw.(*monitor.PullRequest))
@@ -618,19 +709,24 @@ func repoDistill(t backend.Target, opts backend.WatchOptions) func(any, monitor.
 
 // refCommitConsumer builds the diff engine shared by ref and commit targets:
 // both distill to a RefStatus and diff with the same rules.
-func refCommitConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-	return consumeVia(monitor.NewRefConsumer(ro))
+func refCommitConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
+	return newHandle(monitor.NewRefConsumer(ro), "")
 }
 
-// repoConsumer builds the diff engine for a repository watch.
-func repoConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-	return consumeVia(monitor.NewRepoConsumer(ro))
+// repoConsumerHandle builds the diff engine for a repository watch.
+func repoConsumerHandle(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
+	return newHandle(monitor.NewRepoConsumer(ro), "")
 }
 
 // consumeVia adapts one of the monitor package's typed consumers to the
 // kind-agnostic consume closure the trait table stores. P exists only to
 // tell the compiler that *S really is a backend.Status.
-func consumeVia[S any, P interface{ *S; backend.Status }](c interface{ Consume(P, func(backend.Update)) bool }) func(backend.Status, func(backend.Update)) bool {
+func consumeVia[S any, P interface {
+	*S
+	backend.Status
+}](c interface {
+	Consume(P, func(backend.Update)) bool
+}) func(backend.Status, func(backend.Update)) bool {
 	return func(curr backend.Status, emit func(backend.Update)) bool {
 		return c.Consume(curr.(P), emit)
 	}
@@ -697,6 +793,11 @@ type poller struct {
 	budget   *monitor.BudgetGuard
 	ruleset  *monitor.RulesetChecks // fetched once at PR poller start; nil until fetched
 
+	// started records that run() is going. A poller restored from a handoff
+	// (issue #73) exists before any subscriber does; it starts, like a fresh
+	// one, when its first subscriber arrives. Guarded by hub.mu.
+	started bool
+
 	mu         sync.Mutex
 	latest     any               // raw payload of the last successful fetch
 	noChange   int               // consecutive fingerprint-unchanged fetches; drives idle backoff
@@ -734,9 +835,10 @@ func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 // immediately.
 func (p *poller) run() {
 	// Fetch the branch ruleset once at startup (PR targets only — no other
-	// kind consumes ruleset data). Rulesets rarely change mid-monitoring; a
-	// consumer that needs a refresh can restart.
-	if p.key.kind == backend.KindPR && p.hub.rulesetFn != nil {
+	// kind consumes ruleset data) — unless a predecessor daemon handed one
+	// over (issue #73). Rulesets rarely change mid-monitoring; a consumer
+	// that needs a refresh can restart.
+	if p.key.kind == backend.KindPR && p.hub.rulesetFn != nil && p.ruleset == nil {
 		rs, err := p.hub.rulesetFn(p.identity.Owner, p.identity.Repo)
 		if err != nil {
 			// Log but continue — the poller still works without ruleset data.
@@ -1067,14 +1169,21 @@ func (p *poller) label() string {
 // snapshot inbox, a channel for loop-level notices (degraded / tier-shed),
 // and an output channel of updates.
 type sub struct {
+	// mu guards handle — the one state mutated after creation (by loop's
+	// Consume, and by ExportState's baseline read and takeResume's restore on
+	// the handoff path).
+	mu         sync.Mutex
 	distill    func(raw any, snapOpts monitor.SnapshotOptions) backend.Status
-	consume    func(curr backend.Status, emit func(backend.Update)) bool
+	handle     consumerHandle
 	cursorOf   func(raw any) string
 	snapOpts   monitor.SnapshotOptions
 	snapshotCh chan any
 	notifCh    chan backend.Update
 	out        chan backend.Update
 	done       chan struct{}
+	resumeID   string
+	target     backend.Target
+	watchOpts  backend.WatchOptions
 }
 
 // loop owns the consumer's diff goroutine. It reads raw payloads from the
@@ -1106,7 +1215,9 @@ func (s *sub) loop() {
 				}
 			}
 			curr := s.distill(raw, s.snapOpts)
-			terminal := s.consume(curr, emit)
+			s.mu.Lock()
+			terminal := s.handle.consume(curr, emit)
+			s.mu.Unlock()
 			if terminal {
 				close(s.out)
 				return

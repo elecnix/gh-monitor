@@ -314,5 +314,9 @@ func assignJSON(result interface{}, payload interface{}) error {
 func TestMain(m *testing.M) {
 	// Ensure tests don't inherit GH_HOST requirements.
 	_ = os.Unsetenv("GH_HOST")
+	// Resident commands relaunch from a runtime copy of the binary (issue
+	// #73). In tests the "binary" is the test executable — never copy or
+	// exec it; tests that care stub maybeReexecFn themselves.
+	maybeReexecFn = func() error { return nil }
 	os.Exit(m.Run())
 }
