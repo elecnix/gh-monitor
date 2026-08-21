@@ -12,15 +12,12 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/elecnix/gh-monitor/internal/prefs"
@@ -109,7 +106,6 @@ func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec
 // ---------------------------------------------------------------------------
 // Self-update (issue #69): the daemon pulls new releases itself
 // ---------------------------------------------------------------------------
-
 // selfUpdateRemovedEnv is the removed environment variable that used to gate
 // self-update (issue #82 moved the setting into preferences.json). It is no
 // longer honored anywhere, but a daemon that sees it set announces loudly
@@ -217,115 +213,4 @@ func spawnUpgradedDaemon(installed, socket string, interval time.Duration) (*os.
 	p := cmd.Process
 	_ = p.Release()
 	return p, nil
-}
-
-// ---------------------------------------------------------------------------
-// Sub-daemon-mode upgrades (issue #84): the launcher self-updates too
-// ---------------------------------------------------------------------------
-
-// subdaemonUpgradeDecision tells runSubdaemonMode's generation loop what to do
-// after the upgrade watcher stopped the current children.
-type subdaemonUpgradeDecision int
-
-const (
-	// upgradeTakeover: the successor spawned and stayed up through the grace
-	// window; this process should exit and let it own the service.
-	upgradeTakeover subdaemonUpgradeDecision = iota
-	// upgradeRelaunch: the successor failed to spawn or died within the grace
-	// window; relaunch the children on the old binary so service converges.
-	upgradeRelaunch
-)
-
-// subdaemonSuccessorAliveFn reports whether the freshly spawned successor is
-// still running. Package variable so tests stub liveness.
-var subdaemonSuccessorAliveFn = processAlive
-
-// processAlive reports whether p is still running. A nil process is dead. An
-// error other than os.ErrProcessDone (e.g. signals unsupported on Windows)
-// optimistically reports alive: a false "dead" would tear down working
-// children, while a false "alive" at worst leaves the successor in charge.
-func processAlive(p *os.Process) bool {
-	if p == nil {
-		return false
-	}
-	if err := p.Signal(syscall.Signal(0)); err != nil {
-		return !errors.Is(err, os.ErrProcessDone)
-	}
-	return true
-}
-
-// startSubdaemonUpgradeWatcher arms the binary-change watcher for sub-daemon
-// mode. There is no socket handoff here — the children own their sockets and
-// their state — so a detected upgrade stops the children (releasing those
-// sockets), spawns the successor, and reports one decision on the returned
-// channel: upgradeTakeover (exit; the successor owns the service) or
-// upgradeRelaunch (bring the children back on the old binary). The channel is
-// only written when the watcher actually takes over, which the takingOver
-// flag records for the generation loop.
-func startSubdaemonUpgradeWatcher(ctx context.Context, cmd *cobra.Command, socket string, interval time.Duration, stopChildren func(), takingOver *atomic.Bool) <-chan subdaemonUpgradeDecision {
-	decision := make(chan subdaemonUpgradeDecision, 1)
-	installed := os.Getenv(reexec.InstalledBinEnv)
-	if installed == "" {
-		return decision // not launched from a runtime copy: nothing to watch
-	}
-	go watchSubdaemonBinary(ctx, installed, socket, interval, cmd.ErrOrStderr(), stopChildren, takingOver, decision)
-	return decision
-}
-
-// watchSubdaemonBinary stats the installed binary on every tick and, when it
-// has changed, walks the sub-daemon upgrade sequence: stop children, spawn
-// the successor, hold a grace window to confirm it stays up, then report the
-// decision. Failure is never fatal to convergence — every failure path ends
-// in upgradeRelaunch, so some generation of children is always running.
-func watchSubdaemonBinary(ctx context.Context, installed, socket string, interval time.Duration, stderr io.Writer, stopChildren func(), takingOver *atomic.Bool, decision chan<- subdaemonUpgradeDecision) {
-	base, err := os.Stat(installed)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: cannot watch %s for upgrades (%v)\n", installed, err)
-		return
-	}
-	ticker := time.NewTicker(upgradeCheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		cur, err := os.Stat(installed)
-		if err != nil || (cur.Size() == base.Size() && cur.ModTime().Equal(base.ModTime())) {
-			continue
-		}
-		_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: upgrade detected (%s changed); restarting sub-daemons on the new binary\n", installed)
-		takingOver.Store(true)
-		stopChildren() // children exit, releasing the sockets they own
-		proc, spawnErr := spawnUpgradedDaemonFn(installed, socket, interval)
-		if spawnErr == nil {
-			// Grace: confirm the successor stays up before committing. A
-			// successor that dies here would otherwise become an outage.
-			deadline := time.Now().Add(upgradeTakeoverTimeout)
-			for time.Now().Before(deadline) {
-				if !subdaemonSuccessorAliveFn(proc) {
-					spawnErr = errors.New("the upgraded daemon exited during the takeover grace window")
-					break
-				}
-				select {
-				case <-ctx.Done():
-					return // root shutdown while waiting; nothing left to decide
-				case <-time.After(50 * time.Millisecond):
-				}
-			}
-		}
-		if spawnErr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"gh-monitor daemon: upgrade handoff failed (%v); relaunching sub-daemons on the old version\n", spawnErr)
-			base = cur // retried only when the binary changes again
-			select {
-			case decision <- upgradeRelaunch:
-			default: // the loop also recovers via its decision timeout
-			}
-			continue
-		}
-		decision <- upgradeTakeover
-		return
-	}
 }

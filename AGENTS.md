@@ -18,6 +18,56 @@ Run `gh monitor --help` for the real subcommand list (`comments`, `draft`,
 `prefs`, `react`, `review`, `threads`). Trust `--help` over any prose, including
 this file.
 
+## Daemon socket ownership
+
+**gh-monitor owns `$GH_MONITOR_SOCK`. Sub-daemons never bind it.** This was
+not always true — v1.19.0–v1.22.0 conceded the socket to whichever sub-daemon
+bound it first, which left every target kind that sub-daemon did not serve
+(workflow runs, repos, issues) with no serving path and cost a long debugging
+session. Since the routing rework ([#88](https://github.com/elecnix/gh-monitor/issues/88),
+[#89](https://github.com/elecnix/gh-monitor/pull/89)) the topology is:
+
+```mermaid
+flowchart LR
+    subgraph clients [gh monitor clients]
+        C1[watch pr #7]
+        C2[watch --run-id 99]
+    end
+
+    S((($GH_MONITOR_SOCK\nowned by gh-monitor)))
+
+    subgraph daemon [gh-monitor daemon — one process]
+        RS[mux.RoutingSource\nroute by target kind]
+        HUB[polling hub\nserves every kind\nholds resume state]
+        REG[mux.Registry\nprobe hellos → kinds]
+        L[subdaemon.Launcher\nsupervise + restart]
+    end
+
+    B[[broker-subscriber\nprivate socket:\nsubdaemon-broker-subscriber.sock\nserves: pr]]
+
+    C1 --> S
+    C2 --> S
+    S --> RS
+    RS -- "kind served by a live child" --> B
+    RS -- "other kinds, resumable watches,\ndead-child fallback" --> HUB
+    L -- "launches, sets GH_MONITOR_SOCK\nto the private path" --> B
+    REG -- "remote.Connect probe" --> B
+    REG -. "kinds discovered from hello" .-> RS
+```
+
+Practical consequences when debugging or extending the daemon:
+
+- A `pr` watch is served by broker-subscriber **without touching the GitHub
+  API** — the hub never creates a poller for it. Polling for `pr` only happens
+  as a fallback (broker child down, or a resumable watch, whose state lives in
+  the hub).
+- Sub-daemon children bind private sockets next to the daemon socket
+  (`subdaemon-<name>.sock`); the launcher redirects them via
+  `GH_MONITOR_SOCK`. If you see one bound to the public path, something is
+  running an old binary.
+- "watching requires the shared-poller daemon" means no daemon owns the
+  public socket — not that a sub-daemon is missing.
+
 ## Releasing
 
 Read [`.github/workflows/release.yml`](.github/workflows/release.yml) before
