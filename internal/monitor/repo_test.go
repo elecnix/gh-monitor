@@ -1,9 +1,7 @@
 package monitor
 
 import (
-	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -26,7 +24,7 @@ func TestFetchRepo(t *testing.T) {
 			assert.Equal(t, 25, variables["first"])
 			return assign(result, RepoQueryResponse{
 				Repository: struct {
-					PullRequests RepoPRNodes  `json:"pullRequests"`
+					PullRequests RepoPRNodes    `json:"pullRequests"`
 					Issues       RepoIssueNodes `json:"issues"`
 				}{
 					PullRequests: RepoPRNodes{Nodes: []RepoPR{
@@ -61,21 +59,27 @@ func TestFetchRepo(t *testing.T) {
 func TestSnapshotRepo(t *testing.T) {
 	resp := &RepoQueryResponse{
 		Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
+			PullRequests RepoPRNodes    `json:"pullRequests"`
 			Issues       RepoIssueNodes `json:"issues"`
 		}{
 			PullRequests: RepoPRNodes{Nodes: []RepoPR{
 				{Number: 1, Title: "feat: add x", State: "OPEN", URL: "https://gh/o/r/pull/1",
 					CreatedAt: "2024-01-01T00:00:00Z",
-					Author:    struct{ Login string `json:"login"` }{Login: "alice"}},
+					Author: struct {
+						Login string `json:"login"`
+					}{Login: "alice"}},
 				{Number: 2, Title: "fix: bug", State: "OPEN", URL: "https://gh/o/r/pull/2",
 					CreatedAt: "2024-01-02T00:00:00Z",
-					Author:    struct{ Login string `json:"login"` }{Login: "bob"}},
+					Author: struct {
+						Login string `json:"login"`
+					}{Login: "bob"}},
 			}},
 			Issues: RepoIssueNodes{Nodes: []RepoIssue{
 				{Number: 10, Title: "crash", State: "OPEN", URL: "https://gh/o/r/issues/10",
 					CreatedAt: "2024-01-01T00:00:00Z",
-					Author:    struct{ Login string `json:"login"` }{Login: "carol"}},
+					Author: struct {
+						Login string `json:"login"`
+					}{Login: "carol"}},
 			}},
 		},
 	}
@@ -195,139 +199,8 @@ func repoRunOptions() RunOptions {
 		Prefs:    prefs.DefaultPreferences(),
 		Interval: 60,
 		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
-		Sleep:    func(context.Context, time.Duration) error { return nil },
 	}
 }
-
-func TestRunRepo_StreamsEvents(t *testing.T) {
-	responses := []*RepoQueryResponse{
-		// First poll: 1 PR, 1 issue
-		{Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
-			Issues       RepoIssueNodes `json:"issues"`
-		}{
-			PullRequests: RepoPRNodes{Nodes: []RepoPR{repoPR(1, "pr1", "alice")}},
-			Issues:       RepoIssueNodes{Nodes: []RepoIssue{repoIssue(10, "issue1", "bob")}},
-		}},
-		// Second poll: 2 PRs, 1 issue (new PR #2)
-		{Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
-			Issues       RepoIssueNodes `json:"issues"`
-		}{
-			PullRequests: RepoPRNodes{Nodes: []RepoPR{repoPR(1, "pr1", "alice"), repoPR(2, "pr2", "carol")}},
-			Issues:       RepoIssueNodes{Nodes: []RepoIssue{repoIssue(10, "issue1", "bob")}},
-		}},
-		// Third poll: 2 PRs, 2 issues (new issue #11)
-		{Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
-			Issues       RepoIssueNodes `json:"issues"`
-		}{
-			PullRequests: RepoPRNodes{Nodes: []RepoPR{repoPR(1, "pr1", "alice"), repoPR(2, "pr2", "carol")}},
-			Issues:       RepoIssueNodes{Nodes: []RepoIssue{repoIssue(10, "issue1", "bob"), repoIssue(11, "issue2", "dave")}},
-		}},
-	}
-
-	call := 0
-	svc := &Service{API: &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		idx := call
-		if idx >= len(responses) {
-			idx = len(responses) - 1
-		}
-		call++
-		return assign(result, responses[idx])
-	}}}
-
-	opts := repoRunOptions()
-
-	var got []Notification
-	ctx, cancel := context.WithCancel(context.Background())
-	var newIssueSeen bool
-	opts.Sleep = func(ctx context.Context, d time.Duration) error {
-		if call >= 3 {
-			cancel()
-			return context.Canceled
-		}
-		return nil
-	}
-
-	err := Run(ctx, svc, opts, func(n Notification) {
-		got = append(got, n)
-		switch n.Type {
-		case string(EventRepoNewIssue):
-			newIssueSeen = true
-		}
-	})
-	require.True(t, errors.Is(err, context.Canceled) || err == nil)
-
-	types := typesOf(got)
-	assert.Equal(t, firstPollType, types[0])
-	// On first poll, existing items are surfaced.
-	assert.Contains(t, types, string(EventRepoNewPR))
-	assert.Contains(t, types, string(EventRepoNewIssue))
-	assert.True(t, newIssueSeen, "expected repo-new-issue")
-
-	// After second poll, new PR #2 should be emitted.
-	prEvents := 0
-	for _, n := range got {
-		if n.Type == string(EventRepoNewPR) {
-			prEvents++
-		}
-	}
-	assert.GreaterOrEqual(t, prEvents, 2, "expected at least 2 repo-new-pr events (baseline + new)")
-}
-
-func TestOnceRepo_EmitsCurrentActionable(t *testing.T) {
-	resp := &RepoQueryResponse{
-		Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
-			Issues       RepoIssueNodes `json:"issues"`
-		}{
-			PullRequests: RepoPRNodes{Nodes: []RepoPR{repoPR(1, "feat: x", "alice")}},
-			Issues:       RepoIssueNodes{Nodes: []RepoIssue{repoIssue(42, "bug", "bob")}},
-		},
-	}
-	svc := &Service{API: &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		return assign(result, resp)
-	}}}
-
-	opts := repoRunOptions()
-	var got []Notification
-	err := Once(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
-	require.NoError(t, err)
-
-	types := typesOf(got)
-	assert.Equal(t, firstPollType, types[0])
-	assert.Contains(t, types, string(EventRepoNewPR))
-	assert.Contains(t, types, string(EventRepoNewIssue))
-}
-
-func TestRunRepo_ContextCancelStops(t *testing.T) {
-	resp := &RepoQueryResponse{
-		Repository: struct {
-			PullRequests RepoPRNodes  `json:"pullRequests"`
-			Issues       RepoIssueNodes `json:"issues"`
-		}{
-			PullRequests: RepoPRNodes{Nodes: []RepoPR{repoPR(1, "pr1", "alice")}},
-			Issues:       RepoIssueNodes{},
-		},
-	}
-	svc := &Service{API: &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		return assign(result, resp)
-	}}}
-
-	opts := repoRunOptions()
-	opts.Sleep = func(context.Context, time.Duration) error { return context.Canceled }
-
-	var got []Notification
-	err := Run(context.Background(), svc, opts, func(n Notification) { got = append(got, n) })
-	assert.ErrorIs(t, err, context.Canceled)
-	require.NotEmpty(t, got)
-	assert.Equal(t, firstPollType, got[0].Type)
-}
-
-// ---------------------------------------------------------------------------
-// Repo notification rendering
-// ---------------------------------------------------------------------------
 
 func TestRenderNotificationRepo(t *testing.T) {
 	status := &RepoStatus{
@@ -359,29 +232,3 @@ func TestRenderNotificationRepo(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Helpers for repo tests
 // ---------------------------------------------------------------------------
-
-func repoPR(number int, title, author string) RepoPR {
-	return RepoPR{
-		Number:    number,
-		Title:     title,
-		State:     "OPEN",
-		URL:       fmt.Sprintf("https://github.com/o/r/pull/%d", number),
-		CreatedAt: "2024-01-01T00:00:00Z",
-		Author: struct {
-			Login string `json:"login"`
-		}{Login: author},
-	}
-}
-
-func repoIssue(number int, title, author string) RepoIssue {
-	return RepoIssue{
-		Number:    number,
-		Title:     title,
-		State:     "OPEN",
-		URL:       fmt.Sprintf("https://github.com/o/r/issues/%d", number),
-		CreatedAt: "2024-01-01T00:00:00Z",
-		Author: struct {
-			Login string `json:"login"`
-		}{Login: author},
-	}
-}

@@ -8,8 +8,8 @@
 // per-kind trait table says how to distill that kind's raw payload into a
 // status, how to fingerprint it for idle backoff, and which fetch tiers it
 // honours. The per-poll diff behaviour lives in the monitor package's
-// consumers, which the in-process run loops share — so both code paths emit
-// the same event vocabulary by construction (issue #76).
+// consumers the in-process loops used to share before they were deleted —
+// one event vocabulary, one code path (issue #76).
 package hub
 
 import (
@@ -53,13 +53,29 @@ type FetchFunc func(ctx context.Context, id resolver.Identity, tier monitor.Quer
 // consumes ruleset data.
 type RulesetFunc func(owner, repo string) (*monitor.RulesetChecks, error)
 
+// FailedRunLogFetcher fetches the failed-run log snippet for one workflow run.
+// It is injected because the fetch goes through the gh CLI, whose client lives
+// with the caller (the daemon); without it, failed-run notifications carry no
+// log snippet.
+type FailedRunLogFetcher func(owner, repo string, runID int) (string, error)
+
+// Option configures optional Hub behaviour.
+type Option func(*Hub)
+
+// WithFailedRunLogFetcher installs the daemon-side failed-run log fetcher used
+// by run-target subscribers. See FailedRunLogFetcher.
+func WithFailedRunLogFetcher(fn FailedRunLogFetcher) Option {
+	return func(h *Hub) { h.failedLogs = fn }
+}
+
 // Hub owns one poller goroutine per identity and fans each fetched snapshot
 // out to every subscribed consumer. It is safe for concurrent use.
 type Hub struct {
-	fetch     FetchFunc
-	rulesetFn RulesetFunc
-	interval  time.Duration
-	budget    *monitor.BudgetGuard
+	fetch      FetchFunc
+	rulesetFn  RulesetFunc
+	failedLogs FailedRunLogFetcher
+	interval   time.Duration
+	budget     *monitor.BudgetGuard
 
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
@@ -107,17 +123,22 @@ func keyOf(id resolver.Identity) pollerKey {
 // status checks; pass nil to disable ruleset-aware monitoring. budget, when
 // non-nil, makes every poller stretch its cadence as the shared GraphQL
 // budget runs low (advisory; rate-limit errors keep their hard backoff).
-func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget *monitor.BudgetGuard) *Hub {
+// Options configure the rest (see Option).
+func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget *monitor.BudgetGuard, opts ...Option) *Hub {
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
-	return &Hub{
+	h := &Hub{
 		fetch:     fetch,
 		rulesetFn: rulesetFn,
 		interval:  interval,
 		budget:    budget,
 		pollers:   make(map[pollerKey]*poller),
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // Subscribe registers a consumer for the target named by t and returns a
@@ -163,7 +184,7 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 
 	sub := &sub{
 		distill:    traits.distill(t, opts),
-		consume:    traits.consumer(ro, opts),
+		consume:    traits.consumer(h, ro, opts),
 		cursorOf:   traits.cursorOf,
 		snapOpts:   snapOpts,
 		snapshotCh: make(chan any, 1),
@@ -259,7 +280,7 @@ func (h *Hub) RefreshRepo(owner, repo string) {
 }
 
 // Once performs a single fetch of the target and emits its current actionable
-// state — the hub's equivalent of the in-process WatchOnce paths. It fetches
+// state — the hub's equivalent of the deleted in-process WatchOnce paths. It fetches
 // once at the full tier, distills with the caller's snapshot options, diffs
 // against opts.Baseline (empty means an empty baseline, which is a
 // first-poll), and closes the returned channel when done. No poller is
@@ -308,7 +329,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		}
 
 		distill := traits.distill(t, opts)
-		consume := traits.consumer(ro, opts)
+		consume := traits.consumer(h, ro, opts)
 		cursorOf := traits.cursorOf
 		emit := func(u backend.Update) {
 			if cursorOf != nil {
@@ -447,7 +468,7 @@ type kindTraits struct {
 	// consumer builds the subscriber's diff engine — one of the monitor
 	// package's per-kind consumers — as a kind-agnostic consume closure.
 	// The closure returns true when the target reached a terminal state.
-	consumer func(ro monitor.RunOptions, opts backend.WatchOptions) func(curr backend.Status, emit func(backend.Update)) bool
+	consumer func(h *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(curr backend.Status, emit func(backend.Update)) bool
 
 	// fingerprint covers every field the kind's diff can fire on. It runs on
 	// the poller's raw payload once per fetch.
@@ -464,7 +485,8 @@ type kindTraits struct {
 
 // restore decodes a stored baseline JSON into the consumer's own status type
 // and restores it, for the kinds whose loops honour cursor snapshots (PR and
-// issue — matching runPR/runIssue). Other kinds start from an empty baseline.
+// issue — the kinds whose original loops honoured cursor snapshots). Other
+// kinds start from an empty baseline.
 func restore[T any](c interface{ RestoreBaseline(*T) }, baseline string) {
 	if baseline == "" {
 		return
@@ -475,125 +497,73 @@ func restore[T any](c interface{ RestoreBaseline(*T) }, baseline string) {
 	}
 }
 
-// traitsFor returns the trait table for a target kind.
+// traitsFor returns the trait table for a target kind. The per-kind pieces
+// are named package functions (below) rather than inline closures so each
+// appears exactly once — the duplicate-code detector reads this table, and
+// so should you.
 func traitsFor(kind backend.Kind) kindTraits {
 	switch kind {
 	case backend.KindRef:
 		return kindTraits{
-			distill: func(t backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return func(raw any, _ monitor.SnapshotOptions) backend.Status {
-					return monitor.SnapshotRef(raw.(*monitor.RefQueryResponse).Repository.Ref)
-				}
-			},
-			consumer: func(ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-				c := monitor.NewRefConsumer(ro)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.RefStatus), emit)
-				}
-			},
-			fingerprint: func(raw any) string {
-				return monitor.FingerprintRef(monitor.SnapshotRef(raw.(*monitor.RefQueryResponse).Repository.Ref))
-			},
-			tiered: true,
+			distill:     plainDistill(distillRef),
+			consumer:    refCommitConsumer,
+			fingerprint: fingerprintRefResp,
+			tiered:      true,
 		}
 	case backend.KindCommit:
 		return kindTraits{
-			distill: func(t backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return func(raw any, _ monitor.SnapshotOptions) backend.Status {
-					return monitor.SnapshotCommit(raw.(*monitor.CommitQueryResponse).Repository.Object)
-				}
-			},
-			consumer: func(ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-				c := monitor.NewRefConsumer(ro)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.RefStatus), emit)
-				}
-			},
-			fingerprint: func(raw any) string {
-				return monitor.FingerprintRef(monitor.SnapshotCommit(raw.(*monitor.CommitQueryResponse).Repository.Object))
-			},
-			tiered: true,
+			distill:     plainDistill(distillCommit),
+			consumer:    refCommitConsumer,
+			fingerprint: fingerprintCommitResp,
+			tiered:      true,
 		}
 	case backend.KindIssue:
 		return kindTraits{
-			distill: func(t backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return func(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
-					return monitor.SnapshotIssue(raw.(*monitor.IssueQueryResponse).Repository.Issue,
-						monitor.SnapshotOptions{IgnoredBots: snapOpts.IgnoredBots})
-				}
+			distill: func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+				return distillIssue
 			},
-			consumer: func(ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewIssueConsumer(ro)
 				restore(c, opts.Baseline)
 				return func(curr backend.Status, emit func(backend.Update)) bool {
 					return c.Consume(curr.(*monitor.IssueStatus), emit)
 				}
 			},
-			fingerprint: func(raw any) string {
-				return monitor.FingerprintIssue(monitor.SnapshotIssue(raw.(*monitor.IssueQueryResponse).Repository.Issue,
-					monitor.SnapshotOptions{}))
-			},
+			fingerprint: fingerprintIssueResp,
 		}
 	case backend.KindRun:
 		return kindTraits{
-			distill: func(t backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return func(raw any, _ monitor.SnapshotOptions) backend.Status {
-					return monitor.SnapshotRun(raw.(*monitor.WorkflowRun))
-				}
-			},
-			consumer: func(ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+			distill: plainDistill(distillRun),
+			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewRunConsumer(ro)
 				// The failed-run log snippet is fetched through the gh CLI,
 				// which lives on the daemon side of the wire; the consumer
 				// only needs the distilled detail.
-				c.FailedLogDetail = failedRunLogDetailFn(ro.Identity)
+				c.FailedLogDetail = h.failedRunLogDetail(ro.Identity)
 				return func(curr backend.Status, emit func(backend.Update)) bool {
 					return c.Consume(curr.(*monitor.RunStatus), emit)
 				}
 			},
-			fingerprint: func(raw any) string {
-				return monitor.FingerprintRun(monitor.SnapshotRun(raw.(*monitor.WorkflowRun)))
-			},
+			fingerprint: fingerprintRunResp,
 		}
 	case backend.KindRepo:
 		return kindTraits{
-			distill: func(t backend.Target, opts backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				// The subscriber's cursor position clips the response before
-				// distillation — the daemon-side equivalent of runRepo's
-				// filterRepoResponse. An empty Since means "no cursor":
-				// everything is surfaced, matching an unnamed in-process
-				// watch. A named instance with no cursor passes "now" as
-				// its Since, so it starts from where it was created.
-				since := opts.Since
-				return func(raw any, _ monitor.SnapshotOptions) backend.Status {
-					resp := raw.(*monitor.RepoQueryResponse)
-					if since != "" {
-						resp = monitor.ClipRepoResponse(resp, since)
-					}
-					return monitor.SnapshotRepo(resp)
-				}
-			},
-			consumer: func(ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+			distill: repoDistill,
+			consumer: func(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewRepoConsumer(ro)
 				return func(curr backend.Status, emit func(backend.Update)) bool {
 					return c.Consume(curr.(*monitor.RepoStatus), emit)
 				}
 			},
-			fingerprint: func(raw any) string {
-				return monitor.FingerprintRepo(monitor.SnapshotRepo(raw.(*monitor.RepoQueryResponse)))
-			},
-			cursorOf: func(raw any) string {
-				return monitor.LatestRepoCreatedAt(raw.(*monitor.RepoQueryResponse))
-			},
+			fingerprint: fingerprintRepoResp,
+			cursorOf:    repoCursor,
 		}
 	default: // backend.KindPR
 		return kindTraits{
-			distill: func(t backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return func(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
-					return monitor.Snapshot(raw.(*monitor.PullRequest), snapOpts)
-				}
+			distill: func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+				return distillPR
 			},
-			consumer: func(ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewPRConsumer(ro)
 				restore(c, opts.Baseline)
 				return func(curr backend.Status, emit func(backend.Update)) bool {
@@ -608,29 +578,99 @@ func traitsFor(kind backend.Kind) kindTraits {
 	}
 }
 
-// failedRunLogDetailFn builds the failed-run log fetcher a run consumer
-// needs. It lives here rather than in the traits table's consumer closure
-// body only to keep that closure readable; the daemon wires a real gh CLI
-// client through the package-level hook below.
-//
-// The hub package cannot import the gh CLI client directly (that would drag
-// the CLI's process-execution surface into a package tests fake out), so the
-// daemon installs the fetcher via SetFailedRunLogFetcher at startup. Before
-// that, failed-run notifications carry no log snippet — degraded, not broken.
-var failedRunLogFetcher func(owner, repo string, runID int) (string, error)
-
-// SetFailedRunLogFetcher installs the daemon-side failed-run log fetcher used
-// by run-target subscribers. See failedRunLogFetcher.
-func SetFailedRunLogFetcher(fn func(owner, repo string, runID int) (string, error)) {
-	failedRunLogFetcher = fn
+// plainDistill adapts a distillation that ignores the snapshot options (all
+// kinds except PR and issue) to the trait signature.
+func plainDistill(fn func(raw any) backend.Status) func(backend.Target, backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+	return func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+		return func(raw any, _ monitor.SnapshotOptions) backend.Status {
+			return fn(raw)
+		}
+	}
 }
 
-func failedRunLogDetailFn(id resolver.Identity) func(runID int) string {
+func distillRef(raw any) backend.Status {
+	return monitor.SnapshotRef(raw.(*monitor.RefQueryResponse).Repository.Ref)
+}
+
+func distillCommit(raw any) backend.Status {
+	return monitor.SnapshotCommit(raw.(*monitor.CommitQueryResponse).Repository.Object)
+}
+
+func distillIssue(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
+	return monitor.SnapshotIssue(raw.(*monitor.IssueQueryResponse).Repository.Issue,
+		monitor.SnapshotOptions{IgnoredBots: snapOpts.IgnoredBots})
+}
+
+func distillRun(raw any) backend.Status {
+	return monitor.SnapshotRun(raw.(*monitor.WorkflowRun))
+}
+
+func distillPR(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
+	return monitor.Snapshot(raw.(*monitor.PullRequest), snapOpts)
+}
+
+// repoDistill distills a repo response, clipping it to the subscriber's
+// cursor position first. An empty Since means "no cursor": everything is
+// surfaced. A named instance with no cursor passes "now" as its Since, so
+// it starts from where it was created.
+func repoDistill(t backend.Target, opts backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+	since := opts.Since
+	return func(raw any, _ monitor.SnapshotOptions) backend.Status {
+		resp := raw.(*monitor.RepoQueryResponse)
+		if since != "" {
+			resp = monitor.ClipRepoResponse(resp, since)
+		}
+		return monitor.SnapshotRepo(resp)
+	}
+}
+
+// refCommitConsumer builds the diff engine shared by ref and commit targets:
+// both distill to a RefStatus and diff with the same rules.
+func refCommitConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+	c := monitor.NewRefConsumer(ro)
+	return func(curr backend.Status, emit func(backend.Update)) bool {
+		return c.Consume(curr.(*monitor.RefStatus), emit)
+	}
+}
+
+func fingerprintRefResp(raw any) string {
+	return monitor.FingerprintRef(monitor.SnapshotRef(raw.(*monitor.RefQueryResponse).Repository.Ref))
+}
+
+func fingerprintCommitResp(raw any) string {
+	return monitor.FingerprintRef(monitor.SnapshotCommit(raw.(*monitor.CommitQueryResponse).Repository.Object))
+}
+
+func fingerprintIssueResp(raw any) string {
+	return monitor.FingerprintIssue(monitor.SnapshotIssue(raw.(*monitor.IssueQueryResponse).Repository.Issue,
+		monitor.SnapshotOptions{}))
+}
+
+func fingerprintRunResp(raw any) string {
+	return monitor.FingerprintRun(monitor.SnapshotRun(raw.(*monitor.WorkflowRun)))
+}
+
+func fingerprintRepoResp(raw any) string {
+	return monitor.FingerprintRepo(monitor.SnapshotRepo(raw.(*monitor.RepoQueryResponse)))
+}
+
+// repoCursor extracts the opaque resume token a repo update carries: the
+// latest createdAt in the response, so the client can advance its cursor
+// exactly as runRepo's AdvanceCursor did.
+func repoCursor(raw any) string {
+	return monitor.LatestRepoCreatedAt(raw.(*monitor.RepoQueryResponse))
+}
+
+// failedRunLogDetail builds the failed-run log snippet fetcher a run consumer
+// needs, bound to the hub's injected FailedRunLogFetcher (WithFailedRunLogFetcher).
+// Without one, failed-run notifications carry no log snippet — degraded, not
+// broken.
+func (h *Hub) failedRunLogDetail(id resolver.Identity) func(runID int) string {
 	return func(runID int) string {
-		if failedRunLogFetcher == nil {
+		if h.failedLogs == nil {
 			return ""
 		}
-		out, err := failedRunLogFetcher(id.Owner, id.Repo, runID)
+		out, err := h.failedLogs(id.Owner, id.Repo, runID)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: failed-run log fetch error: %v\n", err)
 			return ""
@@ -654,12 +694,13 @@ type poller struct {
 	budget   *monitor.BudgetGuard
 	ruleset  *monitor.RulesetChecks // fetched once at PR poller start; nil until fetched
 
-	mu       sync.Mutex
-	latest   any // raw payload of the last successful fetch
-	noChange int               // consecutive fingerprint-unchanged fetches; drives idle backoff
-	tier     monitor.QueryTier // last fetched tier; drives shed notices
-	degraded map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
-	subs     map[*sub]struct{}
+	mu         sync.Mutex
+	latest     any               // raw payload of the last successful fetch
+	noChange   int               // consecutive fingerprint-unchanged fetches; drives idle backoff
+	tier       monitor.QueryTier // last fetched tier; drives shed notices
+	degraded   map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
+	errBackoff time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
+	subs       map[*sub]struct{}
 
 	wake  chan struct{}
 	stopc chan struct{}
@@ -763,6 +804,16 @@ func (p *poller) nextDelay() time.Duration {
 	}
 
 	d := monitor.Jittered(monitor.IdleIntervalCapped(p.interval, noChange, ceiling))
+	// A run of consecutive fetch failures backs the cadence off exactly as
+	// the in-process loops did: the error backoff dominates the idle backoff
+	// until a fetch succeeds again, so a hard-down GitHub is polled at
+	// doubling delays up to the same 300s ceiling rather than at full rate.
+	p.mu.Lock()
+	errBackoff := p.errBackoff
+	p.mu.Unlock()
+	if errBackoff > d {
+		d = monitor.Jittered(errBackoff)
+	}
 	if p.budget != nil {
 		d += p.budget.Stretch(time.Now()).Extra
 		if d > ceiling {
@@ -826,6 +877,9 @@ func (p *poller) fetchOnce() {
 					DegradedMessage: fmt.Sprintf("%v", err),
 				})
 			}
+			p.mu.Lock()
+			p.errBackoff = monitor.NextErrBackoff(p.errBackoff, p.interval)
+			p.mu.Unlock()
 			return
 		}
 	}
@@ -838,6 +892,9 @@ func (p *poller) fetchOnce() {
 			Notice: fmt.Sprintf("✅ API recovered (%s) on %s", surface, p.label()),
 		})
 	}
+	p.mu.Lock()
+	p.errBackoff = 0
+	p.mu.Unlock()
 	// Track fingerprint changes so run() can idle-back off a quiet target the
 	// way the in-process loop does. Errors leave noChange untouched: a fetch
 	// that failed tells us nothing about whether the target changed.

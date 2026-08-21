@@ -2,12 +2,10 @@ package monitor
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 )
 
@@ -149,37 +147,6 @@ func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok 
 
 // currentTier returns the fetch tier for the next poll: TierFull when no
 // BudgetGuard is wired, otherwise derived from the advisory GraphQL budget.
-func (o *RunOptions) currentTier() QueryTier {
-	if o.Budget == nil {
-		return TierFull
-	}
-	if remaining, limit, ok := o.Budget.GraphQLRemaining(o.now()); ok {
-		return TierForRemaining(remaining, limit)
-	}
-	return TierFull
-}
-
-// emitTierNotice emits a loud degraded notification when the fetch tier drops
-// (naming exactly what is no longer being watched) or recovers. A watcher
-// that quietly sheds surfaces would turn a missing signal into an apparent
-// all-clear; this is the loud half of that rule.
-func emitTierNotice(opts RunOptions, tier QueryTier, emit func(backend.Update)) {
-	label := degradedLabel(opts)
-	var msg string
-	if shed := tier.ShedSurfaces(); len(shed) > 0 {
-		msg = fmt.Sprintf(
-			"⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers",
-			label, strings.Join(shed, ", "))
-	} else {
-		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", label)
-	}
-	emit(opts.notice(msg))
-}
-
-// isQueryCostError reports whether a GraphQL error is a per-query resource
-// limit ("Resource limits for this query exceeded") rather than a rate-limit
-// 403. A cheaper tier can pass where the richer query failed; a rate-limit
-// 403 cannot — every query costs points, so it keeps the hard backoff.
 func IsQueryCostError(err error) bool {
 	var gqlErr *ghcli.GraphQLError
 	if errors.As(err, &gqlErr) {
@@ -193,33 +160,3 @@ func IsQueryCostError(err error) bool {
 // applyBudgetStretch consults the loop's BudgetGuard (when set), emits a loud
 // notice on transitions into/out of the low state, and returns the delay with
 // any stretch added, capped at the idle-backoff ceiling.
-func applyBudgetStretch(opts RunOptions, d time.Duration, emit func(backend.Update)) time.Duration {
-	if opts.Budget == nil {
-		return d
-	}
-	st := opts.Budget.Stretch(opts.now())
-	if st.Changed {
-		emitBudgetNotice(opts, st, emit)
-	}
-	d += st.Extra
-	if d > maxIdleInterval {
-		d = maxIdleInterval
-	}
-	return d
-}
-
-// emitBudgetNotice emits a degraded-type notification on a budget transition:
-// entering the low state says the cadence is being stretched (loud, so a
-// slow-down is never silent); leaving it says normal cadence resumes.
-func emitBudgetNotice(opts RunOptions, st BudgetState, emit func(backend.Update)) {
-	label := degradedLabel(opts)
-	var msg string
-	if st.Low {
-		msg = fmt.Sprintf(
-			"⚠️ GraphQL budget low (%d/%d) on %s: stretching poll interval to slow consumption until the reset",
-			st.Remaining, st.Limit, label)
-	} else {
-		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming normal poll cadence", label)
-	}
-	emit(opts.notice(msg))
-}

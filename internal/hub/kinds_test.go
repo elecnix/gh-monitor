@@ -359,3 +359,102 @@ func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	assert.Equal(t, 2, n, "each kind gets its own poller")
 	assert.GreaterOrEqual(t, fetches, 2, "each poller fetched independently")
 }
+
+func TestPoller_ErrorBackoff(t *testing.T) {
+	t.Run("failed fetches double the error backoff", func(t *testing.T) {
+		h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+			return nil, errors.New("gh api failed: exit status 1")
+		}, nil, 30*time.Second, nil)
+		t.Cleanup(h.Stop)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		t.Cleanup(cancelSub)
+		waitDegraded(t, ch, "first failure must broadcast")
+
+		h.mu.Lock()
+		p := h.pollers[keyOf(monitor.IdentityOf(testHubTarget()))]
+		h.mu.Unlock()
+		require.NotNil(t, p)
+
+		p.mu.Lock()
+		first := p.errBackoff
+		p.mu.Unlock()
+		assert.Equal(t, 30*time.Second, first, "first failure backs off at the base interval")
+
+		// A second consecutive failure doubles it.
+		p.fetchOnce()
+		p.mu.Lock()
+		second := p.errBackoff
+		p.mu.Unlock()
+		assert.Equal(t, time.Minute, second, "backoff doubles per consecutive failure")
+	})
+
+	t.Run("success resets the error backoff", func(t *testing.T) {
+		calls := 0
+		h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("gh api failed: exit status 1")
+			}
+			return prFixture(nil), nil
+		}, nil, time.Hour, nil)
+		t.Cleanup(h.Stop)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		t.Cleanup(cancelSub)
+		waitDegraded(t, ch, "first failure must broadcast")
+
+		require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+		// The recovery notice is a degraded-type update carrying a Notice
+		// (not a DegradedMessage), so wait for any update at all.
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for the recovery notice")
+		}
+
+		h.mu.Lock()
+		p := h.pollers[keyOf(monitor.IdentityOf(testHubTarget()))]
+		h.mu.Unlock()
+		require.NotNil(t, p)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		assert.Zero(t, p.errBackoff, "a successful fetch resets the error backoff")
+	})
+
+	t.Run("nextDelay honours the error backoff", func(t *testing.T) {
+		h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+			return prFixture(nil), nil
+		}, nil, time.Hour, nil)
+		t.Cleanup(h.Stop)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		t.Cleanup(cancelSub)
+		_ = collect(ch, 50*time.Millisecond)
+
+		h.mu.Lock()
+		var p *poller
+		for _, poller := range h.pollers {
+			p = poller
+		}
+		h.mu.Unlock()
+		require.NotNil(t, p)
+
+		p.mu.Lock()
+		p.noChange = 20 // deep idle backoff
+		p.errBackoff = 2 * time.Minute
+		p.mu.Unlock()
+
+		// The error backoff dominates the idle backoff: with jitter ±20% the
+		// delay must sit near 2 minutes, far above the idle ceiling.
+		d := p.nextDelay()
+		assert.Greater(t, d, monitor.MaxIdleInterval,
+			"an active error backoff must stretch the delay past the idle ceiling")
+	})
+}

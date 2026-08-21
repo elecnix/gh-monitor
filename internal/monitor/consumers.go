@@ -11,10 +11,10 @@ import (
 // consumer never suppresses delivery to another (gh-monitor issues #34, #32).
 //
 // Each one is the single implementation of its target kind's per-poll
-// behaviour: both the in-process run loops (run.go) and the shared poller's
-// per-subscriber goroutines (internal/hub) drive the same Consume method, so
-// the two code paths cannot drift apart — first-poll semantics, event
-// vocabulary, and terminal states are identical by construction.
+// behaviour: the shared poller's per-subscriber goroutines (internal/hub)
+// drive exactly these Consume methods, and the in-process run loops drove
+// them too before they were deleted — which is how parity was proven before
+// the consolidation to a single watch code path (issue #76).
 //
 // Like PRConsumer, no consumer here ever touches the network: the caller
 // fetches the current status and hands it in.
@@ -23,40 +23,43 @@ import (
 // Ref / commit target
 // ---------------------------------------------------------------------------
 
-// RefConsumer holds the per-consumer state for a ref or commit watch.
-type RefConsumer struct {
+// diffConsumer is the shared skeleton of the consumers whose per-poll
+// behaviour is entirely: emit first-poll against an empty baseline, diff,
+// emit each event, and track no-change polls. Ref/commit and repo targets
+// both have exactly that shape (no terminal state, no snapshot persistence),
+// so they are one generic implementation parameterized by status type and
+// diff function — the duplicate-code detector reads this file, and so should
+// you. Issue and run targets have extra per-poll behaviour (terminal states,
+// snapshot saves, failed-log details) and keep their own consumers below.
+type diffConsumer[S any] struct {
 	opts     RunOptions
-	prev     *RefStatus
+	prev     *S
 	noChange int
-}
-
-// NewRefConsumer creates a consumer with an empty baseline.
-func NewRefConsumer(opts RunOptions) *RefConsumer {
-	return &RefConsumer{opts: opts}
+	diff     func(prev, curr *S) []Event
 }
 
 // NoChange reports the number of consecutive polls that produced no events.
-func (c *RefConsumer) NoChange() int { return c.noChange }
+func (c *diffConsumer[S]) NoChange() int { return c.noChange }
 
 // RestoreBaseline sets the consumer's baseline to a previously-stored
 // snapshot.
-func (c *RefConsumer) RestoreBaseline(snapshot *RefStatus) { c.prev = snapshot }
+func (c *diffConsumer[S]) RestoreBaseline(snapshot *S) { c.prev = snapshot }
 
 // Consume diffs curr against the consumer's baseline and invokes emit for
-// every genuinely-new change, mirroring runRef's per-poll behaviour. Ref
-// targets have no terminal state, so Consume always returns false.
-func (c *RefConsumer) Consume(curr *RefStatus, emit func(backend.Update)) bool {
+// every genuinely-new change. It always returns false: these targets have no
+// terminal state and run until cancelled or timed out.
+func (c *diffConsumer[S]) Consume(curr *S, emit func(backend.Update)) bool {
 	firstPoll := c.prev == nil
 	// On the first poll, diff against an empty baseline so all pre-existing
-	// CI issues are surfaced immediately.
+	// state is surfaced immediately.
 	compare := c.prev
 	if firstPoll {
-		compare = &RefStatus{}
-		emit(c.opts.update(curr, Event{Type: EventFirstPoll}))
+		compare = new(S)
+		emit(c.opts.update(any(curr).(backend.Status), Event{Type: EventFirstPoll}))
 	}
-	events := DiffRef(compare, curr)
+	events := c.diff(compare, curr)
 	for _, ev := range events {
-		emit(c.opts.update(curr, ev))
+		emit(c.opts.update(any(curr).(backend.Status), ev))
 	}
 	if len(events) == 0 {
 		c.noChange++
@@ -65,6 +68,14 @@ func (c *RefConsumer) Consume(curr *RefStatus, emit func(backend.Update)) bool {
 	}
 	c.prev = curr
 	return false
+}
+
+// RefConsumer holds the per-consumer state for a ref or commit watch.
+type RefConsumer = diffConsumer[RefStatus]
+
+// NewRefConsumer creates a consumer with an empty baseline.
+func NewRefConsumer(opts RunOptions) *RefConsumer {
+	return &RefConsumer{opts: opts, diff: DiffRef}
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +103,8 @@ func (c *IssueConsumer) NoChange() int { return c.noChange }
 func (c *IssueConsumer) RestoreBaseline(snapshot *IssueStatus) { c.prev = snapshot }
 
 // Consume diffs curr against the consumer's baseline and invokes emit for
-// every genuinely-new change, mirroring runIssue's per-poll behaviour,
+// every genuinely-new change, matching the runIssue loop this consumer was
+// extracted from,
 // including persisting the baseline via opts.SaveSnapshot. It returns
 // terminal=true when the issue is closed (a reopened issue continues).
 func (c *IssueConsumer) Consume(curr *IssueStatus, emit func(backend.Update)) (terminal bool) {
@@ -170,7 +182,8 @@ func (c *RunConsumer) failedDetail(ev Event, runID int) Event {
 }
 
 // Consume diffs curr against the consumer's baseline and invokes emit for
-// every genuinely-new change, mirroring runRun's per-poll behaviour. It
+// every genuinely-new change, matching the runRun loop this consumer was
+// extracted from. It
 // returns terminal=true once the run has completed (its conclusion rides the
 // final run-completed event).
 func (c *RunConsumer) Consume(curr *RunStatus, emit func(backend.Update)) (terminal bool) {
@@ -212,53 +225,15 @@ func (c *RunConsumer) Consume(curr *RunStatus, emit func(backend.Update)) (termi
 // ---------------------------------------------------------------------------
 
 // RepoConsumer holds the per-consumer state for a repository watch (new PRs
-// and issues).
-type RepoConsumer struct {
-	opts     RunOptions
-	prev     *RepoStatus
-	noChange int
-}
+// and issues). It shares diffConsumer's skeleton with the ref/commit
+// consumer; cursor advancement is the caller's concern: only the caller sees
+// the raw response the distilled status came from, and the cursor must
+// advance from every item in it — not just those this consumer emitted.
+type RepoConsumer = diffConsumer[RepoStatus]
 
 // NewRepoConsumer creates a consumer with an empty baseline.
 func NewRepoConsumer(opts RunOptions) *RepoConsumer {
-	return &RepoConsumer{opts: opts}
-}
-
-// NoChange reports the number of consecutive polls that produced no events.
-func (c *RepoConsumer) NoChange() int { return c.noChange }
-
-// RestoreBaseline sets the consumer's baseline to a previously-stored
-// snapshot.
-func (c *RepoConsumer) RestoreBaseline(snapshot *RepoStatus) { c.prev = snapshot }
-
-// Consume diffs curr against the consumer's baseline and invokes emit for
-// every genuinely-new change, mirroring runRepo's per-poll behaviour. Repo
-// targets never reach a terminal state, so Consume always returns false.
-// Cursor advancement is the caller's concern: only the caller sees the raw
-// response the distilled status came from, and the cursor must advance from
-// every item in it — not just those this consumer emitted.
-func (c *RepoConsumer) Consume(curr *RepoStatus, emit func(backend.Update)) bool {
-	firstPoll := c.prev == nil
-	// On the first poll, diff against an empty baseline so all pre-existing
-	// PRs and issues are surfaced immediately — but only those that passed
-	// the caller's cursor filter (a new instance with no cursor shows
-	// nothing).
-	compare := c.prev
-	if firstPoll {
-		compare = &RepoStatus{}
-		emit(c.opts.update(curr, Event{Type: EventFirstPoll}))
-	}
-	events := DiffRepo(compare, curr)
-	for _, ev := range events {
-		emit(c.opts.update(curr, ev))
-	}
-	if len(events) == 0 {
-		c.noChange++
-	} else {
-		c.noChange = 0
-	}
-	c.prev = curr
-	return false
+	return &RepoConsumer{opts: opts, diff: DiffRepo}
 }
 
 // ---------------------------------------------------------------------------

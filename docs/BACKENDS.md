@@ -301,25 +301,31 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 announcing itself as `daemon` with a single capability (`source`), because
 multiplexing one fetch across several watchers is all it does. Since
 [#76](https://github.com/elecnix/gh-monitor/issues/76) it covers every target
-kind — one poller per watched identity, whatever the kind. Everything else —
-reads, mutations — resolves past it to the built-in backend.
+kind — one poller per watched identity, whatever the kind — and it is the only
+way to watch continuously: the built-in backend's Source serves one-shot reads
+only, so a watch with no daemon attached is a hard error, never a silent
+in-process poll loop. Reads and mutations resolve past it to the built-in
+backend.
 
 That is also why it is not special-cased in the client. It registers after the
 built-in backend and before any backend you configured, so an external backend
-you asked for still wins.
+you asked for still wins — and configuring one skips daemon attachment
+entirely.
 
 ```sh
 gh monitor --backend daemon 42   # pin to the shared poller
-GH_MONITOR_DAEMON=0 gh monitor 42  # never use it
 ```
 
 ## What the built-in backend still owns
 
 The `gh` backend provides every capability for every kind, so it is the
-fallback under anything partial. It also keeps the parts that are specific to
-polling the GitHub API, which no other backend has to think about:
+fallback under anything partial. Its Source serves one-shot reads (`--once`):
+a single fetch through an in-process hub, no daemon required. It also keeps
+the parts that are specific to polling the GitHub API, which no other backend
+has to think about:
 
 - adaptive idle backoff and jitter, so quiet targets cost less and concurrent
-  watchers do not poll in phase
+  watchers do not poll in phase (the shared-poller daemon applies the same
+  cadence model per poller)
 - GraphQL budget awareness and query tiering, shedding the least valuable
   surfaces first and saying loudly what it stopped watching
