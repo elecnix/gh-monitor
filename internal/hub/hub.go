@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -317,8 +318,9 @@ type prPoller struct {
 
 	mu       sync.Mutex
 	latest   *monitor.PullRequest
-	noChange int // consecutive fingerprint-unchanged fetches; drives idle backoff
+	noChange int               // consecutive fingerprint-unchanged fetches; drives idle backoff
 	tier     monitor.QueryTier // last fetched tier; drives shed notices
+	degraded map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
 	subs     map[*prSub]struct{}
 
 	wake  chan struct{}
@@ -463,16 +465,30 @@ func (p *prPoller) fetchOnce() {
 			curr, err = fetch(ctx, p.identity, tier-1)
 		}
 		if err != nil || curr == nil {
-			// Degrade loudly: a fetch error must reach subscribers, never
-			// vanish — a silently blind watcher reads as "all clear". The
+			// Degrade loudly, once per episode: a fetch error must reach
+			// subscribers, never vanish — a silently blind watcher reads as
+			// "all clear". Consecutive identical failures are one episode,
+			// one broadcast (issue #66); a changed error re-notifies, and the
+			// recovery notice goes out on the next successful fetch. The
 			// previous snapshot is retained; no inference replaces it.
-			p.broadcast(monitor.Event{
-				Type:            monitor.EventDegraded,
-				DegradedSurface: "graphql",
-				DegradedMessage: fmt.Sprintf("%v", err),
-			})
+			if p.enterDegraded("graphql", fmt.Sprintf("%v", err)) {
+				p.broadcast(monitor.Event{
+					Type:            monitor.EventDegraded,
+					DegradedSurface: "graphql",
+					DegradedMessage: fmt.Sprintf("%v", err),
+				})
+			}
 			return
 		}
+	}
+	// A successful fetch ends every degraded episode this poller has in
+	// flight: announce the recovery before the fresh snapshot, so a
+	// consumer never reads the outage as ongoing past this point.
+	for _, surface := range p.recoverDegraded() {
+		p.broadcast(monitor.Event{
+			Type:   monitor.EventDegraded,
+			Notice: fmt.Sprintf("✅ API recovered (%s) on %s", surface, p.label()),
+		})
 	}
 	// Track fingerprint changes so run() can idle-back off a quiet PR the way
 	// the in-process loop does. Errors leave noChange untouched: a fetch that
@@ -531,6 +547,42 @@ func (p *prPoller) applyTier(tier monitor.QueryTier) {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
 	}
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
+}
+
+// enterDegraded records a degraded observation of the given API surface and
+// reports whether it is new information: the surface just degraded, or it is
+// degraded with a different message than the last broadcast. Consecutive
+// identical failed fetches are one episode, one broadcast (issue #66) — the
+// same transition-noticing semantics the in-process loops use.
+func (p *prPoller) enterDegraded(surface, msg string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.degraded[surface] == msg {
+		return false
+	}
+	if p.degraded == nil {
+		p.degraded = make(map[string]string)
+	}
+	p.degraded[surface] = msg
+	return true
+}
+
+// recoverDegraded returns the sorted surfaces currently in a degraded episode
+// and clears them — the caller has just fetched successfully again.
+// Deterministic order keeps multi-surface recoveries stable for log diffing.
+func (p *prPoller) recoverDegraded() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.degraded) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.degraded))
+	for s := range p.degraded {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	p.degraded = nil
+	return out
 }
 
 // broadcast fans a loop-level event out to every subscriber. Sends are
