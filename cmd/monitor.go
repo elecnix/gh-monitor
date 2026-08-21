@@ -110,6 +110,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return err
 	}
 
+	// A continuous watch is resident: it keeps the running image mapped for
+	// as long as it polls. Launch it from a runtime copy of the binary so the
+	// installed file stays free for `gh extension upgrade` to rewrite in
+	// place (issue #73). One-shot reads exit immediately and need nothing.
+	if !opts.Once {
+		if err := maybeReexecFn(); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"gh-monitor: could not relaunch from a runtime copy (%v); running from the installed binary\n", err)
+		}
+	}
+
 	inferRepo(&opts.Repo)
 
 	var identity resolver.Identity

@@ -424,3 +424,61 @@ func TestDaemon_NoConfigFallsBackToPolling(t *testing.T) {
 	assert.False(t, ok, "absent config must read as not-configured, not an error")
 	assert.Empty(t, loaded)
 }
+
+// TestDaemon_ReexecsFromRuntimeCopy verifies the daemon command relaunches
+// itself from a runtime copy of the binary before doing anything else
+// (issue #73): an upgrade must be able to rewrite the installed file in place
+// while a daemon is resident, which requires the resident image to map some
+// other inode.
+func TestDaemon_ReexecsFromRuntimeCopy(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemons.conf")
+	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
+	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
+	t.Setenv("GH_MONITOR_SOCK", filepath.Join(dir, "unused.sock"))
+
+	var calls int
+	orig := maybeReexecFn
+	t.Cleanup(func() { maybeReexecFn = orig })
+	maybeReexecFn = func() error { calls++; return nil }
+
+	// Sub-daemon mode with a missing child binary returns immediately, so the
+	// command exercises RunE's preamble without binding anything.
+	cmd := newDaemonCommand()
+	cmd.SetArgs([]string{"--socket", filepath.Join(dir, "unused.sock"), "--interval", "10"})
+	require.NoError(t, cmd.Execute())
+	assert.Equal(t, 1, calls, "daemon must attempt the relaunch from a runtime copy exactly once")
+}
+
+// TestDaemon_ReexecFailureIsNotFatal verifies a failed relaunch only logs and
+// the daemon still starts (in place) rather than refusing to run.
+func TestDaemon_ReexecFailureIsNotFatal(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "daemons.conf")
+	require.NoError(t, os.WriteFile(cfgPath, []byte("broker-subscriber /no/such/binary daemon\n"), 0o644))
+	t.Setenv("GH_MONITOR_SUBDAEMONS", cfgPath)
+	t.Setenv("GH_MONITOR_SOCK", filepath.Join(dir, "unused.sock"))
+
+	orig := maybeReexecFn
+	t.Cleanup(func() { maybeReexecFn = orig })
+	maybeReexecFn = func() error { return errors.New("boom") }
+
+	cmd := newDaemonCommand()
+	cmd.SetArgs([]string{"--socket", filepath.Join(dir, "unused.sock"), "--interval", "10"})
+	require.NoError(t, cmd.Execute(), "a failed relaunch must not stop the daemon")
+}
+
+// TestMonitor_ReexecSkippedForOnce verifies a one-shot read never relaunches:
+// it exits immediately, so it never keeps the installed image mapped.
+func TestMonitor_ReexecSkippedForOnce(t *testing.T) {
+	var calls int
+	orig := maybeReexecFn
+	t.Cleanup(func() { maybeReexecFn = orig })
+	maybeReexecFn = func() error { calls++; return nil }
+
+	root := newRootCommand()
+	root.SetArgs([]string{"--once", "-R", "owner/repo", "1"})
+	// The run itself may fail on network/credentials; only the hook matters.
+	_ = root.Execute()
+	assert.Equal(t, 0, calls, "--once must not relaunch from a runtime copy")
+}

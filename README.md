@@ -365,6 +365,10 @@ Concurrent auto-starts are race-safe: at most one daemon binds a socket (a secon
 
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (so a client falls back to in-process polling when no daemon is running instead of spawning one). `--once` and non-PR targets always use the in-process loop.
 
+#### Upgrading while watchers run
+
+Resident processes — the daemon, and any continuous `monitor` watch — relaunch themselves from a **runtime copy** of the binary (`$XDG_RUNTIME_DIR/gh-monitor/gh-monitor`, falling back to the user cache dir) before they start polling. The installed file in `~/.local/share/gh/extensions/gh-monitor/` is therefore only exec'd for the instant of launch, so `gh extension upgrade` can rewrite it in place even while watchers run ([#73](https://github.com/elecnix/gh-monitor/issues/73)); without this, Linux rejects the upgrade with "text file busy" because the running image is mapped from the installed file. Running watchers keep polling their already-loaded copy until restarted, so restart them once after an upgrade to pick up the new version. Set `GH_MONITOR_REEXEC=0` to disable the relaunch and run resident commands from the installed path (the pre-#73 behaviour).
+
 #### Broker transport (optional)
 
 The daemon can subscribe to an external GitHub-webhook fan-out broker (AWS IoT Core MQTT, or any broker publishing the same normalized event envelope) and treat each event as a wake signal that triggers an immediate fetch, instead of waiting for the next tick. It is entirely opt-in and additive: no `monitor` client, skill, or workflow changes — the daemon still fetches ground truth through the exact same GraphQL/REST path either way; a broker event only ever decides _when_ that fetch runs, never what it returns. A watcher never derives PR or CI state from the event stream itself, because that stream can drop messages across a long disconnect with no reliable replay.

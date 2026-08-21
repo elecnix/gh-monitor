@@ -22,6 +22,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
+	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
 )
@@ -69,6 +70,13 @@ normal interval polling within one cycle, never silence. See the README's
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// The daemon is the most resident process gh-monitor runs, so it
+			// must not keep the installed binary's image mapped: relaunch from
+			// a runtime copy the upgrade path can replace in place (issue #73).
+			if err := maybeReexecFn(); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"gh-monitor daemon: could not relaunch from a runtime copy (%v); running from the installed binary\n", err)
+			}
 			if socket == "" {
 				socket = ipc.DefaultSocketPath()
 			}
@@ -324,6 +332,10 @@ func isDisconnect(err error) bool {
 // variable so tests can substitute an in-process server instead of re-exec'ing
 // the real binary.
 var spawnDaemonFn = spawnDaemon
+
+// maybeReexecFn relaunches the current resident command from a runtime copy
+// of the binary (issue #73). Package variable so tests run in place.
+var maybeReexecFn = reexec.MaybeReexec
 
 // daemonAutostart reports whether `gh monitor` clients should spawn a daemon
 // when none is running. Default true; opt out with GH_MONITOR_AUTOSTART=0.
