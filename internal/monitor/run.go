@@ -34,12 +34,14 @@ const (
 	defaultInterval = 60 * time.Second
 )
 
-// maxFailedLogLines caps the failed-run log snippet embedded in a
+// MaxFailedLogLines caps the failed-run log snippet embedded in a
 // run-completed notification (issue #19). `gh run view --log-failed` emits the
 // full failed-step log chronologically, with the actual error at the END, so we
 // keep the last N lines (the error + its immediate context) rather than the
 // first N — taking the head would capture only setup noise and miss the error.
-const maxFailedLogLines = 50
+// It is exported so the shared poller daemon caps its snippets exactly as the
+// in-process loop does.
+const MaxFailedLogLines = 50
 
 // runFailureConclusions are the terminal conclusions that mean the run did not
 // succeed and therefore warrant a failed-log snippet.
@@ -77,13 +79,14 @@ func cleanFailedLogLine(line string) string {
 	return fields[1] + "\t" + logTsRE.ReplaceAllString(fields[2], "")
 }
 
-// summarizeFailedLog cleans and tail-truncates the failed-run log output so the
-// snippet carries the error (which lives at the end of the `--log-failed`
-// output) plus its immediate context. When the cleaned log fits within maxLines
-// it is returned verbatim; otherwise the last maxLines lines are kept, prefixed
-// by a one-line marker noting how many earlier lines were dropped. Empty input
-// yields "".
-func summarizeFailedLog(s string, maxLines int) string {
+// SummarizeFailedLog cleans and tail-truncates the failed-run log output so
+// the snippet carries the error (which lives at the end of the `--log-failed`
+// output) plus its immediate context. When the cleaned log fits within
+// maxLines it is returned verbatim; otherwise the last maxLines lines are
+// kept, prefixed by a one-line marker noting how many earlier lines were
+// dropped. Empty input yields "". It is exported so the shared poller daemon
+// summarizes snippets exactly as the in-process loop does.
+func SummarizeFailedLog(s string, maxLines int) string {
 	s = strings.TrimPrefix(s, "\ufeff") // strip a leading BOM if present
 	if strings.TrimSpace(s) == "" {
 		return ""
@@ -112,7 +115,7 @@ func failedRunLogDetail(svc *Service, id resolver.Identity, runID int) string {
 		fmt.Fprintf(os.Stderr, "gh-monitor: failed-run log fetch error: %v\n", err)
 		return ""
 	}
-	return summarizeFailedLog(out, maxFailedLogLines)
+	return SummarizeFailedLog(out, MaxFailedLogLines)
 }
 
 // Notification is one emitted event, rendered for a consumer. It serializes to a
@@ -634,7 +637,6 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		emitDegradedRecovery(opts, emit)
 
 		c.Consume(curr, emit)
-		errBackoff = 0
 
 		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
@@ -1346,7 +1348,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 		// restart never misses items, even when the current poll was filtered
 		// to empty by an event allowlist.
 		if opts.AdvanceCursor != nil {
-			if latest := latestRepoCreatedAt(resp); latest != "" {
+			if latest := LatestRepoCreatedAt(resp); latest != "" {
 				opts.AdvanceCursor(latest)
 			}
 		}
@@ -1380,7 +1382,7 @@ func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 		emit(opts.update(curr, ev))
 	}
 	if opts.AdvanceCursor != nil {
-		if latest := latestRepoCreatedAt(resp); latest != "" {
+		if latest := LatestRepoCreatedAt(resp); latest != "" {
 			opts.AdvanceCursor(latest)
 		}
 	}
@@ -1419,7 +1421,16 @@ func filterRepoResponse(resp *RepoQueryResponse, opts RunOptions) *RepoQueryResp
 		// FromBeginning with no cursor: emit everything.
 		return resp
 	}
+	return ClipRepoResponse(resp, threshold)
+}
 
+// ClipRepoResponse returns a copy of resp with every PR and issue created at
+// or before threshold (an RFC3339 timestamp) suppressed. It is the shared
+// clipping primitive behind the named-instance cursor filter: the in-process
+// runRepo loop applies it via filterRepoResponse, and the shared poller
+// applies it to a subscriber's WatchOptions.Since so a repo watch resumed
+// from a cursor sees only what came after it.
+func ClipRepoResponse(resp *RepoQueryResponse, threshold string) *RepoQueryResponse {
 	// Shallow copy and filter nodes.
 	filtered := *resp
 	filtered.Repository.PullRequests.Nodes = filterRepoPRs(resp.Repository.PullRequests.Nodes, threshold)
@@ -1447,10 +1458,13 @@ func filterRepoIssues(nodes []RepoIssue, threshold string) []RepoIssue {
 	return out
 }
 
-// latestRepoCreatedAt returns the most recent CreatedAt timestamp among all
+// LatestRepoCreatedAt returns the most recent CreatedAt timestamp among all
 // PRs and issues in the response. It returns "" when the response has no
-// items, so the caller leaves the cursor unchanged.
-func latestRepoCreatedAt(resp *RepoQueryResponse) string {
+// items, so the caller leaves the cursor unchanged. It is exported because
+// both cursor consumers need it: the in-process runRepo loop advances the
+// cursor with it after each poll, and the shared poller stamps it onto every
+// update it emits for a repo target so the client can do the same.
+func LatestRepoCreatedAt(resp *RepoQueryResponse) string {
 	var latest string
 	for _, p := range resp.Repository.PullRequests.Nodes {
 		if p.CreatedAt > latest {

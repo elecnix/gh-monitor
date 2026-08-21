@@ -153,7 +153,7 @@ func TestRunRun_FailureLogTruncatesToLastFiftyLines(t *testing.T) {
 	require.NotNil(t, completed)
 	lines := strings.Split(completed.Detail, "\n")
 	// 1 truncation marker + 50 kept (tail) lines.
-	assert.Equal(t, maxFailedLogLines+1, len(lines))
+	assert.Equal(t, MaxFailedLogLines+1, len(lines))
 	assert.Contains(t, completed.Detail, "THE_FINAL_ERROR", "the tail must keep the final error line")
 	assert.NotContains(t, completed.Detail, "line 0", "the head must be dropped")
 }
@@ -265,13 +265,13 @@ func TestOnceRun_FailureIncludesFailedLogSnippet(t *testing.T) {
 
 func TestSummarizeFailedLog(t *testing.T) {
 	t.Run("empty stays empty", func(t *testing.T) {
-		assert.Equal(t, "", summarizeFailedLog("", 50))
-		assert.Equal(t, "", summarizeFailedLog("   \n  ", 50))
+		assert.Equal(t, "", SummarizeFailedLog("", 50))
+		assert.Equal(t, "", SummarizeFailedLog("   \n  ", 50))
 	})
 
 	t.Run("under limit cleaned and joined", func(t *testing.T) {
 		in := "admin-ci\tbuild\t2026-01-01T00:00:00.000Z step one\nadmin-ci\tbuild\t2026-01-01T00:00:01.000Z step two\n"
-		out := summarizeFailedLog(in, 50)
+		out := SummarizeFailedLog(in, 50)
 		assert.Equal(t, "build\tstep one", strings.Split(out, "\n")[0])
 		assert.Equal(t, "build\tstep two", strings.Split(out, "\n")[1])
 		assert.NotContains(t, out, "2026-01-01")
@@ -282,7 +282,7 @@ func TestSummarizeFailedLog(t *testing.T) {
 		for i := 0; i < 60; i++ {
 			b.WriteString("wf\tjob\t2026-01-01T00:00:00.000Z line " + strconv.Itoa(i) + "\n")
 		}
-		out := summarizeFailedLog(b.String(), 50)
+		out := SummarizeFailedLog(b.String(), 50)
 		lines := strings.Split(out, "\n")
 		require.Len(t, lines, 51) // marker + 50
 		assert.Contains(t, lines[0], "earlier lines truncated")
@@ -298,7 +298,7 @@ func TestSummarizeFailedLog(t *testing.T) {
 		for i := 0; i < 50; i++ {
 			b.WriteString("wf\tjob\t2026-01-01T00:00:00.000Z line " + strconv.Itoa(i) + "\n")
 		}
-		out := summarizeFailedLog(b.String(), 50)
+		out := SummarizeFailedLog(b.String(), 50)
 		lines := strings.Split(out, "\n")
 		assert.Len(t, lines, 50)
 		assert.NotContains(t, out, "truncated")

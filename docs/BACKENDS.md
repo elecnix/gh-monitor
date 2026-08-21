@@ -298,14 +298,15 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 ## The shared-poller daemon
 
 `gh monitor daemon` is a backend like any other. It speaks the protocol above,
-announcing itself as `daemon` with a single capability (`source`) for a single
-kind (`pr`), because multiplexing one fetch across several watchers is all it
-does. Everything else — reads, mutations, every other target kind — resolves
-past it to the built-in backend.
+announcing itself as `daemon` with a single capability (`source`), because
+multiplexing one fetch across several watchers is all it does. Since
+[#76](https://github.com/elecnix/gh-monitor/issues/76) it covers every target
+kind — one poller per watched identity, whatever the kind. Everything else —
+reads, mutations — resolves past it to the built-in backend.
 
 That is also why it is not special-cased in the client. It registers after the
 built-in backend and before any backend you configured, so an external backend
-you asked for still wins, and a target the daemon does not cover still works.
+you asked for still wins.
 
 ```sh
 gh monitor --backend daemon 42   # pin to the shared poller
