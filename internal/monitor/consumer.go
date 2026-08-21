@@ -3,9 +3,10 @@ package monitor
 import "github.com/elecnix/gh-monitor/backend"
 
 // PRConsumer holds the per-consumer state for a PR monitor: its own baseline
-// snapshot and no-change counter. It is reused by the in-process runPR loop
-// and by the hub's per-consumer goroutines so that consumption by one consumer
-// never suppresses delivery to another (gh-monitor issues #34, #32).
+// snapshot and no-change counter. It is driven by the hub's per-consumer
+// goroutines (and was driven by the in-process runPR loop before the
+// issue-#76 consolidation) so that consumption by one consumer never
+// suppresses delivery to another (gh-monitor issues #34, #32).
 //
 // All diffing and rendering happens against the consumer's own baseline; the
 // only shared input is the fetched *PRStatus, which a shared poller produces
@@ -17,7 +18,8 @@ type PRConsumer struct {
 }
 
 // NewPRConsumer creates a consumer with an empty baseline. The first call to
-// Consume mirrors runPR's first poll: it diffs against an empty PRStatus so
+// Consume mirrors the runPR loop's first poll: it diffs against an empty
+// PRStatus so
 // all pre-existing issues surface immediately.
 func NewPRConsumer(opts RunOptions) *PRConsumer {
 	return &PRConsumer{opts: opts}
@@ -37,7 +39,7 @@ func (c *PRConsumer) RestoreBaseline(snapshot *PRStatus) {
 }
 
 // Consume diffs curr against the consumer's baseline and invokes emit for
-// every genuinely-new change, mirroring runPR's per-poll behaviour. It returns
+// every genuinely-new change, matching the runPR loop's per-poll behaviour. It returns
 // terminal=true when the PR is merged or closed (the caller should stop
 // polling this identity for this consumer).
 //

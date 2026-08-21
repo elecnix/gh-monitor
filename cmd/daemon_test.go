@@ -235,31 +235,8 @@ func TestDaemon_NotUsedWhenSocketAbsent(t *testing.T) {
 		}))
 	err := attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "GH_MONITOR_DAEMON=0",
-		"the error must name the escape hatch")
-}
-
-// TestDaemon_OptedOutByEnv verifies GH_MONITOR_DAEMON=0 keeps the daemon out of
-// the registry even when one is listening — the transition-era escape hatch
-// that keeps the in-process loops available.
-func TestDaemon_OptedOutByEnv(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	sock, _ := startTestDaemon(t, ctx, openPR)
-	t.Setenv("GH_MONITOR_SOCK", sock)
-	t.Setenv("GH_MONITOR_DAEMON", "0")
-
-	reg := backend.NewRegistry()
-	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
-		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
-			return nil, nil
-		}))
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
-
-	_, name, err := reg.SourceFor(daemonTarget())
-	require.NoError(t, err)
-	assert.Equal(t, gh.Name, name, "GH_MONITOR_DAEMON=0 must keep the daemon unused")
+	assert.Contains(t, err.Error(), "gh monitor daemon",
+		"the error must name the fix")
 }
 
 // TestDaemon_ServesEveryTargetKind verifies the shared poller multiplexes all

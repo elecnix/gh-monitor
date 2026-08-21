@@ -21,24 +21,6 @@ func (o *RunOptions) update(status backend.Status, ev Event) backend.Update {
 	}
 }
 
-// notice builds an Update carrying a diagnostic the loop raises about itself
-// rather than about the target — an API surface that could not be read, or a
-// surface it stopped watching to stay inside a tight budget.
-func (o *RunOptions) notice(msg string) backend.Update {
-	return backend.Update{
-		Target: TargetOf(o.Identity),
-		Event:  Event{Type: EventDegraded, Notice: msg},
-		At:     o.now(),
-	}
-}
-
-// renderTo adapts a Notification consumer to the Update-emitting loops.
-func (o RunOptions) renderTo(emit func(Notification)) func(backend.Update) {
-	return func(u backend.Update) {
-		emit(Render(u, o.Prefs, o.Interval))
-	}
-}
-
 // isTerminalEvent reports whether an event marks the target as finished, so
 // nothing further will be observed about it.
 func isTerminalEvent(t EventType) bool {

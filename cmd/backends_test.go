@@ -85,10 +85,12 @@ func TestBackendsCommandListsTheBuiltInBackend(t *testing.T) {
 
 	out := stdout.String()
 	assert.Contains(t, out, "gh")
-	assert.Contains(t, out, "source")
 	assert.Contains(t, out, "reader")
-	// The built-in backend covers every kind, so it reports "all" rather than
-	// enumerating them.
+	// The Source it registers serves one-shot reads only; continuous watching
+	// goes through the shared-poller daemon (issue #76).
+	assert.Contains(t, out, "source")
+	// It covers every kind for what it does register, so it reports "all"
+	// rather than enumerating them.
 	assert.Contains(t, out, "all")
 }
 
@@ -131,7 +133,6 @@ func TestBackendsCommandShowsAnExternalBackendsPartialSurface(t *testing.T) {
 func TestMonitorStreamsFromAnExternalBackend(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
-	t.Setenv("GH_MONITOR_DAEMON", "0") // the daemon is a built-in-backend path
 
 	watched := make(chan backend.Target, 1)
 	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
@@ -197,10 +198,13 @@ func TestMonitorStreamsFromAnExternalBackend(t *testing.T) {
 	assert.Equal(t, "merged", second.Type)
 }
 
-func TestMonitorFallsBackToTheBuiltInBackendForUncoveredKinds(t *testing.T) {
+// TestMonitorUncoveredKindIsAHardError verifies the end-state behaviour after
+// the in-process loops were deleted (issue #76): an external backend that
+// covers only some kinds leaves the others to no one, and a watch for an
+// uncovered kind fails loudly rather than silently doing nothing.
+func TestMonitorUncoveredKindIsAHardError(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
-	t.Setenv("GH_MONITOR_DAEMON", "0")
 
 	// The external backend covers pull requests only.
 	endpoint := serveTestBackend(t, remote.ServerConfig{
@@ -229,10 +233,10 @@ func TestMonitorFallsBackToTheBuiltInBackendForUncoveredKinds(t *testing.T) {
 	root.SetOut(stdout)
 	root.SetErr(&bytes.Buffer{})
 	root.SetArgs([]string{"--issue", "3", "-R", "o/r"})
-	require.NoError(t, root.Execute())
-
-	assert.True(t, polled, "an issue is not covered by the external backend, so gh must handle it")
-	assert.Contains(t, stdout.String(), "issue-closed")
+	err := root.Execute()
+	require.Error(t, err)
+	assert.False(t, polled,
+		"the built-in backend registers no Source: nothing may silently watch what no backend covers")
 }
 
 func TestMonitorRejectsAnUnknownPinnedBackend(t *testing.T) {

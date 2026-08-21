@@ -3,9 +3,13 @@ package monitor
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/elecnix/gh-monitor/internal/prefs"
+	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 func TestFormatDiffExcerpt(t *testing.T) {
@@ -78,6 +82,17 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(digits)
+}
+
+// testRunOptions builds the render-time RunOptions the notification tests
+// need: identity for the labels, default templates, a fixed clock.
+func testRunOptions() RunOptions {
+	return RunOptions{
+		Identity: resolver.Identity{Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
+		Prefs:    prefs.DefaultPreferences(),
+		Interval: 60 * time.Second,
+		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
+	}
 }
 
 func TestRenderNotification_ThreadDetail(t *testing.T) {
