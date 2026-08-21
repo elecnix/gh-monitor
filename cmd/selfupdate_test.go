@@ -55,11 +55,11 @@ func TestUpgradeWatcherSpawnsOnBinaryChange(t *testing.T) {
 	var spawned []string
 	origSpawn := spawnUpgradedDaemonFn
 	t.Cleanup(func() { spawnUpgradedDaemonFn = origSpawn })
-	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) error {
+	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) (*os.Process, error) {
 		mu.Lock()
 		spawned = append(spawned, installed)
 		mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	var messages string
 	stop := watchForTest(t, installed, filepath.Join(dir, "d.sock"), func(s string) { messages += s })
@@ -96,9 +96,9 @@ func TestUpgradeWatcherQuietWhileUnchanged(t *testing.T) {
 	var spawns int
 	origSpawn := spawnUpgradedDaemonFn
 	t.Cleanup(func() { spawnUpgradedDaemonFn = origSpawn })
-	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) error {
+	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) (*os.Process, error) {
 		spawns++
-		return nil
+		return nil, nil
 	}
 
 	stop := watchForTest(t, installed, filepath.Join(dir, "d.sock"), func(string) {})
@@ -126,8 +126,8 @@ func TestUpgradeWatcherKeepsServingWhenSuccessorFails(t *testing.T) {
 
 	origSpawn := spawnUpgradedDaemonFn
 	t.Cleanup(func() { spawnUpgradedDaemonFn = origSpawn })
-	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) error {
-		return nil // successor starts but never takes over
+	spawnUpgradedDaemonFn = func(installed, socket string, interval time.Duration) (*os.Process, error) {
+		return nil, nil // successor starts but never takes over
 	}
 
 	stop := watchForTest(t, installed, filepath.Join(dir, "d.sock"), record)
