@@ -3,10 +3,7 @@ package monitor
 import (
 	"errors"
 	"testing"
-	"time"
 
-	"github.com/elecnix/gh-monitor/internal/prefs"
-	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -190,16 +187,15 @@ func TestDiffRepo_NilPrev(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Run / Once repo tests
+// Repo notification rendering
 // ---------------------------------------------------------------------------
 
+// repoRunOptions is testRunOptions pointed at a repo identity — one shared
+// base so the render tests agree on templates and the fixed clock.
 func repoRunOptions() RunOptions {
-	return RunOptions{
-		Identity: resolver.Identity{Owner: "o", Repo: "r", Target: "repo", Host: "github.com"},
-		Prefs:    prefs.DefaultPreferences(),
-		Interval: 60,
-		Now:      func() time.Time { return time.Unix(0, 0).UTC() },
-	}
+	opts := testRunOptions()
+	opts.Identity.Target = "repo"
+	return opts
 }
 
 func TestRenderNotificationRepo(t *testing.T) {

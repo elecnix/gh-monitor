@@ -519,15 +519,11 @@ func traitsFor(kind backend.Kind) kindTraits {
 		}
 	case backend.KindIssue:
 		return kindTraits{
-			distill: func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return distillIssue
-			},
+			distill: snapDistill(distillIssue),
 			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewIssueConsumer(ro)
 				restore(c, opts.Baseline)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.IssueStatus), emit)
-				}
+				return consumeVia(c)
 			},
 			fingerprint: fingerprintIssueResp,
 		}
@@ -540,35 +536,24 @@ func traitsFor(kind backend.Kind) kindTraits {
 				// which lives on the daemon side of the wire; the consumer
 				// only needs the distilled detail.
 				c.FailedLogDetail = h.failedRunLogDetail(ro.Identity)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.RunStatus), emit)
-				}
+				return consumeVia(c)
 			},
 			fingerprint: fingerprintRunResp,
 		}
 	case backend.KindRepo:
 		return kindTraits{
-			distill: repoDistill,
-			consumer: func(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-				c := monitor.NewRepoConsumer(ro)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.RepoStatus), emit)
-				}
-			},
+			distill:     repoDistill,
+			consumer:    repoConsumer,
 			fingerprint: fingerprintRepoResp,
 			cursorOf:    repoCursor,
 		}
 	default: // backend.KindPR
 		return kindTraits{
-			distill: func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-				return distillPR
-			},
+			distill: snapDistill(distillPR),
 			consumer: func(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
 				c := monitor.NewPRConsumer(ro)
 				restore(c, opts.Baseline)
-				return func(curr backend.Status, emit func(backend.Update)) bool {
-					return c.Consume(curr.(*monitor.PRStatus), emit)
-				}
+				return consumeVia(c)
 			},
 			fingerprint: func(raw any) string {
 				return monitor.Fingerprint(raw.(*monitor.PullRequest))
@@ -581,10 +566,17 @@ func traitsFor(kind backend.Kind) kindTraits {
 // plainDistill adapts a distillation that ignores the snapshot options (all
 // kinds except PR and issue) to the trait signature.
 func plainDistill(fn func(raw any) backend.Status) func(backend.Target, backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
+	return snapDistill(func(raw any, _ monitor.SnapshotOptions) backend.Status {
+		return fn(raw)
+	})
+}
+
+// snapDistill adapts a distillation that reads the subscriber's snapshot
+// options (PR: annotation levels; issue: ignored bots) to the trait
+// signature.
+func snapDistill(fn func(raw any, snapOpts monitor.SnapshotOptions) backend.Status) func(backend.Target, backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
 	return func(_ backend.Target, _ backend.WatchOptions) func(any, monitor.SnapshotOptions) backend.Status {
-		return func(raw any, _ monitor.SnapshotOptions) backend.Status {
-			return fn(raw)
-		}
+		return fn
 	}
 }
 
@@ -627,9 +619,20 @@ func repoDistill(t backend.Target, opts backend.WatchOptions) func(any, monitor.
 // refCommitConsumer builds the diff engine shared by ref and commit targets:
 // both distill to a RefStatus and diff with the same rules.
 func refCommitConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
-	c := monitor.NewRefConsumer(ro)
+	return consumeVia(monitor.NewRefConsumer(ro))
+}
+
+// repoConsumer builds the diff engine for a repository watch.
+func repoConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) func(backend.Status, func(backend.Update)) bool {
+	return consumeVia(monitor.NewRepoConsumer(ro))
+}
+
+// consumeVia adapts one of the monitor package's typed consumers to the
+// kind-agnostic consume closure the trait table stores. P exists only to
+// tell the compiler that *S really is a backend.Status.
+func consumeVia[S any, P interface{ *S; backend.Status }](c interface{ Consume(P, func(backend.Update)) bool }) func(backend.Status, func(backend.Update)) bool {
 	return func(curr backend.Status, emit func(backend.Update)) bool {
-		return c.Consume(curr.(*monitor.RefStatus), emit)
+		return c.Consume(curr.(P), emit)
 	}
 }
 
