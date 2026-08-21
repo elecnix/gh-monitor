@@ -3,7 +3,6 @@ package mux
 import (
 	"context"
 	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/remote"
+	"github.com/elecnix/gh-monitor/internal/mux/muxtest"
 )
 
 // shortSock returns a socket path under a short directory: macOS caps Unix
@@ -53,26 +53,11 @@ func (s *recordingSource) Watch(ctx context.Context, t backend.Target, _ backend
 }
 
 // startFakeBackend serves the remote protocol on sockPath as a sub-daemon
-// would, advertising kinds and streaming src's updates.
+// would, advertising kinds and streaming src's updates. It delegates to the
+// shared muxtest helper.
 func startFakeBackend(t *testing.T, ctx context.Context, sockPath string, kinds []backend.Kind, src backend.Source) {
 	t.Helper()
-	l, err := net.Listen("unix", sockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Close() })
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-				_ = remote.Serve(ctx, c, remote.ServerConfig{Name: "fakebroker", Kinds: kinds, Source: src})
-			}(conn)
-		}
-	}()
+	muxtest.StartFakeBackend(t, ctx, sockPath, kinds, src)
 }
 
 func TestSocketPathSanitizesName(t *testing.T) {

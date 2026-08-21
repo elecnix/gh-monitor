@@ -20,6 +20,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/mux"
+	"github.com/elecnix/gh-monitor/internal/mux/muxtest"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
@@ -94,41 +95,7 @@ func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string
 // bindTestServerOn is bindTestServer for an already-bound listener — the
 // shape a handoff successor has after adopting its predecessor's socket.
 func bindTestServerOn(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener) *daemonServer {
-	t.Helper()
-	// A derived context is what makes a handoff complete: the successor's fd
-	// pass triggers shutdown, which must close every client connection — the
-	// signal watchers use to reconnect to the successor.
-	serveCtx, cancel := context.WithCancel(ctx)
-	var handedOff atomic.Bool
-	srv := &daemonServer{
-		hub:       h,
-		listener:  l,
-		handedOff: &handedOff,
-		shutdown:  func() { cancel(); _ = l.Close() },
-	}
-	var wg sync.WaitGroup
-	t.Cleanup(func() {
-		// Cancel first: serveWatch returns only when its context is done, so
-		// waiting for the serve goroutines before cancelling would deadlock.
-		cancel()
-		_ = l.Close()
-		wg.Wait()
-	})
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			wg.Add(1)
-			go func(c net.Conn) {
-				defer wg.Done()
-				defer func() { _ = c.Close() }()
-				serveClient(serveCtx, srv, c)
-			}(conn)
-		}
-	}()
-	return srv
+	return bindTestServerOnWithRoutes(t, ctx, h, l, nil)
 }
 
 // recordingDaemonSource is a backend.Source that emits its updates once and
@@ -147,30 +114,20 @@ func (s *recordingDaemonSource) Watch(ctx context.Context, _ backend.Target, _ b
 }
 
 // startFakeSubdaemon serves the remote protocol on sockPath as a sub-daemon
-// binary would after the launcher points it at a private socket.
+// binary would after the launcher points it at a private socket. It delegates
+// to the shared muxtest helper.
 func startFakeSubdaemon(t *testing.T, ctx context.Context, sockPath string, kinds []backend.Kind, src backend.Source) {
 	t.Helper()
-	l, err := net.Listen("unix", sockPath)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = l.Close() })
-	go func() {
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				defer func() { _ = c.Close() }()
-				_ = remote.Serve(ctx, c, remote.ServerConfig{Name: "fakebroker", Kinds: kinds, Source: src})
-			}(conn)
-		}
-	}()
+	muxtest.StartFakeBackend(t, ctx, sockPath, kinds, src)
 }
 
 // bindTestServerOnWithRoutes is bindTestServerOn for a daemon that also routes
 // kinds to discovered sub-daemons (issue #88).
 func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry) *daemonServer {
 	t.Helper()
+	// A derived context is what makes a handoff complete: the successor's fd
+	// pass triggers shutdown, which must close every client connection — the
+	// signal watchers use to reconnect to the successor.
 	serveCtx, cancel := context.WithCancel(ctx)
 	var handedOff atomic.Bool
 	srv := &daemonServer{
