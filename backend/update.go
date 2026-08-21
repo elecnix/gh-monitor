@@ -60,7 +60,11 @@ type Update struct {
 // that cannot honour one ignores it rather than failing.
 type WatchOptions struct {
 	// Since is an opaque cursor from a previous Update. Empty means "start
-	// from now" — deliver changes from this moment on.
+	// from now" — deliver changes from this moment on. For repo targets it is
+	// the createdAt cursor: items created at or before it are suppressed
+	// before distillation, and every update the backend emits carries the new
+	// position in Update.Cursor. PR and issue targets ignore it; resume for
+	// those kinds goes through Baseline.
 	Since string `json:"since,omitempty"`
 
 	// Kinds narrows the event types the caller cares about. Empty means all.
@@ -99,6 +103,14 @@ type WatchOptions struct {
 	// replaying everything it currently knows. Empty means the watch has no
 	// history to resume.
 	ResumeID string `json:"resume_id,omitempty"`
+
+	// Baseline is a JSON-encoded Status from a previous watch — the
+	// per-instance cursor snapshot (issue #32). When set, the backend diffs
+	// its first observation against this baseline instead of an empty one, so
+	// a restart delivers only what changed while offline. Empty means start
+	// from an empty baseline. A backend whose kind has no baseline concept
+	// ignores it.
+	Baseline string `json:"baseline,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

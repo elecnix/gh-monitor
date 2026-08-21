@@ -1,22 +1,24 @@
 // Handoff state: what one daemon's hub knows that the next daemon needs in
-// order to take over watching the same pull requests without a replay storm
-// or a blind gap (issue #73). The state travels in memory — over the daemon
+// order to take over watching the same targets without a replay storm or a
+// blind gap (issue #73). The state travels in memory — over the daemon
 // socket, as the handoff request's response payload — and is never written
 // to a file.
 //
 // Two kinds of state move across:
 //
-//   - Pollers: one per watched identity, carrying the last fetched snapshot,
-//     the idle-backoff counter, the query tier, and the cached ruleset. The
-//     next daemon seeds its pollers with these, so a watcher that reconnects
-//     is served from continuity, not from a cold first poll.
-//   - Resumes: one per connected watcher, carrying the baseline that watcher
-//     had already been shown. The next daemon holds these until the watcher
-//     reconnects with the same ResumeID, then diffs against the carried
-//     baseline — so the handoff replays nothing and misses nothing.
+//   - Pollers: one per watched identity (any target kind), carrying the last
+//     fetched raw snapshot, the idle-backoff counter, the query tier, and the
+//     cached ruleset. The next daemon seeds its pollers with these, so a
+//     watcher that reconnects is served from continuity, not from a cold
+//     first poll.
+//   - Resumes: one per connected watcher, carrying the distilled baseline
+//     that watcher had already been shown. The next daemon holds these until
+//     the watcher reconnects with the same ResumeID, then diffs against the
+//     carried baseline — so the handoff replays nothing and misses nothing.
 package hub
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -44,22 +46,26 @@ type State struct {
 	Resumes []ResumeState `json:"resumes,omitempty"`
 }
 
-// PollerState is one watched identity's continuity.
+// PollerState is one watched identity's continuity. Latest is the raw fetch
+// payload as JSON — its concrete shape depends on the identity's target kind,
+// and the adopting daemon decodes it with that kind's traits rather than
+// guessing.
 type PollerState struct {
 	Identity resolver.Identity      `json:"identity"`
-	Latest   *monitor.PullRequest   `json:"latest,omitempty"`
+	Latest   json.RawMessage        `json:"latest,omitempty"`
 	NoChange int                    `json:"noChange,omitempty"`
 	Tier     monitor.QueryTier      `json:"tier,omitempty"`
 	Ruleset  *monitor.RulesetChecks `json:"ruleset,omitempty"`
 }
 
 // ResumeState is one connected watcher's continuity: where its stream was, and
-// what it had already been shown.
+// what it had already been shown. Baseline is the watcher's distilled status
+// as JSON — decoded on the adopting side by the target's kind.
 type ResumeState struct {
 	ResumeID string               `json:"resumeId"`
 	Target   backend.Target       `json:"target"`
 	Options  backend.WatchOptions `json:"options"`
-	Baseline *monitor.PRStatus    `json:"baseline,omitempty"`
+	Baseline json.RawMessage      `json:"baseline,omitempty"`
 }
 
 // resumeEntry is a ResumeState plus its expiry.
@@ -73,7 +79,7 @@ type resumeEntry struct {
 // that owns it.
 func (h *Hub) ExportState() State {
 	h.mu.Lock()
-	pollers := make([]*prPoller, 0, len(h.pollers))
+	pollers := make([]*poller, 0, len(h.pollers))
 	for _, p := range h.pollers {
 		pollers = append(pollers, p)
 	}
@@ -87,8 +93,15 @@ func (h *Hub) ExportState() State {
 	for _, p := range pollers {
 		ps := PollerState{Identity: p.identity}
 		p.mu.Lock()
-		ps.Latest, ps.NoChange, ps.Tier, ps.Ruleset = p.latest, p.noChange, p.tier, p.ruleset
-		subs := make([]*prSub, 0, len(p.subs))
+		if p.latest != nil {
+			// The raw payload's concrete type is JSON-tagged, so it travels
+			// encoded and the successor decodes it by kind.
+			if b, err := json.Marshal(p.latest); err == nil {
+				ps.Latest = b
+			}
+		}
+		ps.NoChange, ps.Tier, ps.Ruleset = p.noChange, p.tier, p.ruleset
+		subs := make([]*sub, 0, len(p.subs))
 		for s := range p.subs {
 			subs = append(subs, s)
 		}
@@ -99,13 +112,18 @@ func (h *Hub) ExportState() State {
 				continue
 			}
 			s.mu.Lock()
+			st := s.handle.baseline()
 			rs := ResumeState{
 				ResumeID: s.resumeID,
 				Target:   s.target,
 				Options:  s.watchOpts,
-				Baseline: s.consumer.Snapshot(),
 			}
 			s.mu.Unlock()
+			if st != nil {
+				if b, err := json.Marshal(st); err == nil {
+					rs.Baseline = b
+				}
+			}
 			state.Resumes = append(state.Resumes, rs)
 		}
 		state.Pollers = append(state.Pollers, ps)
@@ -129,12 +147,18 @@ func (h *Hub) RestoreState(s State) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, ps := range s.Pollers {
-		key := prKey{ps.Identity.Owner, ps.Identity.Repo, ps.Identity.Number}
+		key := keyOf(ps.Identity)
 		if _, exists := h.pollers[key]; exists {
 			continue // never clobber a poller that already started
 		}
-		p := newPRPoller(h, ps.Identity, h.interval)
-		p.latest, p.noChange, p.tier, p.ruleset = ps.Latest, ps.NoChange, ps.Tier, ps.Ruleset
+		p := newPoller(h, ps.Identity, h.interval)
+		if len(ps.Latest) > 0 {
+			raw := rawForKind(key.kind)
+			if err := json.Unmarshal(ps.Latest, raw); err == nil {
+				p.latest = raw
+			}
+		}
+		p.noChange, p.tier, p.ruleset = ps.NoChange, ps.Tier, ps.Ruleset
 		h.pollers[key] = p
 	}
 	now := time.Now()
@@ -149,13 +173,13 @@ func (h *Hub) RestoreState(s State) error {
 
 // takeResume consumes the baseline held for resumeID, if one is live. Called
 // with h.mu held.
-func (h *Hub) takeResume(resumeID string) (*monitor.PRStatus, bool) {
+func (h *Hub) takeResume(resumeID string) (json.RawMessage, bool) {
 	entry, ok := h.resumes[resumeID]
 	if !ok {
 		return nil, false
 	}
 	delete(h.resumes, resumeID)
-	if time.Now().After(entry.expires) || entry.state.Baseline == nil {
+	if time.Now().After(entry.expires) || len(entry.state.Baseline) == 0 {
 		return nil, false
 	}
 	return entry.state.Baseline, true

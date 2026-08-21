@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/broker"
 	"github.com/elecnix/gh-monitor/internal/handoff"
@@ -56,9 +57,12 @@ func newDaemonCommand() *cobra.Command {
 		Long: `Run a long-lived daemon that multiplexes one fetch loop per PR identity.
 
 Client ` + "`gh monitor`" + ` processes detect the daemon via its Unix socket and stream
-notifications from the shared poller instead of each polling GitHub. When no
-daemon is running, ` + "`gh monitor`" + ` falls back to its usual in-process polling, so
-existing behaviour is unchanged.
+notifications from the shared poller instead of each polling GitHub. The
+shared poller multiplexes every target kind — pull requests, refs, commits,
+issues, workflow runs, and whole repositories. Watch mode requires it: if no
+daemon can be attached, the client fails with an error rather than polling
+in-process. Watching requires the daemon: if none can be attached, the client
+fails with an error rather than polling in-process.
 
 The daemon honours $GH_MONITOR_SOCK, $XDG_RUNTIME_DIR, and a per-user cache
 dir for the socket path. Send SIGTERM/SIGINT to stop it cleanly.
@@ -123,25 +127,14 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		}
 	}()
 
-	// One fetch function per identity. Each call goes through the real gh CLI
-	// client at the poller's current query tier (shedding low-priority
-	// surfaces as the GraphQL budget runs low); the hub fans the single result
-	// out to every subscribed client.
-	fetch := func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (*monitor.PullRequest, error) {
-		svc := &monitor.Service{API: apiClientFactory(id.Host)}
-		resp, err := svc.FetchWithTier(&id, id.Number, tier)
-		if err != nil {
-			return nil, err
-		}
-		return resp.Repository.PullRequest, nil
-	}
+	// One fetch function per identity, dispatching on the identity's target
+	// kind (see gh.Fetch). The hub fans the single result out to every
+	// subscribed client.
+	fetch := gh.Fetch(apiClientFactory)
 
-	// Ruleset function is called once per new poller to read the branch
+	// Ruleset function is called once per new PR poller to read the branch
 	// ruleset and determine required status checks.
-	rulesetFn := func(owner, repo string) (*monitor.RulesetChecks, error) {
-		svc := &monitor.Service{API: apiClientFactory("")}
-		return svc.FetchRequiredChecks(owner, repo)
-	}
+	rulesetFn := gh.Ruleset(apiClientFactory)
 
 	// Budget guard: every poller stretches its cadence as the shared GraphQL
 	// budget runs low. Advisory only — rate-limit errors keep their hard
@@ -150,7 +143,8 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	budgetSvc := &monitor.Service{API: apiClientFactory("")}
 	budget := monitor.NewBudgetGuard(budgetSvc, interval)
 
-	h := hub.New(fetch, rulesetFn, interval, budget)
+	h := hub.New(fetch, rulesetFn, interval, budget,
+		hub.WithFailedRunLogFetcher(gh.FailedRunLogs(apiClientFactory)))
 	defer h.Stop()
 	if adopted != nil {
 		if err := h.RestoreState(*adopted); err != nil {
@@ -346,15 +340,47 @@ func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 }
 
 func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
-	if t.Kind != backend.KindPR {
-		return nil, fmt.Errorf("the shared poller only serves pull requests, not %s", t.Kind)
+	var ch <-chan backend.Update
+	if opts.Once {
+		// One-shot read: a single fetch + emit through the hub, no poller.
+		// The returned channel closes after the current state is delivered.
+		ch = s.hub.Once(ctx, t, opts)
+	} else {
+		// Subscribe detaches the consumer on its own when ctx is cancelled,
+		// so the cancel function is deliberately dropped here: calling it
+		// when Watch returns would detach before the caller reads anything.
+		ch, _ = s.hub.Subscribe(ctx, t, opts)
 	}
-	ch, unsub := s.hub.SubscribePR(ctx, t, opts)
+	if opts.Timeout <= 0 {
+		return ch, nil
+	}
+	// A watch stops after the caller's timeout. The hub itself has no notion
+	// of one (a shared poller outlives any single subscriber), so the
+	// boundary enforces it: relay until the source closes or the timeout
+	// fires, then close — a client reading the channel sees a clean EOF
+	// either way.
+	out := make(chan backend.Update, 16)
+	timer := time.NewTimer(opts.Timeout)
 	go func() {
-		<-ctx.Done()
-		unsub()
+		defer close(out)
+		defer timer.Stop()
+		for {
+			select {
+			case u, ok := <-ch:
+				if !ok {
+					return
+				}
+				select {
+				case out <- u:
+				case <-timer.C:
+					return
+				}
+			case <-timer.C:
+				return
+			}
+		}
 	}()
-	return ch, nil
+	return out, nil
 }
 
 // listenOrAdopt binds the daemon socket. When a live daemon already owns it
@@ -397,7 +423,7 @@ func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 	// for everything else.
 	cfg := remote.ServerConfig{
 		Name:   DaemonBackendName,
-		Kinds:  []backend.Kind{backend.KindPR},
+		Kinds:  backend.AllKinds(),
 		Source: hubSource{hub: srv.hub},
 		// Watchers survive a daemon upgrade: the hello announces that a
 		// dropped stream can be re-established with the same ResumeID, and

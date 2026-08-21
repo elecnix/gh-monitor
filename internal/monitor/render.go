@@ -21,24 +21,6 @@ func (o *RunOptions) update(status backend.Status, ev Event) backend.Update {
 	}
 }
 
-// notice builds an Update carrying a diagnostic the loop raises about itself
-// rather than about the target — an API surface that could not be read, or a
-// surface it stopped watching to stay inside a tight budget.
-func (o *RunOptions) notice(msg string) backend.Update {
-	return backend.Update{
-		Target: TargetOf(o.Identity),
-		Event:  Event{Type: EventDegraded, Notice: msg},
-		At:     o.now(),
-	}
-}
-
-// renderTo adapts a Notification consumer to the Update-emitting loops.
-func (o RunOptions) renderTo(emit func(Notification)) func(backend.Update) {
-	return func(u backend.Update) {
-		emit(Render(u, o.Prefs, o.Interval))
-	}
-}
-
 // isTerminalEvent reports whether an event marks the target as finished, so
 // nothing further will be observed about it.
 func isTerminalEvent(t EventType) bool {
@@ -76,11 +58,22 @@ func Render(u backend.Update, p prefs.Preferences, interval time.Duration) Notif
 	}
 	if u.Event.Type == EventDegraded {
 		label := degradedLabel(opts)
+		// degraded is a first-class kind: like every other kind it has a
+		// prefs template, so a consumer can reword or mute it. Callers that
+		// render with zero Prefs get the built-in sentence.
+		msg := prefs.Interpolate(p.Templates[string(EventDegraded)], map[string]string{
+			"prLabel":         label,
+			"degradedSurface": u.Event.DegradedSurface,
+			"degradedMessage": u.Event.DegradedMessage,
+		})
+		if msg == "" {
+			msg = fmt.Sprintf("⚠️ API degraded (%s) on %s: %s",
+				u.Event.DegradedSurface, label, u.Event.DegradedMessage)
+		}
 		return Notification{
-			Type:    string(EventDegraded),
-			PRLabel: label,
-			Message: fmt.Sprintf("⚠️ API degraded (%s) on %s: %s",
-				u.Event.DegradedSurface, label, u.Event.DegradedMessage),
+			Type:      string(EventDegraded),
+			PRLabel:   label,
+			Message:   msg,
 			Timestamp: u.At,
 		}
 	}

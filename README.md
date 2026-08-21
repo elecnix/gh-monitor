@@ -225,7 +225,9 @@ gh monitor -R owner/repo 42 --events conflict,new-failing-checks,merged,closed
 gh monitor --run-id 30433642 -R owner/repo --events run-completed
 ```
 
-The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`, `degraded`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+
+`degraded` reports that an API surface (graphql or rest) could not be read. It is emitted per **episode**, not per failed poll, so an outage costs a consumer a handful of notifications instead of one per poll: once when a surface degrades, once more if the error message changes while it stays degraded, and once — a ✅ recovery notice — when the next successful poll shows it is back. Like every other kind it has a preferences template key (rewordable in the preferences file) and can be included in or excluded from `--events`; leaving it out of an allowlist mutes the warnings entirely.
 
 `new-unresolved-threads` and `new-general-comments` events carry a rich `detail` body — the thread/comment location, author, text, a diff excerpt centered on the anchored line, and the exact commands to reply/resolve or 👍-acknowledge — so a consumer can act without extra API calls. In `--text` mode the PR label and commit SHA are wrapped in OSC-8 hyperlinks (clickable in supporting terminals, plain text elsewhere) and any `detail` body is printed, indented, beneath the message.
 
@@ -348,7 +350,7 @@ Cursors are independent — advancing one instance's cursor never affects anothe
 
 ### Shared poller daemon
 
-By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same PR (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per PR** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
+By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same target (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per watched target** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
 
 ```sh
 # Start the daemon (runs until SIGTERM/SIGINT)
@@ -361,9 +363,11 @@ gh monitor -R owner/repo 42 --text
 
 A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` **auto-starts** one (a detached background process) and then connects, so you get shared polling without a manual `daemon` step. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
 
+Since [#76](https://github.com/elecnix/gh-monitor/issues/76) the daemon is the single watch code path: it multiplexes every target kind (pull requests, refs, commits, issues, workflow runs, whole repositories), and watching **requires** it — if no daemon can be attached, the client fails with an error naming the fix rather than silently polling in-process. The in-process polling loops were deleted. `--once` is the exception: it is a single fetch, answered in-process by the built-in backend (through the same one-shot hub path the daemon serves), so a one-shot read never spawns or requires a daemon.
+
 Concurrent auto-starts are race-safe: at most one daemon binds a socket (a second `Listen` refuses to steal a live daemon's socket), so several clients starting at once share a single fetch loop rather than each spawning their own.
 
-The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (so a client falls back to in-process polling when no daemon is running instead of spawning one). `--once` and non-PR targets always use the in-process loop.
+The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
 #### Upgrading while watchers run
 

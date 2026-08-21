@@ -21,7 +21,7 @@ func TestExportRestoreResumesWithoutReplay(t *testing.T) {
 	t.Cleanup(cancel)
 
 	// Predecessor daemon: PR with failing CI; the watcher has been shown it.
-	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture([]string{"ci-build"}), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h1.Stop)
@@ -41,7 +41,7 @@ func TestExportRestoreResumesWithoutReplay(t *testing.T) {
 
 	// A short interval: if the subscriber has not yet drained the seeded
 	// snapshot when the first fetch lands, the next tick redelivers.
-	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h2.Stop)
@@ -78,7 +78,7 @@ func TestRestoreSeedsPollerWithoutRulesetFetch(t *testing.T) {
 		atomic.AddInt64(&rulesetFetches, 1)
 		return &monitor.RulesetChecks{Contexts: []string{"ci-build"}}, nil
 	}
-	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture([]string{"ci-build"}), nil
 	}, rulesetFn, time.Hour, nil)
 	t.Cleanup(h1.Stop)
@@ -93,7 +93,7 @@ func TestRestoreSeedsPollerWithoutRulesetFetch(t *testing.T) {
 	require.NotNil(t, state.Pollers[0].Ruleset, "the cached ruleset must travel")
 	require.NotNil(t, state.Pollers[0].Latest, "the last snapshot must travel")
 
-	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture([]string{"ci-build"}), nil
 	}, rulesetFn, time.Hour, nil)
 	t.Cleanup(h2.Stop)
@@ -130,7 +130,7 @@ func TestResumeEntryExpires(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture([]string{"ci-build"}), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h1.Stop)
@@ -140,7 +140,7 @@ func TestResumeEntryExpires(t *testing.T) {
 	t.Cleanup(cancel1)
 	collect(ch1, 200*time.Millisecond)
 
-	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture([]string{"ci-build"}), nil
 	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h2.Stop)
@@ -160,7 +160,7 @@ func TestExportWhileRunning(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, 10*time.Millisecond, nil)
 	t.Cleanup(h.Stop)

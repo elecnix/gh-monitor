@@ -125,7 +125,7 @@ func startPredecessor(t *testing.T, ctx context.Context, socket string, h *hub.H
 
 func handoffHub(t *testing.T) *hub.Hub {
 	t.Helper()
-	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return &monitor.PullRequest{State: "OPEN"}, nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)

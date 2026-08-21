@@ -49,7 +49,7 @@ func validEventKinds() map[string]bool {
 		EventMerged, EventClosed, EventIssueClosed, EventIssueReopened,
 		EventIssueNewComment, EventIssueMention, EventRunQueued,
 		EventRunInProgress, EventRunCompleted, EventRepoNewPR, EventRepoNewIssue,
-		EventRepoReadiness,
+		EventRepoReadiness, EventDegraded,
 	} {
 		out[string(e)] = true
 	}
@@ -92,24 +92,6 @@ func ParseEventFilter(s string) (*EventFilter, error) {
 		f.allowed[k] = true
 	}
 	return f, nil
-}
-
-// filterEmit wraps a caller's emit callback with the EventFilter. A nil
-// filter (or nil emit) returns a safe no-op so the default path is
-// zero-overhead and a nil emit never panics. A non-nil filter drops any
-// Notification whose Type is not allowed before it reaches emit.
-func filterEmit(f *EventFilter, emit func(Notification)) func(Notification) {
-	if emit == nil {
-		return func(Notification) {} // no-op: nothing to call
-	}
-	if f == nil {
-		return emit // nil filter: pass everything through unchanged
-	}
-	return func(n Notification) {
-		if f.Allows(n.Type) {
-			emit(n)
-		}
-	}
 }
 
 // Allows reports whether a notification Type passes the filter. A nil filter

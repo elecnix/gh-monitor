@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -75,7 +77,7 @@ func collect(ch <-chan backend.Update, timeout time.Duration) []string {
 
 // swapFetcher swaps the hub's fetch function under its lock; used to advance
 // the simulated PR state between refreshes.
-func swapFetcher(h *Hub, f func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error)) {
+func swapFetcher(h *Hub, f func(context.Context, resolver.Identity, monitor.QueryTier) (any, error)) {
 	h.mu.Lock()
 	h.fetch = f
 	h.mu.Unlock()
@@ -90,7 +92,7 @@ func TestHub_SingleFetchFansOutToMultipleConsumers(t *testing.T) {
 
 	// A one-hour interval means the ticker never fires during the test; only
 	// the poller's immediate first fetch runs, so fetches is deterministic.
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		return snap, nil
 	}, nil, time.Hour, nil)
@@ -124,7 +126,7 @@ func TestHub_SingleFetchFansOutToMultipleConsumers(t *testing.T) {
 func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	// Start with a failing check; swap to green mid-test via RefreshPR.
 	current := prFixture([]string{"ci-build"})
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return current, nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -145,7 +147,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	// suppress delivery to B. This arrives from the poller's cached latest,
 	// not a new fetch.
 	var fetches int64
-	swapFetcher(h, func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	swapFetcher(h, func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		return current, nil
 	})
@@ -178,7 +180,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 	var fetches int64
 	// Short interval so a leaked poller would keep fetching visibly.
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		return prFixture(nil), nil
 	}, nil, 5*time.Millisecond, nil)
@@ -219,7 +221,7 @@ func TestHub_CancelRemovesConsumerAndStopsPollerWhenEmpty(t *testing.T) {
 func TestPoller_BacksOffWhenQuiet(t *testing.T) {
 	var fetches int64
 	snap := prFixture(nil) // never changes
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		return snap, nil
 	}, nil, 20*time.Millisecond, nil)
@@ -253,7 +255,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 	var fetches int64
 	var mu sync.Mutex
 	current := prFixture(nil) // quiet: backoff will grow
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		mu.Lock()
 		defer mu.Unlock()
@@ -290,7 +292,7 @@ func TestPoller_WakeResetsBackoffAndFetchesNow(t *testing.T) {
 // TestHub_ConcurrentSubscribersDoNotRace exercises the hub under concurrent
 // subscribe/cancel churn to guard against data races (run with -race).
 func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, 5*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
@@ -310,11 +312,12 @@ func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
 // TestPoller_BroadcastsDegradedOnFetchError verifies the loudness fix: a
 // daemon poller whose fetch fails must reach subscribers with a degraded
 // notification — a silently blind watcher would read as "all clear".
 func TestPoller_BroadcastsDegradedOnFetchError(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return nil, errors.New("gh api failed: exit status 1")
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -336,6 +339,154 @@ func TestPoller_BroadcastsDegradedOnFetchError(t *testing.T) {
 	assert.True(t, degraded, "a fetch error must reach the subscriber as a degraded notification")
 }
 
+// TestPoller_DegradedEpisodeEmitsOnce verifies hub-side episode dedup
+// (issue #66): consecutive identical failed fetches are one episode, one
+// broadcast — the shared poller must not spend one notification per poll on
+// an outage, exactly like the in-process loops.
+func TestPoller_DegradedEpisodeEmitsOnce(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return nil, errors.New("gh api failed: exit status 1")
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	// The subscribe fetch fails and must degrade loudly, exactly once.
+	waitDegraded(t, ch, "the first failed fetch must broadcast the degradation")
+
+	// Two more identical failed polls via the explicit wake path: neither may
+	// broadcast again.
+	for i := 0; i < 2; i++ {
+		require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+		time.Sleep(20 * time.Millisecond)
+	}
+	assertNoDegraded(t, ch, 200*time.Millisecond,
+		"identical repeated failures are one episode: no further degraded broadcast")
+}
+
+// TestPoller_DegradedChangedMessageEmits verifies a changed error message is
+// new information and re-broadcasts, while identical repeats stay silent.
+func TestPoller_DegradedChangedMessageEmits(t *testing.T) {
+	calls := 0
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		calls++
+		return nil, fmt.Errorf("gh api failed: attempt %d", calls)
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	waitDegraded(t, ch, "the first failure must broadcast")
+	for i := 0; i < 2; i++ {
+		require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+		waitDegraded(t, ch, "each distinct error message must re-broadcast")
+	}
+	assertNoDegraded(t, ch, 100*time.Millisecond, "no broadcast without a further poll")
+}
+
+// TestPoller_DegradedRecoveryEmits verifies the recovery notice: after a
+// degraded episode, the first successful fetch announces the surface is back
+// and clears the episode, so a later failure degrades loudly again.
+func TestPoller_DegradedRecoveryEmits(t *testing.T) {
+	calls := 0
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("gh api failed: exit status 1")
+		}
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	waitDegraded(t, ch, "the first failure must broadcast")
+
+	// The next poll succeeds: a recovery notice must precede (or accompany)
+	// the fresh snapshot.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription closed while waiting for recovery")
+			}
+			if u.Event.Notice != "" && strings.Contains(u.Event.Notice, "recovered") {
+				assert.Contains(t, u.Event.Notice, "graphql", "the recovery notice must name the surface")
+				goto recovered
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the recovery notice")
+		}
+	}
+recovered:
+	// The episode is cleared: another success must not re-announce recovery.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	assertNoDegraded(t, ch, 200*time.Millisecond,
+		"a healthy poll after recovery must not re-announce")
+
+	// And a fresh failure starts a new episode, broadcasting again.
+	swapFetcher(h, func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return nil, errors.New("gh api failed: again")
+	})
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	waitDegraded(t, ch, "a failure after recovery is a new episode and must broadcast")
+}
+
+// waitDegraded reads updates until a fetch-error degraded broadcast arrives.
+// Notices (broker health, tier shed, recovery) carry Notice text rather than
+// DegradedMessage, so they do not satisfy the wait.
+func waitDegraded(t *testing.T, ch <-chan backend.Update, msg string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatalf("subscription closed: %s", msg)
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out: %s", msg)
+		}
+	}
+}
+
+// assertNoDegraded drains ch for the timeout and fails if a fetch-error
+// degraded broadcast arrives in the window.
+func assertNoDegraded(t *testing.T, ch <-chan backend.Update, timeout time.Duration, msg string) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+				t.Fatalf("unexpected degraded broadcast: %s", msg)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
 // TestPoller_TierNoticeOnLowBudget verifies the poller sheds surfaces and
 // says so loudly when the advisory GraphQL budget is low, and that the fetch
 // receives the shed tier. A low remaining (2% of limit) maps to
@@ -345,7 +496,7 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 100, limit: 5000}}
 	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
 
-	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
 		gotTier = tier
 		return prFixture(nil), nil
 	}, nil, time.Hour, budget)
@@ -371,7 +522,7 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 // OnState call, or the daemon re-affirming the same health) does not spam a
 // second notice.
 func TestHub_SetBrokerHealth_BroadcastsOnceOnTransition(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -403,7 +554,7 @@ func TestHub_SetBrokerHealth_BroadcastsOnceOnTransition(t *testing.T) {
 // had SetBrokerHealth called — no broker configured — must never claim
 // healthy by default, since nextDelay's extended cap is gated on it).
 func TestHub_BrokerHealthy_ReflectsLastSetState(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -434,7 +585,7 @@ func TestHub_BrokerHealthy_ReflectsLastSetState(t *testing.T) {
 // need a live poller and so can simulate a full 30-minute window without
 // actually sleeping.
 func TestPoller_NextDelayHonoursBrokerExtendedCap(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, 60*time.Second, nil)
 	t.Cleanup(h.Stop)
@@ -446,7 +597,7 @@ func TestPoller_NextDelayHonoursBrokerExtendedCap(t *testing.T) {
 	_ = collect(ch, 50*time.Millisecond) // let the poller start and register
 
 	h.mu.Lock()
-	var p *prPoller
+	var p *poller
 	for _, poller := range h.pollers {
 		p = poller
 	}
@@ -479,7 +630,7 @@ func TestPoller_NextDelayHonoursBrokerExtendedCap(t *testing.T) {
 // that extension — nextDelay must read the normal ceiling on its very next
 // call, not a stale extended one computed while the broker still looked up.
 func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
 	}, nil, 5*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
@@ -499,7 +650,7 @@ func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
 	require.Contains(t, got, string(monitor.EventDegraded), "the degrade must reach the subscriber as a loud notice")
 
 	h.mu.Lock()
-	var p *prPoller
+	var p *poller
 	for _, poller := range h.pollers {
 		p = poller
 	}
@@ -542,7 +693,7 @@ func TestPoller_ErrorAfterTierSelectionStillBroadcasts(t *testing.T) {
 	// broadcast every 5ms and starve collect()'s timeout. One error is enough
 	// to prove the degraded broadcast reaches the subscriber.
 	calls := 0
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		calls++
 		if calls == 2 {
 			return nil, errors.New("boom")

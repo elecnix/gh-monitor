@@ -134,7 +134,7 @@ func bindTestServerOn(t *testing.T, ctx context.Context, h *hub.Hub, l net.Liste
 func startTestDaemon(t *testing.T, ctx context.Context, prFn func() *monitor.PullRequest) (socket string, fetches *int64) {
 	t.Helper()
 	var calls int64
-	fetcher := func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	fetcher := func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&calls, 1)
 		return prFn(), nil
 	}
@@ -185,7 +185,7 @@ func TestDaemon_TwoClientsShareOneFetch(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
 
 	source, name, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
@@ -224,7 +224,7 @@ func TestDaemon_ClientRendersWithItsOwnTemplates(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
 
 	source, _, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
@@ -244,7 +244,9 @@ func TestDaemon_ClientRendersWithItsOwnTemplates(t *testing.T) {
 }
 
 // TestDaemon_NotUsedWhenSocketAbsent verifies that with no daemon listening and
-// autostart off, nothing is registered — so the built-in backend serves.
+// autostart off, attaching is a hard error — watch mode requires the shared
+// poller (issue #76), so a missing daemon must never silently degrade to
+// in-process polling.
 func TestDaemon_NotUsedWhenSocketAbsent(t *testing.T) {
 	t.Setenv("GH_MONITOR_AUTOSTART", "0")
 	t.Setenv("GH_MONITOR_SOCK", shortSocket(t, "ghmon-absent-*.d")) // never bound
@@ -254,38 +256,16 @@ func TestDaemon_NotUsedWhenSocketAbsent(t *testing.T) {
 		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
 			return nil, nil
 		}))
-	attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
-
-	_, name, err := reg.SourceFor(daemonTarget())
-	require.NoError(t, err)
-	assert.Equal(t, gh.Name, name, "with no daemon the built-in backend must serve")
+	err := attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "gh monitor daemon",
+		"the error must name the fix")
 }
 
-// TestDaemon_OptedOutByEnv verifies GH_MONITOR_DAEMON=0 keeps the daemon out of
-// the registry even when one is listening.
-func TestDaemon_OptedOutByEnv(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	sock, _ := startTestDaemon(t, ctx, openPR)
-	t.Setenv("GH_MONITOR_SOCK", sock)
-	t.Setenv("GH_MONITOR_DAEMON", "0")
-
-	reg := backend.NewRegistry()
-	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
-		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
-			return nil, nil
-		}))
-	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
-
-	_, name, err := reg.SourceFor(daemonTarget())
-	require.NoError(t, err)
-	assert.Equal(t, gh.Name, name, "GH_MONITOR_DAEMON=0 must keep the daemon unused")
-}
-
-// TestDaemon_OnlyServesPullRequests verifies the daemon is not registered for
-// kinds it cannot serve, so those keep polling in-process.
-func TestDaemon_OnlyServesPullRequests(t *testing.T) {
+// TestDaemon_ServesEveryTargetKind verifies the shared poller multiplexes all
+// target kinds (issue #76): a daemon that is running is registered for an
+// issue, a ref, and a run just as it is for a pull request.
+func TestDaemon_ServesEveryTargetKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -293,16 +273,15 @@ func TestDaemon_OnlyServesPullRequests(t *testing.T) {
 	t.Setenv("GH_MONITOR_SOCK", sock)
 
 	reg := backend.NewRegistry()
-	reg.RegisterSource(gh.Name, nil, backend.SourceFunc(
-		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
-			return nil, nil
-		}))
-	issue := backend.Target{Kind: backend.KindIssue, Owner: "o", Repo: "r", Number: 3}
-	attachDaemon(ctx, reg, issue, time.Minute)
+	unusedBuiltin(reg)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
 
-	_, name, err := reg.SourceFor(issue)
-	require.NoError(t, err)
-	assert.Equal(t, gh.Name, name, "the shared poller only serves pull requests")
+	for _, kind := range []backend.Kind{backend.KindIssue, backend.KindRef, backend.KindCommit, backend.KindRun, backend.KindRepo} {
+		target := backend.Target{Kind: kind, Owner: "o", Repo: "r", Number: 3, Ref: "main", SHA: "abc", RunID: 9}
+		_, name, err := reg.SourceFor(target)
+		require.NoError(t, err, kind)
+		assert.Equal(t, DaemonBackendName, name, "the daemon must serve %s targets", kind)
+	}
 }
 
 // TestAutoStart_SpawnsDaemonWhenAbsent verifies the autostart wiring: when no
@@ -312,7 +291,7 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	h := hub.New(func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+	h := hub.New(func(_ context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return closedPR(), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -330,7 +309,7 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
 
 	assert.Equal(t, int64(1), atomic.LoadInt64(&spawned), "autostart spawned the daemon once")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -357,7 +336,7 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
 
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when a daemon is already running")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -366,7 +345,9 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 }
 
 // TestAutoStart_DisabledByEnv verifies GH_MONITOR_AUTOSTART=0 suppresses
-// spawning, leaving the built-in backend to poll in-process.
+// spawning. Since #76 watch mode requires the shared poller, so attaching is
+// a hard error naming the fix — never a silent fall back to in-process
+// polling.
 func TestAutoStart_DisabledByEnv(t *testing.T) {
 	t.Setenv("GH_MONITOR_AUTOSTART", "0")
 	t.Setenv("GH_MONITOR_SOCK", shortSocket(t, "ghmon-disabled-*.d")) // never bound
@@ -384,7 +365,7 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
 			return nil, nil
 		}))
-	attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+	require.Error(t, attachDaemon(context.Background(), reg, daemonTarget(), time.Minute))
 
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when autostart is disabled")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -493,7 +474,7 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 	require.Len(t, state.Pollers, 1, "the watched PR must travel")
 	require.Len(t, state.Resumes, 1, "the connected watcher's baseline must travel")
 
-	h2 := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+	h2 := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 		return changedOpenPR(), nil
 	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h2.Stop)

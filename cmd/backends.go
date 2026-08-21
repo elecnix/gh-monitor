@@ -70,9 +70,8 @@ func buildRegistry(ctx context.Context, opts *backendOptions, base monitor.RunOp
 	reg := backend.NewRegistry()
 
 	builtin := &gh.Provider{
-		API:    apiClientFactory,
-		Base:   base,
-		Budget: budget,
+		API:  apiClientFactory,
+		Base: base,
 	}
 	if err := reg.Use(builtin); err != nil {
 		return nil, err

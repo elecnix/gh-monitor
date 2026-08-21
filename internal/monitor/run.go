@@ -1,17 +1,14 @@
 package monitor
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
@@ -33,12 +30,14 @@ const (
 	defaultInterval = 60 * time.Second
 )
 
-// maxFailedLogLines caps the failed-run log snippet embedded in a
+// MaxFailedLogLines caps the failed-run log snippet embedded in a
 // run-completed notification (issue #19). `gh run view --log-failed` emits the
 // full failed-step log chronologically, with the actual error at the END, so we
 // keep the last N lines (the error + its immediate context) rather than the
 // first N — taking the head would capture only setup noise and miss the error.
-const maxFailedLogLines = 50
+// It is exported so the shared poller daemon caps its snippets exactly as the
+// loops that preceded the shared poller did.
+const MaxFailedLogLines = 50
 
 // runFailureConclusions are the terminal conclusions that mean the run did not
 // succeed and therefore warrant a failed-log snippet.
@@ -76,13 +75,14 @@ func cleanFailedLogLine(line string) string {
 	return fields[1] + "\t" + logTsRE.ReplaceAllString(fields[2], "")
 }
 
-// summarizeFailedLog cleans and tail-truncates the failed-run log output so the
-// snippet carries the error (which lives at the end of the `--log-failed`
-// output) plus its immediate context. When the cleaned log fits within maxLines
-// it is returned verbatim; otherwise the last maxLines lines are kept, prefixed
-// by a one-line marker noting how many earlier lines were dropped. Empty input
-// yields "".
-func summarizeFailedLog(s string, maxLines int) string {
+// SummarizeFailedLog cleans and tail-truncates the failed-run log output so
+// the snippet carries the error (which lives at the end of the `--log-failed`
+// output) plus its immediate context. When the cleaned log fits within
+// maxLines it is returned verbatim; otherwise the last maxLines lines are
+// kept, prefixed by a one-line marker noting how many earlier lines were
+// dropped. Empty input yields "". It is exported so the shared poller daemon
+// summarizes snippets exactly as the watch path always has.
+func SummarizeFailedLog(s string, maxLines int) string {
 	s = strings.TrimPrefix(s, "\ufeff") // strip a leading BOM if present
 	if strings.TrimSpace(s) == "" {
 		return ""
@@ -100,18 +100,6 @@ func summarizeFailedLog(s string, maxLines int) string {
 	}
 	dropped := len(cleaned) - maxLines
 	return fmt.Sprintf("… (%d earlier lines truncated)\n%s", dropped, strings.Join(cleaned[len(cleaned)-maxLines:], "\n"))
-}
-
-// failedRunLogDetail fetches and summarizes the failed-run log snippet for a
-// completed run. A fetch error is logged to stderr and yields an empty detail
-// (the run-completed notification still emits).
-func failedRunLogDetail(svc *Service, id resolver.Identity, runID int) string {
-	out, err := svc.FailedRunLogs(id.Owner, id.Repo, runID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "gh-monitor: failed-run log fetch error: %v\n", err)
-		return ""
-	}
-	return summarizeFailedLog(out, maxFailedLogLines)
 }
 
 // Notification is one emitted event, rendered for a consumer. It serializes to a
@@ -144,78 +132,22 @@ type RunOptions struct {
 	Identity resolver.Identity
 	Prefs    prefs.Preferences
 	Interval time.Duration
-	// Timeout stops the loop after this duration; 0 means run forever.
-	Timeout time.Duration
-
-	// EventFilter is a per-event-kind allowlist. A non-nil filter suppresses
-	// (drops) any Notification whose Type is not in the allowlist before it
-	// reaches the caller's emit callback; a nil filter (the default) emits
-	// every kind, preserving today's behaviour. Use NewEventFilter to build
-	// one programmatically or ParseEventFilter to validate caller input.
-	EventFilter *EventFilter
 
 	// AnnotationLevels controls which check-run annotation levels are
-	// included in the snapshot. A nil value uses the default (warning +
-	// failure). An empty filter ("none") drops all annotations. Use
-	// NewAnnotationLevels to build one programmatically or
-	// ParseAnnotationLevels to validate caller input.
+	// included in a PR snapshot's annotations. A nil value uses the default
+	// (warning + failure). An empty filter ("none") drops all annotations.
+	// It is read configuration: the built-in backend's Reader applies it,
+	// and the daemon parses its own from WatchOptions.
 	AnnotationLevels *AnnotationLevels
 
-	// Instance is the named-instance identifier (issue #32). When set, the
-	// monitor uses a per-instance cursor to filter out items it has already
-	// seen across restarts. An empty string (the default) preserves today's
-	// stateless behaviour.
-	Instance string
-
-	// FromBeginning replays the full backlog on startup — the cursor is
-	// ignored. When false and no cursor exists, a new instance starts at
-	// "now" (no pre-existing items are emitted).
-	FromBeginning bool
-
-	// CursorPosition is the ISO-8601 createdAt threshold. When non-empty and
-	// FromBeginning is false, items with createdAt <= CursorPosition are
-	// suppressed. It is set by the caller from the cursor store and advanced
-	// by the run loop via AdvanceCursor.
-	CursorPosition string
-
-	// AdvanceCursor is called after each poll with the latest createdAt among
-	// items that were emitted (or would have been emitted, absent filtering).
-	// The caller persists this to the cursor store so a restart resumes from
-	// this position. It is a no-op when nil.
-	AdvanceCursor func(position string)
-
-	// CursorSnapshot is the JSON-serialised last-known PRStatus or IssueStatus,
-	// loaded from the per-instance cursor store. When non-empty, the consumer
-	// starts from this stored baseline instead of an empty one, so a restart
-	// delivers everything that changed while offline (issue #32 PR mode).
-	CursorSnapshot string
+	// Now is injectable for tests. It defaults to time.Now.
+	Now func() time.Time
 
 	// SaveSnapshot is called after each successful poll with a JSON-serialised
 	// PRStatus or IssueStatus. The caller persists this to the cursor store.
 	// It is NOT called on degraded (error) fetches — a cursor must not advance
 	// past events that were never actually read.
 	SaveSnapshot func(snapshotJSON string)
-
-	// Now and Sleep are injectable for tests. Now defaults to time.Now; Sleep
-	// defaults to a context-aware timer. Sleep must return the context error
-	// when the context is cancelled.
-	Now   func() time.Time
-	Sleep func(context.Context, time.Duration) error
-
-	// Jitter spreads a poll delay before it is slept. It exists so concurrent
-	// watchers do not poll on aligned cadences — a fleet booting several
-	// monitors at the same moment would otherwise burst requests in phase,
-	// which is exactly what exhausts a shared API budget at reset boundaries.
-	// When nil, Jittered (uniform ±20%) is used. The value returned must be
-	// non-negative.
-	Jitter func(time.Duration) time.Duration
-
-	// Budget, when non-nil, makes the loop GraphQL-budget-aware: before each
-	// poll it consults the advisory rate limit and stretches the delay as the
-	// GraphQL budget runs low, emitting a loud notice on each transition into
-	// and out of the low state. Nil (the default) preserves today's
-	// budget-blind cadence.
-	Budget *BudgetGuard
 }
 
 func (o *RunOptions) now() time.Time {
@@ -225,28 +157,8 @@ func (o *RunOptions) now() time.Time {
 	return time.Now()
 }
 
-func (o *RunOptions) sleep(ctx context.Context, d time.Duration) error {
-	if o.Sleep != nil {
-		return o.Sleep(ctx, d)
-	}
-	return realSleep(ctx, d)
-}
-
-// jittered spreads d by ±20% unless the caller supplied an explicit Jitter
-// function. It is applied to idle and error-backoff sleeps so that watchers
-// that started at the same moment drift apart instead of polling in phase.
-// Reset-targeted waits (back off until the rate-limit reset) are deliberately
-// not jittered: they target an absolute time.
-func (o *RunOptions) jittered(d time.Duration) time.Duration {
-	if o.Jitter != nil {
-		return o.Jitter(d)
-	}
-	return Jittered(d)
-}
-
 // Jittered spreads d by a uniform ±20%. It is exported so the shared poller
-// daemon can de-phase its per-PR tickers the same way the in-process loop
-// de-phases its polls. math/rand is fine here: the value shapes request
+// daemon can de-phase its per-target tickers. math/rand is fine here: the value shapes request
 // timing, not security.
 func Jittered(d time.Duration) time.Duration {
 	if d <= 0 {
@@ -257,251 +169,9 @@ func Jittered(d time.Duration) time.Duration {
 	return d + offset
 }
 
-func realSleep(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			return nil
-		}
-	}
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.C:
-		return nil
-	}
-}
-
-// Run polls the target until it reaches a terminal state, the context is
-// cancelled, or the timeout elapses, emitting one Notification per
-// genuinely-new change. Dispatches based on the target type in opts.Identity.
-//
-// If opts.EventFilter is non-nil, notifications whose Type is not in the
-// allowlist are dropped before they reach emit (per-event-kind filtering for
-// orchestrator/automation callers that only care about a subset of events).
-func Run(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
-	return Watch(ctx, svc, opts, opts.renderTo(filterEmit(opts.EventFilter, emit)))
-}
-
-// Watch is Run's backend-facing form: it emits one backend.Update per
-// genuinely-new change instead of a rendered Notification, so a caller can
-// filter, forward, or render on its own terms. Run is Watch plus this
-// package's renderer.
-//
-// Watch deliberately does not apply opts.EventFilter. Filtering is a
-// presentation concern and belongs at the single emit chokepoint the consumer
-// owns; applying it here would silently drop updates a forwarder needs.
-func Watch(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	if emit == nil {
-		emit = func(backend.Update) {}
-	}
-	switch opts.Identity.Target {
-	case "ref", "commit":
-		return runRef(ctx, svc, opts, emit)
-	case "issue":
-		return runIssue(ctx, svc, opts, emit)
-	case "run":
-		return runRun(ctx, svc, opts, emit)
-	case "repo":
-		return runRepo(ctx, svc, opts, emit)
-	default:
-		return runPR(ctx, svc, opts, emit)
-	}
-}
-
-// Once does a single fetch and emits the current actionable state. If
-// opts.EventFilter is non-nil, notifications whose Type is not in the
-// allowlist are dropped before they reach emit.
-func Once(ctx context.Context, svc *Service, opts RunOptions, emit func(Notification)) error {
-	return WatchOnce(ctx, svc, opts, opts.renderTo(filterEmit(opts.EventFilter, emit)))
-}
-
-// WatchOnce is Once's backend-facing form: a single fetch emitting
-// backend.Updates rather than rendered Notifications.
-func WatchOnce(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	if emit == nil {
-		emit = func(backend.Update) {}
-	}
-	switch opts.Identity.Target {
-	case "ref", "commit":
-		return onceRef(ctx, svc, opts, emit)
-	case "issue":
-		return onceIssue(ctx, svc, opts, emit)
-	case "run":
-		return onceRun(ctx, svc, opts, emit)
-	case "repo":
-		return onceRepo(ctx, svc, opts, emit)
-	default:
-		return oncePR(ctx, svc, opts, emit)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // PR target
 // ---------------------------------------------------------------------------
-
-// runPR polls the PR until it is merged/closed, the context is cancelled, or
-// the timeout elapses.
-func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	base := opts.Interval
-	if base <= 0 {
-		base = defaultInterval
-	}
-
-	var deadline time.Time
-	if opts.Timeout > 0 {
-		deadline = opts.now().Add(opts.Timeout)
-	}
-
-	// Fetch the branch ruleset once at startup so we know which checks are
-	// required. This is cached for the lifetime of the poll loop — rulesets
-	// rarely change mid-monitoring, and re-fetching on every poll would add
-	// latency for no benefit.
-	ruleset, rulesetErr := svc.FetchRequiredChecks(opts.Identity.Owner, opts.Identity.Repo)
-	if rulesetErr != nil {
-		fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", rulesetErr)
-	}
-
-	c := NewPRConsumer(opts)
-
-	// Restore the stored baseline for a named instance (issue #32).
-	// The first Consume diffs from this baseline instead of an empty one,
-	// so everything that changed while offline is delivered.
-	if opts.CursorSnapshot != "" {
-		var stored PRStatus
-		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			c.RestoreBaseline(&stored)
-		}
-	}
-
-	errBackoff := time.Duration(0)
-
-	snapOpts := SnapshotOptions{
-		IgnoredBots:      opts.Prefs.IgnoredBots,
-		AnnotationLevels: opts.AnnotationLevels,
-	}
-	if ruleset != nil && ruleset.Error == "" {
-		snapOpts.RulesetChecks = ruleset
-	}
-
-	lastTier := TierFull
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		// Select the fetch tier from the advisory GraphQL budget and say
-		// loudly what is no longer being watched when it changes.
-		tier := opts.currentTier()
-		if tier != lastTier {
-			emitTierNotice(opts, tier, emit)
-			lastTier = tier
-		}
-		snapOpts.Tier = tier
-
-		resp, err := svc.FetchWithTier(&opts.Identity, opts.Identity.Number, tier)
-		if err != nil {
-			// A per-query resource-limit error can be beaten by a cheaper
-			// query: retry once one tier down. A rate-limit 403 cannot — every
-			// query costs points — so it keeps the hard backoff below.
-			if IsQueryCostError(err) && tier > TierStatus {
-				resp, err = svc.FetchWithTier(&opts.Identity, opts.Identity.Number, tier.Lower())
-			}
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-				emitDegraded(opts, "graphql", err, emit)
-				d := opts.jittered(nextErrBackoff(errBackoff, base))
-				errBackoff = d
-				// On rate limit, fetch the reset time and back off until then.
-				if reset := rateLimitResetSeconds(svc); reset > 0 {
-					until := time.Unix(reset, 0).UTC()
-					if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-						d = wait
-					}
-				}
-				if serr := opts.sleep(ctx, d); serr != nil {
-					return serr
-				}
-				continue
-			}
-		}
-		errBackoff = 0
-
-		curr := Snapshot(resp.Repository.PullRequest, snapOpts)
-		if c.Consume(curr, emit) {
-			savePRSnapshot(opts, curr)
-			return nil
-		}
-		savePRSnapshot(opts, curr)
-
-		d := opts.jittered(IdleInterval(base, c.noChange))
-		d = applyBudgetStretch(opts, d, emit)
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(opts.now())
-			if remaining <= 0 {
-				return nil
-			}
-			if d > remaining {
-				d = remaining
-			}
-		}
-		if err := opts.sleep(ctx, d); err != nil {
-			return err
-		}
-	}
-}
-
-func oncePR(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	resp, err := svc.Fetch(&opts.Identity, opts.Identity.Number)
-	if err != nil {
-		return err
-	}
-
-	ruleset, rulesetErr := svc.FetchRequiredChecks(opts.Identity.Owner, opts.Identity.Repo)
-	if rulesetErr != nil {
-		fmt.Fprintf(os.Stderr, "gh-monitor: ruleset fetch error: %v\n", rulesetErr)
-	}
-
-	snapOpts := SnapshotOptions{
-		IgnoredBots:      opts.Prefs.IgnoredBots,
-		AnnotationLevels: opts.AnnotationLevels,
-	}
-	if ruleset != nil && ruleset.Error == "" {
-		snapOpts.RulesetChecks = ruleset
-	}
-
-	curr := Snapshot(resp.Repository.PullRequest, snapOpts)
-
-	// Restore stored baseline for named instance one-shot (issue #32).
-	baseline := &PRStatus{}
-	if opts.CursorSnapshot != "" {
-		var stored PRStatus
-		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			baseline = &stored
-		}
-	}
-	isFirstPoll := opts.CursorSnapshot == ""
-	if isFirstPoll {
-		emit(opts.update(curr, Event{Type: EventFirstPoll}))
-	}
-	for _, ev := range Diff(baseline, curr) {
-		if isFirstPoll && ev.Type == EventNewCommit {
-			continue // agent just pushed it
-		}
-		emit(opts.update(curr, ev))
-	}
-	// ci-all-green never fires against an empty baseline — emit it explicitly.
-	if isFirstPoll && ciAllGreen(curr) {
-		emit(opts.update(curr, Event{Type: EventCIAllGreen}))
-	}
-	savePRSnapshot(opts, curr)
-	return nil
-}
 
 // ciAllGreen reports whether an open PR's CI has finished with every check
 // passing. It requires at least one successful check: with no checks at all —
@@ -526,286 +196,11 @@ func ciAllGreen(s *PRStatus) bool {
 // Ref / commit target
 // ---------------------------------------------------------------------------
 
-// runRef polls a ref or commit, emitting CI events until the context is
-// cancelled or timeout elapses. Ref targets never auto-stop (no terminal
-// state), so they run until cancelled or timed out.
-func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	base := opts.Interval
-	if base <= 0 {
-		base = defaultInterval
-	}
-
-	var deadline time.Time
-	if opts.Timeout > 0 {
-		deadline = opts.now().Add(opts.Timeout)
-	}
-
-	var prev *RefStatus
-	noChange := 0
-	errBackoff := time.Duration(0)
-	lastTier := TierFull
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		// Ref/commit targets shed only annotations (their queries carry no
-		// comments or reviews). The shed is invisible in the snapshot — the
-		// ref watcher surfaces checks only — so it is logged, not notified.
-		tier := opts.currentTier()
-		if tier == TierNoReviews || tier == TierStatus {
-			// The ref query has no comments/reviews to shed; the annotation
-			// shed is the only meaningful step.
-			tier = TierNoAnnotations
-		}
-		if tier != lastTier {
-			fmt.Fprintf(os.Stderr, "gh-monitor: %s %s: graphql budget low, dropping annotations from polls\n",
-				opts.Identity.Owner+"/"+opts.Identity.Repo, opts.Identity.Ref)
-			lastTier = tier
-		}
-
-		var curr *RefStatus
-		switch opts.Identity.Target {
-		case "commit":
-			resp, err := svc.FetchCommitWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA, tier)
-			if err != nil {
-				if IsQueryCostError(err) && tier > TierStatus {
-					resp, err = svc.FetchCommitWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA, tier.Lower())
-				}
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-					emitDegraded(opts, "graphql", err, emit)
-					d := opts.jittered(nextErrBackoff(errBackoff, base))
-					errBackoff = d
-					if reset := rateLimitResetSeconds(svc); reset > 0 {
-						until := time.Unix(reset, 0).UTC()
-						if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-							d = wait
-						}
-					}
-					if serr := opts.sleep(ctx, d); serr != nil {
-						return serr
-					}
-					continue
-				}
-			}
-			curr = SnapshotCommit(resp.Repository.Object)
-		default:
-			resp, err := svc.FetchRefWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref, tier)
-			if err != nil {
-				if IsQueryCostError(err) && tier > TierStatus {
-					resp, err = svc.FetchRefWithTier(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref, tier.Lower())
-				}
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-					emitDegraded(opts, "graphql", err, emit)
-					d := opts.jittered(nextErrBackoff(errBackoff, base))
-					errBackoff = d
-					if reset := rateLimitResetSeconds(svc); reset > 0 {
-						until := time.Unix(reset, 0).UTC()
-						if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-							d = wait
-						}
-					}
-					if serr := opts.sleep(ctx, d); serr != nil {
-						return serr
-					}
-					continue
-				}
-			}
-			curr = SnapshotRef(resp.Repository.Ref)
-		}
-		errBackoff = 0
-
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// CI issues are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RefStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRef(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		d := opts.jittered(IdleInterval(base, noChange))
-		d = applyBudgetStretch(opts, d, emit)
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(opts.now())
-			if remaining <= 0 {
-				return nil
-			}
-			if d > remaining {
-				d = remaining
-			}
-		}
-		if err := opts.sleep(ctx, d); err != nil {
-			return err
-		}
-	}
-}
-
-func onceRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	var curr *RefStatus
-	switch opts.Identity.Target {
-	case "commit":
-		resp, err := svc.FetchCommit(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.CommitSHA)
-		if err != nil {
-			return err
-		}
-		curr = SnapshotCommit(resp.Repository.Object)
-	default:
-		resp, err := svc.FetchRef(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Ref)
-		if err != nil {
-			return err
-		}
-		curr = SnapshotRef(resp.Repository.Ref)
-	}
-	emit(opts.update(curr, Event{Type: EventFirstPoll}))
-	for _, ev := range DiffRef(&RefStatus{}, curr) {
-		emit(opts.update(curr, ev))
-	}
-	return nil
-}
 
 // ---------------------------------------------------------------------------
 // Issue target
 // ---------------------------------------------------------------------------
 
-// runIssue polls an issue, emitting state-change and comment events. Auto-stops
-// when the issue is closed (but not reopened — a reopened issue continues).
-func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	base := opts.Interval
-	if base <= 0 {
-		base = defaultInterval
-	}
-
-	var deadline time.Time
-	if opts.Timeout > 0 {
-		deadline = opts.now().Add(opts.Timeout)
-	}
-
-	var prev *IssueStatus
-
-	// Restore the stored baseline for a named instance (issue #32).
-	if opts.CursorSnapshot != "" {
-		var stored IssueStatus
-		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			prev = &stored
-		}
-	}
-
-	noChange := 0
-	errBackoff := time.Duration(0)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		resp, err := svc.FetchIssue(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Number)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			emitDegraded(opts, "graphql", err, emit)
-			d := opts.jittered(nextErrBackoff(errBackoff, base))
-			errBackoff = d
-			if reset := rateLimitResetSeconds(svc); reset > 0 {
-				until := time.Unix(reset, 0).UTC()
-				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-					d = wait
-				}
-			}
-			if serr := opts.sleep(ctx, d); serr != nil {
-				return serr
-			}
-			continue
-		}
-		errBackoff = 0
-
-		curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
-
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// comments are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &IssueStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffIssues(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-			if ev.Type == EventIssueClosed {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-		saveIssueSnapshot(opts, curr)
-
-		if curr.State == "CLOSED" {
-			if firstPoll && !terminalEmitted {
-				emit(opts.update(curr, Event{Type: EventIssueClosed}))
-			}
-			return nil
-		}
-
-		d := opts.jittered(IdleInterval(base, noChange))
-		d = applyBudgetStretch(opts, d, emit)
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(opts.now())
-			if remaining <= 0 {
-				return nil
-			}
-			if d > remaining {
-				d = remaining
-			}
-		}
-		if err := opts.sleep(ctx, d); err != nil {
-			return err
-		}
-	}
-}
-
-func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	resp, err := svc.FetchIssue(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.Number)
-	if err != nil {
-		return err
-	}
-	curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
-
-	// Restore stored baseline for named instance one-shot (issue #32).
-	baseline := &IssueStatus{}
-	isFirstPoll := opts.CursorSnapshot == ""
-	if !isFirstPoll {
-		var stored IssueStatus
-		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			baseline = &stored
-		}
-	}
-	if isFirstPoll {
-		emit(opts.update(curr, Event{Type: EventFirstPoll}))
-	}
-	for _, ev := range DiffIssues(baseline, curr) {
-		emit(opts.update(curr, ev))
-	}
-	saveIssueSnapshot(opts, curr)
-	return nil
-}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -814,7 +209,7 @@ func onceIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(bac
 // IdleInterval returns the poll interval given the number of consecutive
 // no-change polls: base until 3 no-change polls, then base*2^(n-3) capped at
 // maxIdleInterval. It is exported so the shared poller daemon can back its
-// per-PR cadence off the same formula the in-process loop uses.
+// per-target cadence off a single shared formula.
 func IdleInterval(base time.Duration, noChange int) time.Duration {
 	return IdleIntervalCapped(base, noChange, maxIdleInterval)
 }
@@ -846,8 +241,11 @@ func IdleIntervalCapped(base time.Duration, noChange int, cap time.Duration) tim
 	return d
 }
 
-// nextErrBackoff doubles the current error backoff (starting at base), capped.
-func nextErrBackoff(cur, base time.Duration) time.Duration {
+// NextErrBackoff doubles the current error backoff (starting at base),
+// capped at maxErrBackoff. It is exported so the shared poller backs its
+// cadence off under consecutive fetch failures exactly as the in-process
+// loops did.
+func NextErrBackoff(cur, base time.Duration) time.Duration {
 	if cur <= 0 {
 		if base > maxErrBackoff {
 			return maxErrBackoff
@@ -859,20 +257,6 @@ func nextErrBackoff(cur, base time.Duration) time.Duration {
 		d = maxErrBackoff
 	}
 	return d
-}
-
-// savePRSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
-// when SaveSnapshot is nil (unnamed invocation or target not supporting
-// snapshots). Must only be called after a successful fetch.
-func savePRSnapshot(opts RunOptions, curr *PRStatus) {
-	if opts.SaveSnapshot == nil {
-		return
-	}
-	b, err := json.Marshal(curr)
-	if err != nil {
-		return
-	}
-	opts.SaveSnapshot(string(b))
 }
 
 // saveIssueSnapshot serialises curr and calls opts.SaveSnapshot. It is a no-op
@@ -1161,121 +545,6 @@ func setCommitVars(vars map[string]string, host string, id resolver.Identity, c 
 // Workflow-run target
 // ---------------------------------------------------------------------------
 
-// runRun polls a single GitHub Actions workflow run until it reaches a terminal
-// conclusion (status == "completed"), the context is cancelled, or the timeout
-// elapses. Unlike ref/commit monitoring (which never auto-stops), a run has a
-// clear terminal state and the loop stops once it is reached — mirroring the PR
-// loop's merged/closed exit.
-func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	base := opts.Interval
-	if base <= 0 {
-		base = defaultInterval
-	}
-
-	var deadline time.Time
-	if opts.Timeout > 0 {
-		deadline = opts.now().Add(opts.Timeout)
-	}
-
-	var prev *RunStatus
-	noChange := 0
-	errBackoff := time.Duration(0)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		resp, err := svc.FetchRun(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.RunID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			emitDegraded(opts, "rest", err, emit)
-			d := opts.jittered(nextErrBackoff(errBackoff, base))
-			errBackoff = d
-			if reset := rateLimitResetSeconds(svc); reset > 0 {
-				until := time.Unix(reset, 0).UTC()
-				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-					d = wait
-				}
-			}
-			if serr := opts.sleep(ctx, d); serr != nil {
-				return serr
-			}
-			continue
-		}
-		errBackoff = 0
-
-		curr := SnapshotRun(resp)
-
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so any pre-existing
-		// state (e.g. a run that is already completed) is surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RunStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRun(compare, curr)
-		for _, ev := range events {
-			if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-				ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-			}
-			emit(opts.update(curr, ev))
-			if ev.Type == EventRunCompleted {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		if curr.IsTerminal() {
-			if firstPoll && !terminalEmitted {
-				ev := Event{Type: EventRunCompleted, RunConclusion: curr.Conclusion}
-				if isRunFailureConclusion(curr.Conclusion) {
-					ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-				}
-				emit(opts.update(curr, ev))
-			}
-			return nil
-		}
-
-		d := opts.jittered(IdleInterval(base, noChange))
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(opts.now())
-			if remaining <= 0 {
-				return nil
-			}
-			if d > remaining {
-				d = remaining
-			}
-		}
-		if err := opts.sleep(ctx, d); err != nil {
-			return err
-		}
-	}
-}
-
-func onceRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	resp, err := svc.FetchRun(opts.Identity.Owner, opts.Identity.Repo, opts.Identity.RunID)
-	if err != nil {
-		return err
-	}
-	curr := SnapshotRun(resp)
-	emit(opts.update(curr, Event{Type: EventFirstPoll}))
-	for _, ev := range DiffRun(&RunStatus{}, curr) {
-		if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-			ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-		}
-		emit(opts.update(curr, ev))
-	}
-	return nil
-}
-
 // ---------------------------------------------------------------------------
 // Workflow-run notification rendering
 // ---------------------------------------------------------------------------
@@ -1348,156 +617,21 @@ func buildVarsRun(id resolver.Identity, status *RunStatus, ev Event, interval ti
 // Repo target (watch a repository for new PRs and issues)
 // ---------------------------------------------------------------------------
 
-// runRepo polls a repository for new PRs and issues, emitting events for each
-// new item. Unlike PR/issue targets, repo targets never auto-stop — they run
-// until cancelled or timed out.
+
 //
 // When opts.Instance is set, the loop uses the per-instance cursor to filter
 // out items it has already seen across restarts. The cursor is advanced after
 // each poll via opts.AdvanceCursor.
-func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	base := opts.Interval
-	if base <= 0 {
-		base = defaultInterval
-	}
-
-	var deadline time.Time
-	if opts.Timeout > 0 {
-		deadline = opts.now().Add(opts.Timeout)
-	}
-
-	var prev *RepoStatus
-	noChange := 0
-	errBackoff := time.Duration(0)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		resp, err := svc.FetchRepo(opts.Identity.Owner, opts.Identity.Repo)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "gh-monitor: fetch error: %v\n", err)
-			emitDegraded(opts, "graphql", err, emit)
-			d := opts.jittered(nextErrBackoff(errBackoff, base))
-			errBackoff = d
-			if reset := rateLimitResetSeconds(svc); reset > 0 {
-				until := time.Unix(reset, 0).UTC()
-				if wait := until.Sub(opts.now()); wait > 0 && wait > d {
-					d = wait
-				}
-			}
-			if serr := opts.sleep(ctx, d); serr != nil {
-				return serr
-			}
-			continue
-		}
-		errBackoff = 0
-
-		// Filter by cursor position when running as a named instance.
-		filtered := filterRepoResponse(resp, opts)
-
-		curr := SnapshotRepo(filtered)
-
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// PRs and issues are surfaced immediately — but only those that passed
-		// the cursor filter (a new instance with no cursor shows nothing).
-		compare := prev
-		if firstPoll {
-			compare = &RepoStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRepo(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		// Advance the cursor to the latest createdAt among ALL items in the
-		// unfiltered response — not just those we emitted. This ensures a
-		// restart never misses items, even when the current poll was filtered
-		// to empty by an event allowlist.
-		if opts.AdvanceCursor != nil {
-			if latest := latestRepoCreatedAt(resp); latest != "" {
-				opts.AdvanceCursor(latest)
-			}
-		}
-
-		d := opts.jittered(IdleInterval(base, noChange))
-		d = applyBudgetStretch(opts, d, emit)
-		if !deadline.IsZero() {
-			remaining := deadline.Sub(opts.now())
-			if remaining <= 0 {
-				return nil
-			}
-			if d > remaining {
-				d = remaining
-			}
-		}
-		if err := opts.sleep(ctx, d); err != nil {
-			return err
-		}
-	}
-}
-
-func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
-	resp, err := svc.FetchRepo(opts.Identity.Owner, opts.Identity.Repo)
-	if err != nil {
-		return err
-	}
-	filtered := filterRepoResponse(resp, opts)
-	curr := SnapshotRepo(filtered)
-	emit(opts.update(curr, Event{Type: EventFirstPoll}))
-	for _, ev := range DiffRepo(&RepoStatus{}, curr) {
-		emit(opts.update(curr, ev))
-	}
-	if opts.AdvanceCursor != nil {
-		if latest := latestRepoCreatedAt(resp); latest != "" {
-			opts.AdvanceCursor(latest)
-		}
-	}
-	return nil
-}
-
 // ---------------------------------------------------------------------------
 // Cursor-aware repo filtering (issue #32)
 // ---------------------------------------------------------------------------
 
-// filterRepoResponse returns a copy of the response with items created at or
-// before the cursor position suppressed. When opts.Instance is empty (unnamed
-// invocation), the response is returned unmodified — today's stateless
-// behaviour is preserved exactly.
-//
-// When opts.FromBeginning is true, the cursor is ignored and everything is
-// emitted — the caller explicitly asked for the backlog.
-//
-// When opts.CursorPosition is empty and the instance is named but has no
-// cursor yet, the function clips to "now" (the current time), so a fresh
-// instance emits nothing for pre-existing items. This is the key fix for
-// issue #32: spawning a new watcher on a busy repo should not flood the
-// operator with 13 "New PR" notifications for PRs that have been open for
-// weeks.
-func filterRepoResponse(resp *RepoQueryResponse, opts RunOptions) *RepoQueryResponse {
-	if opts.Instance == "" {
-		return resp // unnamed — stateless behaviour
-	}
-
-	threshold := opts.CursorPosition
-	if threshold == "" && !opts.FromBeginning {
-		// New instance with no cursor: start at "now".
-		threshold = opts.now().UTC().Format(time.RFC3339)
-	}
-	if threshold == "" {
-		// FromBeginning with no cursor: emit everything.
-		return resp
-	}
-
+// ClipRepoResponse returns a copy of resp with every PR and issue created at
+// or before threshold (an RFC3339 timestamp) suppressed. It is the shared
+// clipping primitive behind the named-instance cursor filter: the in-process
+// client passes via WatchOptions.Since, so a repo watch resumed from a
+// cursor sees only what came after it.
+func ClipRepoResponse(resp *RepoQueryResponse, threshold string) *RepoQueryResponse {
 	// Shallow copy and filter nodes.
 	filtered := *resp
 	filtered.Repository.PullRequests.Nodes = filterRepoPRs(resp.Repository.PullRequests.Nodes, threshold)
@@ -1525,10 +659,12 @@ func filterRepoIssues(nodes []RepoIssue, threshold string) []RepoIssue {
 	return out
 }
 
-// latestRepoCreatedAt returns the most recent CreatedAt timestamp among all
+// LatestRepoCreatedAt returns the most recent CreatedAt timestamp among all
 // PRs and issues in the response. It returns "" when the response has no
-// items, so the caller leaves the cursor unchanged.
-func latestRepoCreatedAt(resp *RepoQueryResponse) string {
+// items, so the caller leaves the cursor unchanged. It is exported because
+// the shared poller stamps it onto every update it emits for a repo target
+// so the client can advance its cursor the way the original runRepo loop did.
+func LatestRepoCreatedAt(resp *RepoQueryResponse) string {
 	var latest string
 	for _, p := range resp.Repository.PullRequests.Nodes {
 		if p.CreatedAt > latest {
@@ -1638,35 +774,4 @@ func degradedLabel(opts RunOptions) string {
 	default:
 		return fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number)
 	}
-}
-
-// emitDegraded emits a degraded event notification for the given surface and
-// error.
-func emitDegraded(opts RunOptions, surface string, err error, emit func(backend.Update)) {
-	emit(opts.update(nil, Event{
-		Type:            EventDegraded,
-		DegradedSurface: surface,
-		DegradedMessage: err.Error(),
-	}))
-}
-
-// rateLimitResetSeconds extracts the rate-limit reset time from an error.
-// Returns 0 when the reset time cannot be determined.
-func rateLimitResetSeconds(svc *Service) int64 {
-	rl, err := svc.FetchRateLimit()
-	if err != nil {
-		return 0
-	}
-	// Pick the closer reset: the one with less remaining capacity.
-	// If both Core and GraphQL are close to exhausted, use the earlier reset.
-	var reset int64
-	if rl.Resources.Core.Remaining == 0 && rl.Resources.Core.Reset > 0 {
-		reset = rl.Resources.Core.Reset
-	}
-	if rl.Resources.GraphQL.Remaining == 0 && rl.Resources.GraphQL.Reset > 0 {
-		if reset == 0 || rl.Resources.GraphQL.Reset < reset {
-			reset = rl.Resources.GraphQL.Reset
-		}
-	}
-	return reset
 }

@@ -10,8 +10,7 @@ import (
 
 // TestEventFilter_Allows is the core RED→GREEN test for the per-event-kind
 // allowlist. It exercises EventFilter.Allows directly (the predicate the
-// emit boundary uses to drop suppressed notifications) plus filterEmit (the
-// wrapper Run/Once install around the caller's emit callback).
+// emit boundary uses to drop suppressed notifications).
 //
 // Cases:
 //   - nil filter allows everything (today's default behaviour).
@@ -45,36 +44,6 @@ func TestEventFilter_Allows(t *testing.T) {
 	assert.True(t, mixed.Allows("NEW-FAILING-CHECKS"))
 }
 
-// TestEventFilter_FilterEmitDropsSuppressedKinds drives the exact wrapper that
-// Run/Once install around the caller's emit callback. It confirms:
-//   - a nil filter passes every notification through unchanged;
-//   - a non-nil filter emits only allowlisted kinds and silently drops the rest;
-//   - a nil emit callback is handled without panic.
-func TestEventFilter_FilterEmitDropsSuppressedKinds(t *testing.T) {
-	// nil filter: everything passes.
-	var got []Notification
-	pass := filterEmit(nil, func(n Notification) { got = append(got, n) })
-	pass(Notification{Type: "first-poll"})
-	pass(Notification{Type: "new-failing-checks"})
-	assert.Len(t, got, 2, "nil filter must pass every notification through")
-
-	// non-nil filter: only allowlisted kinds reach emit.
-	got = nil
-	pass = filterEmit(NewEventFilter("new-failing-checks", "merged"), func(n Notification) { got = append(got, n) })
-	pass(Notification{Type: "first-poll"})           // suppressed
-	pass(Notification{Type: "new-failing-checks"})   // allowed
-	pass(Notification{Type: "new-general-comments"}) // suppressed
-	pass(Notification{Type: "merged"})               // allowed
-	assert.Equal(t, []string{"new-failing-checks", "merged"}, typesOf(got),
-		"only allowlisted kinds must reach emit, in order")
-
-	// nil emit callback must not panic even with a filter.
-	require.NotPanics(t, func() {
-		noop := filterEmit(NewEventFilter("merged"), nil)
-		noop(Notification{Type: "merged"})
-	})
-}
-
 // TestEventFilter_ParsesCommaList confirms the parser splits a comma-separated
 // list, trims whitespace, drops empties, and is case-insensitive.
 func TestEventFilter_ParsesCommaList(t *testing.T) {
@@ -93,6 +62,20 @@ func TestEventFilter_ParsesCommaList(t *testing.T) {
 func TestEventFilter_RejectsUnknownKind(t *testing.T) {
 	_, err := ParseEventFilter("conflict,not-a-real-kind")
 	assert.Error(t, err)
+}
+
+// TestEventFilter_DegradedIsARecognisedKind confirms degraded is a first-class
+// notification kind (issue #66): it parses, it can be allowlisted, and it is
+// rejected like any other typo-adjacent spelling.
+func TestEventFilter_DegradedIsARecognisedKind(t *testing.T) {
+	f, err := ParseEventFilter("degraded")
+	require.NoError(t, err, "--events degraded must be accepted")
+	assert.True(t, f.Allows("degraded"))
+	assert.False(t, f.Allows("merged"))
+
+	f, err = ParseEventFilter("merged,DEGRADED")
+	require.NoError(t, err)
+	assert.True(t, f.Allows("degraded"), "matching is case-insensitive")
 }
 
 // TestEventFilter_EmptyInputSuppressesAll confirms an empty input string to

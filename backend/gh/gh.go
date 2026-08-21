@@ -1,19 +1,23 @@
-// Package gh is the built-in backend: it watches GitHub by polling its API,
-// and reads a target's current state the same way.
+// Package gh is the built-in backend: it reads GitHub's API, and — since the
+// shared-poller daemon became the single watch code path (issue #76) — it is
+// also where the daemon's per-kind fetch implementation lives. `gh monitor
+// daemon` wraps gh.Fetch in its hub; watching without a running daemon is a
+// hard error, not a silent in-process fallback.
 //
-// It registers both capabilities for every target kind, so it is the fallback
-// under any backend that covers only part of the surface.
+// It registers the reader capability and the mutation actors for every target
+// kind. It deliberately registers no Source: watching goes through the hub,
+// which shares one fetch across every watcher.
 package gh
 
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
+	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/monitor"
+	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 // Name is the backend name used by --backend and `gh monitor backends`.
@@ -24,21 +28,19 @@ type Provider struct {
 	// API returns the API client for a host. Defaults to the gh CLI client.
 	API func(host string) ghcli.API
 
-	// Base carries the run configuration the CLI resolved from flags and
-	// preferences — templates, ignored bots, annotation levels, cursor
-	// callbacks. Identity, Interval, and Timeout are filled per watch from
-	// the Target and WatchOptions.
+	// Base carries the read configuration the CLI resolved from flags and
+	// preferences — ignored bots and annotation levels. Identity is filled
+	// per read from the Target.
 	Base monitor.RunOptions
-
-	// Budget makes each watch consult the advisory GraphQL budget and stretch
-	// its cadence as that budget runs low.
-	Budget bool
 }
 
 // Name identifies the backend.
 func (p *Provider) Name() string { return Name }
 
 // Register adds every capability this backend provides, for every kind.
+// The Source it registers serves one-shot reads only (a single fetch through
+// an in-process hub — the same hub.Once the daemon serves); continuous
+// watching goes through the shared-poller daemon.
 func (p *Provider) Register(r *backend.Registry) error {
 	r.RegisterSource(Name, nil, backend.SourceFunc(p.watch))
 	r.RegisterReader(Name, nil, backend.ReaderFunc(p.read))
@@ -58,90 +60,87 @@ func (p *Provider) api(host string) ghcli.API {
 	return p.API(host)
 }
 
+// ---------------------------------------------------------------------------
+// The daemon's fetch implementation
+// ---------------------------------------------------------------------------
+
 // service builds a monitor.Service for the target's host, wired with the
 // failed-run log fetcher so a failed run's notification carries its log.
-func (p *Provider) service(host string) *monitor.Service {
-	svc := &monitor.Service{API: p.api(host)}
+func service(api func(host string) ghcli.API, host string) *monitor.Service {
+	var client ghcli.API
+	if api == nil {
+		client = &ghcli.Client{Host: host}
+	} else {
+		client = api(host)
+	}
+	svc := &monitor.Service{API: client}
 	if c, ok := svc.API.(*ghcli.Client); ok {
 		svc.FailedRunLogsFn = c.FailedRunLogs
 	}
 	return svc
 }
 
-// runOptions merges the provider's base configuration with the per-watch
-// target and options.
-func (p *Provider) runOptions(t backend.Target, opts backend.WatchOptions) monitor.RunOptions {
-	ro := p.Base
-	ro.Identity = monitor.IdentityOf(t)
-	if opts.Interval > 0 {
-		ro.Interval = opts.Interval
-	}
-	if opts.Timeout > 0 {
-		ro.Timeout = opts.Timeout
-	}
-	// The per-watch filters are what a caller on the far side of a backend
-	// boundary can say about what it wants to hear; they override whatever
-	// this process was configured with.
-	if len(opts.IgnoredAuthors) > 0 {
-		ro.Prefs.IgnoredBots = opts.IgnoredAuthors
-	}
-	if len(opts.AnnotationLevels) > 0 {
-		// Parsed rather than constructed directly, so "none" keeps meaning
-		// "report no annotations" instead of "report level none".
-		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
-			ro.AnnotationLevels = levels
+// Fetch returns the per-kind fetch function the daemon's hub polls with. Each
+// call goes through the real gh CLI client — at the poller's current query
+// tier for the kinds whose queries have tiers (pr, ref, commit); untiered for
+// the rest. The hub fans each single result out to every subscribed client.
+func Fetch(api func(host string) ghcli.API) hub.FetchFunc {
+	return func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (any, error) {
+		svc := service(api, id.Host)
+		switch id.Target {
+		case "ref":
+			return svc.FetchRefWithTier(id.Owner, id.Repo, id.Ref, tier)
+		case "commit":
+			return svc.FetchCommitWithTier(id.Owner, id.Repo, id.CommitSHA, tier)
+		case "issue":
+			return svc.FetchIssue(id.Owner, id.Repo, id.Number)
+		case "run":
+			return svc.FetchRun(id.Owner, id.Repo, id.RunID)
+		case "repo":
+			return svc.FetchRepo(id.Owner, id.Repo)
+		default:
+			resp, err := svc.FetchWithTier(&id, id.Number, tier)
+			if err != nil {
+				return nil, err
+			}
+			return resp.Repository.PullRequest, nil
 		}
 	}
-	if opts.RepeatUnresolved {
-		ro.Prefs.RetriggerComments = true
-	}
-	return ro
 }
 
-// watch polls the target, delivering one Update per genuinely-new change.
-func (p *Provider) watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
-	svc := p.service(t.Host)
-	ro := p.runOptions(t, opts)
-	if p.Budget {
-		ro.Budget = monitor.NewBudgetGuard(svc, ro.Interval)
+// Ruleset returns the ruleset function the daemon's hub calls once per PR
+// poller to read the branch ruleset and determine required status checks.
+func Ruleset(api func(host string) ghcli.API) hub.RulesetFunc {
+	return func(owner, repo string) (*monitor.RulesetChecks, error) {
+		return service(api, "").FetchRequiredChecks(owner, repo)
 	}
+}
 
-	out := make(chan backend.Update, 16)
-	go func() {
-		defer close(out)
-		emit := func(u backend.Update) {
-			select {
-			case out <- u:
-			case <-ctx.Done():
-			}
-		}
-		var err error
-		if opts.Once {
-			err = monitor.WatchOnce(ctx, svc, ro, emit)
-		} else {
-			err = monitor.Watch(ctx, svc, ro, emit)
-		}
-		// A cancelled context is how a watch ends, not a failure. Anything
-		// else is reported as a degraded update rather than swallowed: a
-		// watcher that stops without saying so reads as all-clear.
-		if err != nil && ctx.Err() == nil {
-			emit(backend.Update{
-				Target: t,
-				Event: backend.Event{
-					Type:            backend.EventDegraded,
-					DegradedSurface: "graphql",
-					DegradedMessage: err.Error(),
-				},
-				At: time.Now(),
-			})
-		}
-	}()
-	return out, nil
+// FailedRunLogs returns the failed-run log fetcher the daemon's hub injects,
+// so run-target notifications carry their log snippet exactly as the
+// in-process loops' did.
+func FailedRunLogs(api func(host string) ghcli.API) hub.FailedRunLogFetcher {
+	return func(owner, repo string, runID int) (string, error) {
+		return service(api, "").FailedRunLogs(owner, repo, runID)
+	}
+}
+
+// watch serves one-shot reads (WatchOptions.Once): a single fetch + emit
+// through an in-process hub, so `--once` works without a daemon. Continuous
+// watching requires the shared-poller daemon — a non-once Watch is a hard
+// error pointing at it, never a silent in-process poll loop.
+func (p *Provider) watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	if !opts.Once {
+		return nil, fmt.Errorf("watching requires the shared-poller daemon; start one with 'gh monitor daemon'")
+	}
+	h := hub.New(Fetch(p.API), Ruleset(p.API), 0, nil,
+		hub.WithFailedRunLogFetcher(FailedRunLogs(p.API)))
+	return h.Once(ctx, t, opts), nil
 }
 
 // read returns the target's current distilled state.
 func (p *Provider) read(ctx context.Context, t backend.Target) (backend.Status, error) {
-	svc := p.service(t.Host)
+	svc := service(p.API, t.Host)
 	id := monitor.IdentityOf(t)
 
 	switch t.Kind {
