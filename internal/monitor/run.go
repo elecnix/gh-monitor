@@ -555,8 +555,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RefStatus
-	noChange := 0
+	c := NewRefConsumer(opts)
 	errBackoff := time.Duration(0)
 	lastTier := TierFull
 
@@ -634,26 +633,10 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		errBackoff = 0
 		emitDegradedRecovery(opts, emit)
 
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// CI issues are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RefStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRef(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
+		c.Consume(curr, emit)
+		errBackoff = 0
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
@@ -710,17 +693,16 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *IssueStatus
+	c := NewIssueConsumer(opts)
 
 	// Restore the stored baseline for a named instance (issue #32).
 	if opts.CursorSnapshot != "" {
 		var stored IssueStatus
 		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			prev = &stored
+			c.RestoreBaseline(&stored)
 		}
 	}
 
-	noChange := 0
 	errBackoff := time.Duration(0)
 
 	for {
@@ -750,38 +732,11 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 
 		curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
 
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// comments are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &IssueStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffIssues(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-			if ev.Type == EventIssueClosed {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-		saveIssueSnapshot(opts, curr)
-
-		if curr.State == "CLOSED" {
-			if firstPoll && !terminalEmitted {
-				emit(opts.update(curr, Event{Type: EventIssueClosed}))
-			}
+		if terminal := c.Consume(curr, emit); terminal {
 			return nil
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
@@ -1194,8 +1149,8 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RunStatus
-	noChange := 0
+	c := NewRunConsumer(opts)
+	c.FailedLogDetail = func(runID int) string { return failedRunLogDetail(svc, opts.Identity, runID) }
 	errBackoff := time.Duration(0)
 
 	for {
@@ -1225,44 +1180,11 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 
 		curr := SnapshotRun(resp)
 
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so any pre-existing
-		// state (e.g. a run that is already completed) is surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RunStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRun(compare, curr)
-		for _, ev := range events {
-			if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-				ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-			}
-			emit(opts.update(curr, ev))
-			if ev.Type == EventRunCompleted {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		if curr.IsTerminal() {
-			if firstPoll && !terminalEmitted {
-				ev := Event{Type: EventRunCompleted, RunConclusion: curr.Conclusion}
-				if isRunFailureConclusion(curr.Conclusion) {
-					ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-				}
-				emit(opts.update(curr, ev))
-			}
+		if terminal := c.Consume(curr, emit); terminal {
 			return nil
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -1384,8 +1306,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RepoStatus
-	noChange := 0
+	c := NewRepoConsumer(opts)
 	errBackoff := time.Duration(0)
 
 	for {
@@ -1418,25 +1339,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 
 		curr := SnapshotRepo(filtered)
 
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// PRs and issues are surfaced immediately — but only those that passed
-		// the cursor filter (a new instance with no cursor shows nothing).
-		compare := prev
-		if firstPoll {
-			compare = &RepoStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRepo(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
+		c.Consume(curr, emit)
 
 		// Advance the cursor to the latest createdAt among ALL items in the
 		// unfiltered response — not just those we emitted. This ensures a
@@ -1448,7 +1351,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 			}
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
