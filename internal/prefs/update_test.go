@@ -174,3 +174,58 @@ func TestFilePathReturnsConfigPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, expected, p)
 }
+
+func TestUpdateFileSetsSelfUpdate(t *testing.T) {
+	base := t.TempDir()
+	eff, err := UpdateFile(base, []byte(`{"selfUpdate":"30m"}`))
+	require.NoError(t, err)
+	assert.Equal(t, "30m", eff.SelfUpdate)
+
+	// Persisted to the file, visible to a fresh Load.
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, "30m", got.SelfUpdate)
+
+	// A second set replaces the value.
+	eff, err = UpdateFile(base, []byte(`{"selfUpdate":"true"}`))
+	require.NoError(t, err)
+	assert.Equal(t, "true", eff.SelfUpdate)
+}
+
+func TestUpdateFileNullResetsSelfUpdate(t *testing.T) {
+	base := t.TempDir()
+	_, err := UpdateFile(base, []byte(`{"selfUpdate":"30m"}`))
+	require.NoError(t, err)
+
+	eff, err := UpdateFile(base, []byte(`{"selfUpdate":null}`))
+	require.NoError(t, err)
+	assert.Empty(t, eff.SelfUpdate)
+
+	// The key is removed from the file so the built-in default (off) applies.
+	stored := readStoredFile(t, base)
+	assert.NotContains(t, stored, "selfUpdate")
+}
+
+func TestUpdateFileRejectsInvalidSelfUpdate(t *testing.T) {
+	base := t.TempDir()
+	// Unparseable durations are rejected at set time — the operator notices
+	// the typo immediately instead of a daemon that silently never updates.
+	_, err := UpdateFile(base, []byte(`{"selfUpdate":"banana"}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selfUpdate")
+
+	// A JSON bool is not the string grammar; reject it too.
+	_, err = UpdateFile(base, []byte(`{"selfUpdate":true}`))
+	require.Error(t, err)
+
+	// Nothing was written by either failed attempt.
+	_, statErr := os.Stat(mustPath(t, base))
+	assert.True(t, os.IsNotExist(statErr))
+}
+
+func mustPath(t *testing.T, base string) string {
+	t.Helper()
+	p, err := ConfigPath(base)
+	require.NoError(t, err)
+	return p
+}

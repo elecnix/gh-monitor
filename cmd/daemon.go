@@ -71,9 +71,16 @@ completes an upgrade handoff.
 The daemon honours $GH_MONITOR_SOCK, $XDG_RUNTIME_DIR, and a per-user cache
 dir for the socket path. Send SIGTERM/SIGINT to stop it cleanly.
 
-Set $GH_MONITOR_SELFUPDATE=1 (or a duration, e.g. 30m) to have the daemon run
+Set "selfUpdate" in the global preferences file to have the daemon run
 "gh extension upgrade gh-monitor" on a cadence and hand off to the new binary
-when one lands.
+when one lands (issue #82):
+
+  gh monitor prefs set '{"selfUpdate": "30m"}'
+
+The value is a Go duration, or "1"/"true" for the default hourly cadence; it
+is off by default. It is a global-only setting: it is read from the operator's
+preferences.json and nowhere else, because self-upgrading the installed binary
+is a machine-wide act.
 
 Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
 broker: matching events wake the affected PR's fetch immediately instead of

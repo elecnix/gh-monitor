@@ -371,7 +371,11 @@ The daemon is **persistent once started** ([#69](https://github.com/elecnix/gh-m
 
 #### Self-update
 
-A resident daemon can also keep itself current. Set `GH_MONITOR_SELFUPDATE=1` (or a Go duration like `GH_MONITOR_SELFUPDATE=30m`; default cadence when enabled: hourly) and the daemon periodically runs `gh extension upgrade gh-monitor` itself. When an upgrade lands, the existing handoff machinery takes over seamlessly — connected watchers ride across with no replay and no lost polling state. It is off by default (auto-upgrading a CLI under the operator's feet is an explicit choice), it only runs when the daemon was launched through its runtime copy (otherwise the installed file could not be rewritten anyway), and a failed check is logged and retried — never fatal, never disruptive to serving.
+A resident daemon can also keep itself current. Set `selfUpdate` in the global preferences file (`gh monitor prefs set '{"selfUpdate": "30m"}'`) and the daemon periodically runs `gh extension upgrade gh-monitor` itself. The value is a Go duration (`"30m"`, `"2h"`), or `"1"`/`"true"` for the default hourly cadence; `""`, `"0"`, `"false"`, or null disables it (the default). When an upgrade lands, the existing handoff machinery takes over seamlessly — connected watchers ride across with no replay and no lost polling state.
+
+Self-update is a **global-only setting** ([#82](https://github.com/elecnix/gh-monitor/issues/82)): it is read from the operator's `preferences.json` and nowhere else — not from any per-project config — because upgrading the installed binary is a machine-wide act that no single checkout should decide. A value that does not parse is rejected at set time rather than becoming a silent no-op, and the removed `GH_MONITOR_SELFUPDATE` environment variable is no longer honored: a daemon that still sees it set says so loudly and points at the new location.
+
+It only runs when the daemon was launched through its runtime copy (otherwise the installed file could not be rewritten anyway), and a failed check is logged and retried — never fatal, never disruptive to serving.
 
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
@@ -467,7 +471,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 ### Checking which build is running
 

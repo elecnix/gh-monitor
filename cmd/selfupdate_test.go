@@ -162,28 +162,151 @@ func TestBuildUpgradeCommand(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Self-update cadence (issue #69)
+// Self-update cadence (issue #69, config-driven since #82)
 // ---------------------------------------------------------------------------
 
-func TestSelfUpdateIntervalFromEnv(t *testing.T) {
-	cases := []struct {
-		env  string
-		want time.Duration
-	}{
-		{"", 0},                    // unset: off
-		{"0", 0},                   // explicit off
-		{"false", 0},               // explicit off
-		{"1", time.Hour},           // on: default cadence
-		{"true", time.Hour},        // on: default cadence
-		{"30m", 30 * time.Minute},  // custom cadence
-		{"2h", 2 * time.Hour},      // custom cadence
-		{"garbage", 0},             // unparseable: off, never guess
-		{"-5m", 0},                 // negative: off
+// writeSelfUpdatePrefs points the global preferences file (XDG_CONFIG_HOME)
+// at a temp dir containing the given selfUpdate value.
+func writeSelfUpdatePrefs(t *testing.T, spec string) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfg := filepath.Join(dir, "gh-monitor")
+	require.NoError(t, os.MkdirAll(cfg, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "preferences.json"),
+		[]byte(`{"selfUpdate":"`+spec+`"}`), 0o644))
+}
+
+// countingUpgradeFn substitutes a counting no-op for the real `gh extension
+// upgrade` call and returns a reader for the count.
+func countingUpgradeFn(t *testing.T) func() int {
+	t.Helper()
+	var mu sync.Mutex
+	checks := 0
+	origUpgrade := extensionUpgradeFn
+	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
+	extensionUpgradeFn = func() error {
+		mu.Lock()
+		checks++
+		mu.Unlock()
+		return nil
 	}
-	for _, tc := range cases {
-		t.Setenv(selfUpdateEnv, tc.env)
-		assert.Equal(t, tc.want, selfUpdateIntervalFromEnv(), "GH_MONITOR_SELFUPDATE=%q", tc.env)
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return checks
 	}
+}
+
+// stopChecker cancels the daemon context a test handed to startSelfUpdate and
+// waits past one tick so the spawned release-check loop has exited — a leaked
+// goroutine would otherwise keep counting against whichever test runs next.
+func stopChecker(cancel context.CancelFunc) {
+	cancel()
+	time.Sleep(30 * time.Millisecond)
+}
+
+// TestSelfUpdate_EnabledViaPrefs verifies the config path end to end: a
+// selfUpdate value in the global preferences file enables the checker with no
+// environment variable involved (issue #82).
+func TestSelfUpdate_EnabledViaPrefs(t *testing.T) {
+	writeSelfUpdatePrefs(t, "5ms")
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	checks := countingUpgradeFn(t)
+
+	cmd := newDaemonCommand()
+	ctx, cancel := context.WithCancel(context.Background())
+	startSelfUpdate(ctx, cmd)
+
+	deadline := time.After(2 * time.Second)
+	for checks() == 0 {
+		select {
+		case <-deadline:
+			stopChecker(cancel)
+			t.Fatal("selfUpdate in preferences.json never enabled the checker")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	stopChecker(cancel)
+}
+
+// TestSelfUpdate_RemovedEnvVarIsNotHonored pins the removal (issue #82): the
+// env var is dead — it must not enable the checker — and its remnant must be
+// announced loudly so an operator relying on it is never silently ignored.
+func TestSelfUpdate_RemovedEnvVarIsNotHonored(t *testing.T) {
+	t.Setenv(selfUpdateRemovedEnv, "5ms") // the old spelling: dead, not honored
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	var logs []string
+	cmd := newDaemonCommand()
+	cmd.SetErr(writerFunc(func(s string) { logs = append(logs, s) }))
+
+	checks := countingUpgradeFn(t)
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Zero(t, checks(), "the removed env var must not enable self-update")
+	joined := strings.Join(logs, "")
+	assert.Contains(t, joined, selfUpdateRemovedEnv,
+		"a set-but-removed env var must be called out, never silently ignored")
+	assert.Contains(t, joined, "prefs", "the warning must point at the config home")
+}
+
+// TestSelfUpdate_OffByDefault verifies that with no selfUpdate in the global
+// preferences the checker never runs: a resident daemon must not shell out to
+// `gh extension upgrade` unless the operator asked for it.
+func TestSelfUpdate_OffByDefault(t *testing.T) {
+	writeSelfUpdatePrefs(t, "")
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	checks := countingUpgradeFn(t)
+
+	cmd := newDaemonCommand()
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(50 * time.Millisecond)
+	assert.Zero(t, checks(), "self-update must be opt-in")
+}
+
+// TestSelfUpdate_RequiresRuntimeCopyLaunch verifies the second gate: even
+// when enabled, the checker does not run unless the daemon was launched from
+// a runtime copy — otherwise the running image maps the installed file and an
+// upgrade could not land anyway.
+func TestSelfUpdate_RequiresRuntimeCopyLaunch(t *testing.T) {
+	writeSelfUpdatePrefs(t, "5ms")
+	t.Setenv(reexec.InstalledBinEnv, "") // not launched via the runtime copy
+
+	var logs []string
+	cmd := newDaemonCommand()
+	cmd.SetErr(writerFunc(func(s string) { logs = append(logs, s) }))
+
+	checks := countingUpgradeFn(t)
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(30 * time.Millisecond)
+	assert.Zero(t, checks(), "no runtime copy: self-update must stay off")
+	require.NotEmpty(t, logs, "the disablement must be announced, never silent")
+}
+
+// TestSelfUpdate_UnreadablePrefsDegradesToOff verifies a broken preferences
+// file never kills or enables the daemon's self-update: it degrades to off
+// with a logged reason.
+func TestSelfUpdate_UnreadablePrefsDegradesToOff(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	cfg := filepath.Join(dir, "gh-monitor")
+	require.NoError(t, os.MkdirAll(cfg, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cfg, "preferences.json"), []byte(`{not json`), 0o644))
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	var logs []string
+	cmd := newDaemonCommand()
+	cmd.SetErr(writerFunc(func(s string) { logs = append(logs, s) }))
+
+	checks := countingUpgradeFn(t)
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(30 * time.Millisecond)
+	assert.Zero(t, checks(), "a broken preferences file must degrade to off")
+	require.NotEmpty(t, logs, "the degradation must be announced, never silent")
 }
 
 // TestSelfUpdate_CheckerRunsUpgradeOnCadence verifies the loop end to end:
@@ -226,53 +349,6 @@ func TestSelfUpdate_CheckerRunsUpgradeOnCadence(t *testing.T) {
 	}
 	cancel()
 	<-done
-}
-
-// TestSelfUpdate_OffByDefault verifies that without GH_MONITOR_SELFUPDATE the
-// checker never runs: a resident daemon must not shell out to `gh extension
-// upgrade` unless the operator asked for it.
-func TestSelfUpdate_OffByDefault(t *testing.T) {
-	t.Setenv(selfUpdateEnv, "")
-	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
-
-	checks := 0
-	origUpgrade := extensionUpgradeFn
-	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
-	extensionUpgradeFn = func() error {
-		checks++
-		return nil
-	}
-
-	cmd := newDaemonCommand()
-	startSelfUpdate(context.Background(), cmd)
-	time.Sleep(50 * time.Millisecond)
-	assert.Zero(t, checks, "self-update must be opt-in")
-}
-
-// TestSelfUpdate_RequiresRuntimeCopyLaunch verifies the second gate: even
-// when enabled, the checker does not run unless the daemon was launched from
-// a runtime copy — otherwise the running image maps the installed file and an
-// upgrade could not land anyway.
-func TestSelfUpdate_RequiresRuntimeCopyLaunch(t *testing.T) {
-	t.Setenv(selfUpdateEnv, "5ms")
-	t.Setenv(reexec.InstalledBinEnv, "") // not launched via the runtime copy
-
-	var logs []string
-	cmd := newDaemonCommand()
-	cmd.SetErr(writerFunc(func(s string) { logs = append(logs, s) }))
-
-	checks := 0
-	origUpgrade := extensionUpgradeFn
-	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
-	extensionUpgradeFn = func() error {
-		checks++
-		return nil
-	}
-
-	startSelfUpdate(context.Background(), cmd)
-	time.Sleep(30 * time.Millisecond)
-	assert.Zero(t, checks, "no runtime copy: self-update must stay off")
-	require.NotEmpty(t, logs, "the disablement must be announced, never silent")
 }
 
 // TestSelfUpdate_FailedCheckIsNotFatal verifies a failed upgrade check is

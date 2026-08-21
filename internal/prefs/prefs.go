@@ -20,18 +20,24 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"time"
 )
 
 // Preferences holds the user's notification templates keyed by event kind,
 // plus non-template configuration.
 //
-// Templates is keyed by the event kinds in DefaultPreferences. The two
-// non-template fields (IgnoredBots, RetriggerComments) are plain config and are
+// Templates is keyed by the event kinds in DefaultPreferences. The non-template
+// fields (IgnoredBots, RetriggerComments, SelfUpdate) are plain config and are
 // exempt from the template validation guardrail.
+//
+// SelfUpdate is a global-only setting (issue #82): it decides whether the
+// resident daemon upgrades gh-monitor itself, which is a machine-wide act —
+// this document is the only place it is read from.
 type Preferences struct {
 	Templates         map[string]string `json:"templates"`
 	IgnoredBots       []string          `json:"ignoredBots"`
 	RetriggerComments bool              `json:"retriggerComments"`
+	SelfUpdate        string            `json:"selfUpdate,omitempty"`
 }
 
 // templateKeys are the exact, authoritative event-kind keys. They intentionally
@@ -83,7 +89,39 @@ func DefaultPreferences() Preferences {
 		Templates:         templates,
 		IgnoredBots:       []string{},
 		RetriggerComments: false,
+		SelfUpdate:        "",
 	}
+}
+
+// SelfUpdateInterval interprets a selfUpdate preference value against dflt,
+// the cadence used when self-update is enabled without an explicit duration.
+// Zero means off. The spec grammar mirrors what the removed
+// GH_MONITOR_SELFUPDATE env variable accepted (issue #82): absent, "0", or
+// "false" disable; "1" or "true" select dflt; any positive Go duration is an
+// explicit cadence. Anything unparseable is off — never guessed.
+func SelfUpdateInterval(spec string, dflt time.Duration) time.Duration {
+	switch spec {
+	case "", "0", "false":
+		return 0
+	case "1", "true":
+		return dflt
+	}
+	if d, err := time.ParseDuration(spec); err == nil && d > 0 {
+		return d
+	}
+	return 0
+}
+
+// ValidSelfUpdateSpec reports whether spec is a value UpdateFile accepts for
+// the selfUpdate key. It accepts exactly what SelfUpdateInterval interprets,
+// so a typo is rejected at set time rather than becoming a silent no-op.
+func ValidSelfUpdateSpec(spec string) bool {
+	switch spec {
+	case "", "0", "false", "1", "true":
+		return true
+	}
+	d, err := time.ParseDuration(spec)
+	return err == nil && d > 0
 }
 
 // recognizedTokens is the fixed set of tokens Interpolate will replace. Any
@@ -257,6 +295,7 @@ type storedPreferences struct {
 	Templates         map[string]*string `json:"templates"`
 	IgnoredBots       []string           `json:"ignoredBots"`
 	RetriggerComments *bool              `json:"retriggerComments,omitempty"`
+	SelfUpdate        *string            `json:"selfUpdate,omitempty"`
 }
 
 // Load starts from DefaultPreferences and overlays the JSON file if present.
