@@ -350,7 +350,7 @@ Cursors are independent — advancing one instance's cursor never affects anothe
 
 ### Shared poller daemon
 
-By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same PR (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per PR** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
+By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same target (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per watched target** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
 
 ```sh
 # Start the daemon (runs until SIGTERM/SIGINT)
@@ -363,9 +363,11 @@ gh monitor -R owner/repo 42 --text
 
 A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` **auto-starts** one (a detached background process) and then connects, so you get shared polling without a manual `daemon` step. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
 
+Since [#76](https://github.com/elecnix/gh-monitor/issues/76) the daemon is the single watch code path: it multiplexes every target kind (pull requests, refs, commits, issues, workflow runs, whole repositories), and watch mode **requires** it — if no daemon can be attached, the client fails with an error naming the fix rather than silently polling in-process. `--once` reads still go straight to the built-in backend, which answers them without a daemon.
+
 Concurrent auto-starts are race-safe: at most one daemon binds a socket (a second `Listen` refuses to steal a live daemon's socket), so several clients starting at once share a single fetch loop rather than each spawning their own.
 
-The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to force a client to use in-process polling even when a daemon is running, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (so a client falls back to in-process polling when no daemon is running instead of spawning one). `--once` and non-PR targets always use the in-process loop.
+The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_DAEMON=0` to use the transition-era in-process polling loops instead of the daemon, and `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one).
 
 #### Broker transport (optional)
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -174,6 +175,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// Wire cursor I/O for named instances (issue #32). Repo targets use the
 	// cursor's Position (a createdAt timestamp); PR and issue targets use the
 	// cursor's Snapshot (a JSON-serialised PRStatus or IssueStatus baseline).
+	// persistFromUpdate is set alongside: it is how the daemon path persists
+	// cursor state, since the polling happens on the far side of the wire and
+	// the client only sees what the updates carry.
+	var persistFromUpdate func(backend.Update)
 	if opts.Instance != "" {
 		prefsPath, err := prefs.ConfigPath("")
 		if err != nil {
@@ -221,6 +226,21 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			}
 			if err := store.Save(c); err != nil {
 				fmt.Fprintf(os.Stderr, "gh-monitor: cursor save error: %v\n", err)
+			}
+		}
+		// The daemon path persists from the updates it receives: a distilled
+		// Status becomes the new baseline snapshot (degraded updates carry no
+		// status, so a cursor never advances past events that were never read,
+		// matching the in-process loops), and a repo target's Cursor token —
+		// the latest createdAt in the polled response — advances the position.
+		persistFromUpdate = func(u backend.Update) {
+			if u.Status != nil {
+				if b, err := json.Marshal(u.Status); err == nil {
+					runOpts.SaveSnapshot(string(b))
+				}
+			}
+			if u.Cursor != "" {
+				runOpts.AdvanceCursor(u.Cursor)
 			}
 		}
 	}
@@ -279,18 +299,21 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	if err != nil {
 		return err
 	}
-	// The daemon exists so several processes watching one pull request share a
-	// single fetch (issue #34). It only makes sense for a continuous watch, so
-	// a one-shot read goes straight to the backend that can answer it.
+	// The daemon exists so several processes watching one target share a
+	// single fetch (issue #34), and since #76 it serves every target kind. It
+	// only makes sense for a continuous watch, so a one-shot read goes
+	// straight to the backend that can answer it.
 	if !opts.Once {
-		attachDaemon(ctx, reg, target, runOpts.Interval)
+		if err := attachDaemon(ctx, reg, target, runOpts.Interval); err != nil {
+			return err
+		}
 	}
 	source, sourceName, err := reg.SourceFor(target)
 	if err != nil {
 		return err
 	}
 
-	updates, err := source.Watch(ctx, target, backend.WatchOptions{
+	watchOpts := backend.WatchOptions{
 		Interval:         runOpts.Interval,
 		Timeout:          runOpts.Timeout,
 		Once:             opts.Once,
@@ -298,7 +321,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		IgnoredAuthors:   runOpts.Prefs.IgnoredBots,
 		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
 		AnnotationLevels: runOpts.AnnotationLevels.Names(),
-	})
+		Baseline:         runOpts.CursorSnapshot,
+	}
+	// A named repo instance with no cursor yet starts at "now" (issue #32):
+	// the in-process loop computes that threshold itself, but the daemon
+	// polls on the far side of the wire, so the client passes it via Since.
+	if opts.Instance != "" && target.Kind == backend.KindRepo && runOpts.CursorPosition == "" && !opts.FromBeginning {
+		watchOpts.Since = time.Now().UTC().Format(time.RFC3339)
+	}
+	updates, err := source.Watch(ctx, target, watchOpts)
 	if err != nil {
 		return fmt.Errorf("backend %q: %w", sourceName, err)
 	}
@@ -308,6 +339,11 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	for u := range updates {
 		if !dedup.Allow(u) {
 			continue
+		}
+		// The in-process loops persist cursor state themselves; the daemon
+		// path persists from what each update carries.
+		if persistFromUpdate != nil && sourceName == DaemonBackendName {
+			persistFromUpdate(u)
 		}
 		emit(monitor.Render(u, runOpts.Prefs, runOpts.Interval))
 	}
@@ -489,24 +525,25 @@ func splitRepo(repoArg string) (owner, repo string) {
 	return repoArg, ""
 }
 
-// attachDaemon registers the shared-poller daemon as a backend for pull
-// requests, starting one if none is listening and autostart is enabled.
+// attachDaemon registers the shared-poller daemon as a backend for the given
+// target, starting one if none is listening and autostart is enabled.
 //
-// It is best-effort by design: the daemon is an optimisation — several
-// processes watching one pull request share a single fetch — and its absence
-// must never stop a watch. Every failure path simply leaves the registry as it
-// was, so the built-in backend polls in-process instead.
+// The daemon is the primary watch path (issue #76): one GitHub fetch shared
+// by N watchers, broker/webhook fan-out, tier-shedding. Watch mode therefore
+// requires it — every failure to attach is a hard error naming the fix, not a
+// silent fall back to in-process polling. The explicit escape hatch is
+// GH_MONITOR_DAEMON=0, which keeps the transition-era in-process loops
+// available for users who need them.
 //
-// Registering it as a backend rather than special-casing it is what lets an
-// explicitly configured external backend still win: it registers after this
-// one, and the later registration takes precedence for the kinds it claims.
-func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Target, interval time.Duration) {
-	if target.Kind != backend.KindPR {
-		return // the shared poller only serves pull requests
-	}
+// Registering the daemon as a backend rather than special-casing it is what
+// lets an explicitly configured external backend still win: it registers
+// after this one, and the later registration takes precedence for the kinds
+// it claims.
+func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Target, interval time.Duration) error {
 	socket := daemonSocketPath()
 	if socket == "" {
-		return // opted out via GH_MONITOR_DAEMON=0
+		// Escape hatch: GH_MONITOR_DAEMON=0 keeps polling in-process.
+		return nil
 	}
 
 	if probe, err := ipc.Dial(socket); err == nil {
@@ -515,32 +552,29 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 		_ = probe.Close()
 	} else {
 		if !daemonAutostart() {
-			return
+			return fmt.Errorf("no shared poller is listening on %s and autostart is disabled (GH_MONITOR_AUTOSTART=0); start one with 'gh monitor daemon', or set GH_MONITOR_DAEMON=0 to poll in-process", socket)
 		}
 		if err := autostartDaemon(ctx, socket, interval); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr,
-				"gh-monitor: could not start the shared poller (%v); polling in-process\n", err)
-			return
+			return fmt.Errorf("could not start the shared poller (%v); start one with 'gh monitor daemon', or set GH_MONITOR_DAEMON=0 to poll in-process", err)
 		}
 	}
 
 	transport, err := remote.ParseEndpoint("unix:" + socket)
 	if err != nil {
-		return
+		return fmt.Errorf("parse daemon endpoint: %w", err)
 	}
 	provider, err := remote.Connect(ctx, transport)
 	if err != nil {
 		// The likeliest cause is a daemon left running from a build before
 		// this protocol: it holds the socket and waits for the client to speak
-		// first, so the handshake times out. Say what to do about it — the
-		// alternative is every invocation quietly paying that timeout.
-		_, _ = fmt.Fprintf(os.Stderr,
-			"gh-monitor: the process holding %s does not speak this backend protocol (%v).\n"+
-				"gh-monitor: polling in-process. If it is a daemon from an older build, stop it:\n"+
-				"gh-monitor:   pkill -f 'gh monitor daemon'\n", socket, err)
-		return
+		// first, so the handshake times out. Say what to do about it.
+		return fmt.Errorf("the process holding %s does not speak this backend protocol (%v).\n"+
+			"If it is a daemon from an older build, stop it:\n"+
+			"  pkill -f 'gh monitor daemon'\n"+
+			"or set GH_MONITOR_DAEMON=0 to poll in-process", socket, err)
 	}
 	if err := reg.Use(provider); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor: %v; polling in-process\n", err)
+		return fmt.Errorf("register the shared poller: %w", err)
 	}
+	return nil
 }

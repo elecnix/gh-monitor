@@ -1365,13 +1365,13 @@ func TestLatestRepoCreatedAt(t *testing.T) {
 		[]RepoPR{mkRepoPR(1, "p1", "2025-01-01T00:00:00Z"), mkRepoPR(2, "p2", "2025-01-05T00:00:00Z")},
 		[]RepoIssue{mkRepoIssue(3, "i1", "2025-01-03T00:00:00Z")},
 	)
-	latest := latestRepoCreatedAt(resp)
+	latest := LatestRepoCreatedAt(resp)
 	assert.Equal(t, "2025-01-05T00:00:00Z", latest)
 }
 
 func TestLatestRepoCreatedAt_Empty(t *testing.T) {
 	resp := mkRepoResponse(nil, nil)
-	latest := latestRepoCreatedAt(resp)
+	latest := LatestRepoCreatedAt(resp)
 	assert.Empty(t, latest)
 }
 

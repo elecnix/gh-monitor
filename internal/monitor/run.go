@@ -34,12 +34,14 @@ const (
 	defaultInterval = 60 * time.Second
 )
 
-// maxFailedLogLines caps the failed-run log snippet embedded in a
+// MaxFailedLogLines caps the failed-run log snippet embedded in a
 // run-completed notification (issue #19). `gh run view --log-failed` emits the
 // full failed-step log chronologically, with the actual error at the END, so we
 // keep the last N lines (the error + its immediate context) rather than the
 // first N — taking the head would capture only setup noise and miss the error.
-const maxFailedLogLines = 50
+// It is exported so the shared poller daemon caps its snippets exactly as the
+// in-process loop does.
+const MaxFailedLogLines = 50
 
 // runFailureConclusions are the terminal conclusions that mean the run did not
 // succeed and therefore warrant a failed-log snippet.
@@ -77,13 +79,14 @@ func cleanFailedLogLine(line string) string {
 	return fields[1] + "\t" + logTsRE.ReplaceAllString(fields[2], "")
 }
 
-// summarizeFailedLog cleans and tail-truncates the failed-run log output so the
-// snippet carries the error (which lives at the end of the `--log-failed`
-// output) plus its immediate context. When the cleaned log fits within maxLines
-// it is returned verbatim; otherwise the last maxLines lines are kept, prefixed
-// by a one-line marker noting how many earlier lines were dropped. Empty input
-// yields "".
-func summarizeFailedLog(s string, maxLines int) string {
+// SummarizeFailedLog cleans and tail-truncates the failed-run log output so
+// the snippet carries the error (which lives at the end of the `--log-failed`
+// output) plus its immediate context. When the cleaned log fits within
+// maxLines it is returned verbatim; otherwise the last maxLines lines are
+// kept, prefixed by a one-line marker noting how many earlier lines were
+// dropped. Empty input yields "". It is exported so the shared poller daemon
+// summarizes snippets exactly as the in-process loop does.
+func SummarizeFailedLog(s string, maxLines int) string {
 	s = strings.TrimPrefix(s, "\ufeff") // strip a leading BOM if present
 	if strings.TrimSpace(s) == "" {
 		return ""
@@ -112,7 +115,7 @@ func failedRunLogDetail(svc *Service, id resolver.Identity, runID int) string {
 		fmt.Fprintf(os.Stderr, "gh-monitor: failed-run log fetch error: %v\n", err)
 		return ""
 	}
-	return summarizeFailedLog(out, maxFailedLogLines)
+	return SummarizeFailedLog(out, MaxFailedLogLines)
 }
 
 // Notification is one emitted event, rendered for a consumer. It serializes to a
@@ -555,8 +558,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RefStatus
-	noChange := 0
+	c := NewRefConsumer(opts)
 	errBackoff := time.Duration(0)
 	lastTier := TierFull
 
@@ -634,26 +636,9 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		errBackoff = 0
 		emitDegradedRecovery(opts, emit)
 
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// CI issues are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RefStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRef(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
+		c.Consume(curr, emit)
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
@@ -710,17 +695,16 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *IssueStatus
+	c := NewIssueConsumer(opts)
 
 	// Restore the stored baseline for a named instance (issue #32).
 	if opts.CursorSnapshot != "" {
 		var stored IssueStatus
 		if err := json.Unmarshal([]byte(opts.CursorSnapshot), &stored); err == nil {
-			prev = &stored
+			c.RestoreBaseline(&stored)
 		}
 	}
 
-	noChange := 0
 	errBackoff := time.Duration(0)
 
 	for {
@@ -750,38 +734,11 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 
 		curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
 
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// comments are surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &IssueStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffIssues(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-			if ev.Type == EventIssueClosed {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-		saveIssueSnapshot(opts, curr)
-
-		if curr.State == "CLOSED" {
-			if firstPoll && !terminalEmitted {
-				emit(opts.update(curr, Event{Type: EventIssueClosed}))
-			}
+		if terminal := c.Consume(curr, emit); terminal {
 			return nil
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
@@ -1194,8 +1151,8 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RunStatus
-	noChange := 0
+	c := NewRunConsumer(opts)
+	c.FailedLogDetail = func(runID int) string { return failedRunLogDetail(svc, opts.Identity, runID) }
 	errBackoff := time.Duration(0)
 
 	for {
@@ -1225,44 +1182,11 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 
 		curr := SnapshotRun(resp)
 
-		firstPoll := prev == nil
-		terminalEmitted := false
-		// On the first poll, diff against an empty baseline so any pre-existing
-		// state (e.g. a run that is already completed) is surfaced immediately.
-		compare := prev
-		if firstPoll {
-			compare = &RunStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRun(compare, curr)
-		for _, ev := range events {
-			if ev.Type == EventRunCompleted && isRunFailureConclusion(ev.RunConclusion) {
-				ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-			}
-			emit(opts.update(curr, ev))
-			if ev.Type == EventRunCompleted {
-				terminalEmitted = true
-			}
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
-
-		if curr.IsTerminal() {
-			if firstPoll && !terminalEmitted {
-				ev := Event{Type: EventRunCompleted, RunConclusion: curr.Conclusion}
-				if isRunFailureConclusion(curr.Conclusion) {
-					ev.Detail = failedRunLogDetail(svc, opts.Identity, curr.RunID)
-				}
-				emit(opts.update(curr, ev))
-			}
+		if terminal := c.Consume(curr, emit); terminal {
 			return nil
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
 			if remaining <= 0 {
@@ -1384,8 +1308,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 		deadline = opts.now().Add(opts.Timeout)
 	}
 
-	var prev *RepoStatus
-	noChange := 0
+	c := NewRepoConsumer(opts)
 	errBackoff := time.Duration(0)
 
 	for {
@@ -1418,37 +1341,19 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 
 		curr := SnapshotRepo(filtered)
 
-		firstPoll := prev == nil
-		// On the first poll, diff against an empty baseline so all pre-existing
-		// PRs and issues are surfaced immediately — but only those that passed
-		// the cursor filter (a new instance with no cursor shows nothing).
-		compare := prev
-		if firstPoll {
-			compare = &RepoStatus{}
-			emit(opts.update(curr, Event{Type: EventFirstPoll}))
-		}
-		events := DiffRepo(compare, curr)
-		for _, ev := range events {
-			emit(opts.update(curr, ev))
-		}
-		if len(events) == 0 {
-			noChange++
-		} else {
-			noChange = 0
-		}
-		prev = curr
+		c.Consume(curr, emit)
 
 		// Advance the cursor to the latest createdAt among ALL items in the
 		// unfiltered response — not just those we emitted. This ensures a
 		// restart never misses items, even when the current poll was filtered
 		// to empty by an event allowlist.
 		if opts.AdvanceCursor != nil {
-			if latest := latestRepoCreatedAt(resp); latest != "" {
+			if latest := LatestRepoCreatedAt(resp); latest != "" {
 				opts.AdvanceCursor(latest)
 			}
 		}
 
-		d := opts.jittered(IdleInterval(base, noChange))
+		d := opts.jittered(IdleInterval(base, c.NoChange()))
 		d = applyBudgetStretch(opts, d, emit)
 		if !deadline.IsZero() {
 			remaining := deadline.Sub(opts.now())
@@ -1477,7 +1382,7 @@ func onceRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 		emit(opts.update(curr, ev))
 	}
 	if opts.AdvanceCursor != nil {
-		if latest := latestRepoCreatedAt(resp); latest != "" {
+		if latest := LatestRepoCreatedAt(resp); latest != "" {
 			opts.AdvanceCursor(latest)
 		}
 	}
@@ -1516,7 +1421,16 @@ func filterRepoResponse(resp *RepoQueryResponse, opts RunOptions) *RepoQueryResp
 		// FromBeginning with no cursor: emit everything.
 		return resp
 	}
+	return ClipRepoResponse(resp, threshold)
+}
 
+// ClipRepoResponse returns a copy of resp with every PR and issue created at
+// or before threshold (an RFC3339 timestamp) suppressed. It is the shared
+// clipping primitive behind the named-instance cursor filter: the in-process
+// runRepo loop applies it via filterRepoResponse, and the shared poller
+// applies it to a subscriber's WatchOptions.Since so a repo watch resumed
+// from a cursor sees only what came after it.
+func ClipRepoResponse(resp *RepoQueryResponse, threshold string) *RepoQueryResponse {
 	// Shallow copy and filter nodes.
 	filtered := *resp
 	filtered.Repository.PullRequests.Nodes = filterRepoPRs(resp.Repository.PullRequests.Nodes, threshold)
@@ -1544,10 +1458,13 @@ func filterRepoIssues(nodes []RepoIssue, threshold string) []RepoIssue {
 	return out
 }
 
-// latestRepoCreatedAt returns the most recent CreatedAt timestamp among all
+// LatestRepoCreatedAt returns the most recent CreatedAt timestamp among all
 // PRs and issues in the response. It returns "" when the response has no
-// items, so the caller leaves the cursor unchanged.
-func latestRepoCreatedAt(resp *RepoQueryResponse) string {
+// items, so the caller leaves the cursor unchanged. It is exported because
+// both cursor consumers need it: the in-process runRepo loop advances the
+// cursor with it after each poll, and the shared poller stamps it onto every
+// update it emits for a repo target so the client can do the same.
+func LatestRepoCreatedAt(resp *RepoQueryResponse) string {
 	var latest string
 	for _, p := range resp.Repository.PullRequests.Nodes {
 		if p.CreatedAt > latest {

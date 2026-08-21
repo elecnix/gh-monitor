@@ -91,6 +91,14 @@ type WatchOptions struct {
 	// RepeatUnresolved asks for still-open items to be re-reported on every
 	// observation rather than only when they first appear.
 	RepeatUnresolved bool `json:"repeat_unresolved,omitempty"`
+
+	// Baseline is a JSON-encoded Status from a previous watch — the
+	// per-instance cursor snapshot (issue #32). When set, the backend diffs
+	// its first observation against this baseline instead of an empty one, so
+	// a restart delivers only what changed while offline. Empty means start
+	// from an empty baseline. A backend whose kind has no baseline concept
+	// ignores it.
+	Baseline string `json:"baseline,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
