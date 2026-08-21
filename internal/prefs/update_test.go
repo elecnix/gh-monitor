@@ -175,6 +175,49 @@ func TestFilePathReturnsConfigPath(t *testing.T) {
 	assert.Equal(t, expected, p)
 }
 
+func TestUpdateFileSetsEventLog(t *testing.T) {
+	base := t.TempDir()
+	// Absent: off.
+	eff, err := UpdateFile(base, []byte(`{}`))
+	require.NoError(t, err)
+	assert.Nil(t, eff.EventLog)
+
+	// An object turns it on; zero keepDays means the default (10).
+	eff, err = UpdateFile(base, []byte(`{"eventLog":{"dir":"/tmp/ev","keepDays":3}}`))
+	require.NoError(t, err)
+	require.NotNil(t, eff.EventLog)
+	assert.Equal(t, "/tmp/ev", eff.EventLog.Dir)
+	assert.Equal(t, 3, eff.EventLog.KeepDays)
+
+	got, err := Load(base)
+	require.NoError(t, err)
+	require.NotNil(t, got.EventLog)
+	assert.Equal(t, "/tmp/ev", got.EventLog.Dir)
+
+	// An empty object is still "on" — both fields fall back to defaults.
+	eff, err = UpdateFile(base, []byte(`{"eventLog":{}}`))
+	require.NoError(t, err)
+	require.NotNil(t, eff.EventLog)
+
+	// Null resets to off and removes the key from the file.
+	eff, err = UpdateFile(base, []byte(`{"eventLog":null}`))
+	require.NoError(t, err)
+	assert.Nil(t, eff.EventLog)
+	stored := readStoredFile(t, base)
+	assert.NotContains(t, stored, "eventLog")
+}
+
+func TestUpdateFileRejectsInvalidEventLog(t *testing.T) {
+	base := t.TempDir()
+	_, err := UpdateFile(base, []byte(`{"eventLog":{"keepDays":-1}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "keepDays")
+
+	// A bare string is not the object shape.
+	_, err = UpdateFile(base, []byte(`{"eventLog":"on"}`))
+	require.Error(t, err)
+}
+
 func TestUpdateFileSetsSelfUpdate(t *testing.T) {
 	base := t.TempDir()
 	eff, err := UpdateFile(base, []byte(`{"selfUpdate":"30m"}`))

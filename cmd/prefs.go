@@ -31,12 +31,19 @@ The document shape:
     "templates":         { "<event-kind>": "<template>" | null, ... },
     "ignoredBots":       ["login", ...],
     "retriggerComments": false,
-    "selfUpdate":        "30m" | "1" | "" | null
+    "selfUpdate":        "30m" | "1" | "" | null,
+    "eventLog":          { "dir": "/path", "keepDays": 10 } | null
   }
 
 selfUpdate is a global-only setting (issue #82): a Go duration for the
 resident daemon's release-check cadence, "1"/"true" for the default (hourly),
 or ""/"0"/"false"/null to disable (the default).
+
+eventLog turns on the backend event log (issue #86): every update a watch
+consumes — from any backend — is appended to daily JSONL files. Both fields
+are optional: dir defaults to the user cache dir's gh-monitor/events, and
+keepDays defaults to 10 (a new file per day, 10 days kept). null or absence
+disables it.
 
 A null template value resets that key to its built-in default. Event kinds
 include: new-unresolved-threads, new-general-comments, conflict,

@@ -23,6 +23,19 @@ import (
 	"time"
 )
 
+// EventLogConfig turns on the backend event log (issue #86): every update a
+// watch consumes is appended to daily JSONL files. Dir empty selects the
+// default location (the user cache dir's gh-monitor/events); KeepDays zero
+// selects the default retention (10 days). A *EventLogConfig that is nil
+// means off — the pointer is the switch.
+type EventLogConfig struct {
+	Dir      string `json:"dir,omitempty"`
+	KeepDays int    `json:"keepDays,omitempty"`
+}
+
+// DefaultEventLogKeepDays is the retention window when keepDays is unset.
+const DefaultEventLogKeepDays = 10
+
 // Preferences holds the user's notification templates keyed by event kind,
 // plus non-template configuration.
 //
@@ -38,6 +51,7 @@ type Preferences struct {
 	IgnoredBots       []string          `json:"ignoredBots"`
 	RetriggerComments bool              `json:"retriggerComments"`
 	SelfUpdate        string            `json:"selfUpdate,omitempty"`
+	EventLog          *EventLogConfig   `json:"eventLog,omitempty"`
 }
 
 // templateKeys are the exact, authoritative event-kind keys. They intentionally
@@ -296,6 +310,7 @@ type storedPreferences struct {
 	IgnoredBots       []string           `json:"ignoredBots"`
 	RetriggerComments *bool              `json:"retriggerComments,omitempty"`
 	SelfUpdate        *string            `json:"selfUpdate,omitempty"`
+	EventLog          *EventLogConfig    `json:"eventLog,omitempty"`
 }
 
 // Load starts from DefaultPreferences and overlays the JSON file if present.

@@ -19,6 +19,7 @@ import (
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/cursor"
+	"github.com/elecnix/gh-monitor/internal/eventlog"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -364,6 +365,33 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// A backend with at-least-once delivery repeats itself; a repeat that
 	// reaches the operator is a second notification about one thing.
 	dedup := backend.NewDeduper(0)
+
+	// Event log (issue #86): when the operator turned it on in the global
+	// preferences, every delivered update — from the built-in gh backend,
+	// the shared daemon, or an out-of-process broker sub-daemon — is
+	// recorded above the backend layer, before rendering. Logging is a
+	// witness: a failure disables it with one loud line, never the watch.
+	var evlog *eventlog.Writer
+	if cfg := runOpts.Prefs.EventLog; cfg != nil {
+		dir := cfg.Dir
+		if dir == "" {
+			dir = DefaultEventLogDir()
+		}
+		keep := cfg.KeepDays
+		if keep <= 0 {
+			keep = prefs.DefaultEventLogKeepDays
+		}
+		w, err := eventlog.New(dir, keep)
+		if err != nil {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				"gh-monitor: event log disabled (%v) — set a writable eventLog.dir in preferences\n", err)
+		} else {
+			evlog = w
+			defer func() { _ = w.Close() }()
+		}
+	}
+	evlogFailed := false
+
 	for u := range updates {
 		if !dedup.Allow(u) {
 			continue
@@ -371,6 +399,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// The daemon path persists cursor state from what each update carries.
 		if persistFromUpdate != nil && sourceName == DaemonBackendName {
 			persistFromUpdate(u)
+		}
+		if evlog != nil && !evlogFailed {
+			if err := evlog.Log(u); err != nil {
+				evlogFailed = true
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"gh-monitor: event log write failed (%v); logging disabled for this watch\n", err)
+			}
 		}
 		emit(monitor.Render(u, runOpts.Prefs, runOpts.Interval))
 	}
@@ -384,6 +419,18 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 // for tests.
 func daemonSocketPath() string {
 	return ipc.DefaultSocketPath()
+}
+
+// DefaultEventLogDir is where the event log lives when eventLog.dir is
+// unset: the user cache dir's gh-monitor/events (honouring $GH_MONITOR_CACHE
+// style overrides the same way the runtime copy does — via the OS cache dir).
+func DefaultEventLogDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "gh-monitor", "events")
 }
 
 // newResumeID generates the identifier one continuous watch keeps across
