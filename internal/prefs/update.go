@@ -19,6 +19,11 @@ import (
 //     list; null clears it to an empty list. Absent leaves it untouched.
 //   - "retriggerComments": bool. Present sets it; null resets it to the default
 //     (false) and removes it from the file. Absent leaves it untouched.
+//   - "selfUpdate": string (issue #82) — a Go duration ("30m"), "1"/"true"
+//     for the daemon's default cadence, or ""/"0"/"false" to disable. Null
+//     resets it to the default (off) and removes it from the file. Absent
+//     leaves it untouched. Invalid specs are rejected so a typo never becomes
+//     a silent no-op.
 //
 // Unknown top-level keys are rejected so callers notice typos. An empty object
 // ("{}") is a no-op: it returns the current effective preferences without
@@ -85,8 +90,23 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.RetriggerComments = &b
 			}
+		case "selfUpdate":
+			if string(v) == "null" {
+				stored.SelfUpdate = nil
+			} else {
+				var s string
+				if err := json.Unmarshal(v, &s); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse selfUpdate: %w (use a Go duration like \"30m\", \"1\"/\"true\" for the default cadence, or \"\"/\"false\"/\"0\" to disable)", err)
+				}
+				if !ValidSelfUpdateSpec(s) {
+					return Preferences{}, fmt.Errorf(
+						"invalid selfUpdate value %q: use a Go duration (\"30m\"), \"1\"/\"true\" (default cadence), or \"\"/\"0\"/\"false\" (off)", s)
+				}
+				stored.SelfUpdate = &s
+			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate)", key)
 		}
 	}
 
@@ -175,6 +195,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.RetriggerComments != nil {
 		prefs.RetriggerComments = *stored.RetriggerComments
+	}
+	if stored.SelfUpdate != nil {
+		prefs.SelfUpdate = *stored.SelfUpdate
 	}
 	return prefs
 }

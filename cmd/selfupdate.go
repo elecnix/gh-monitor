@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/spf13/cobra"
 )
@@ -104,12 +105,12 @@ func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec
 // Self-update (issue #69): the daemon pulls new releases itself
 // ---------------------------------------------------------------------------
 
-// selfUpdateEnv controls whether a resident daemon checks for new releases of
-// gh-monitor and upgrades the installed binary itself. Unset or "0" disables
-// it; "1" or "true" uses selfUpdateDefaultInterval; any Go duration ("30m",
-// "2h") sets the cadence. Off by default: auto-upgrading a CLI under the
-// operator's feet is an explicit choice, not a default.
-const selfUpdateEnv = "GH_MONITOR_SELFUPDATE"
+// selfUpdateRemovedEnv is the removed environment variable that used to gate
+// self-update (issue #82 moved the setting into preferences.json). It is no
+// longer honored anywhere, but a daemon that sees it set announces loudly
+// where the setting lives now — an operator relying on the old spelling must
+// never be silently ignored.
+const selfUpdateRemovedEnv = "GH_MONITOR_SELFUPDATE"
 
 // selfUpdateDefaultInterval is the release-check cadence when self-update is
 // enabled without an explicit duration. The issue asks for roughly hourly —
@@ -130,34 +131,49 @@ var extensionUpgradeFn = func() error {
 	return nil
 }
 
-// selfUpdateIntervalFromEnv parses GH_MONITOR_SELFUPDATE. Zero means off.
-func selfUpdateIntervalFromEnv() time.Duration {
-	v := strings.TrimSpace(os.Getenv(selfUpdateEnv))
-	if v == "" || v == "0" || v == "false" {
-		return 0
+// selfUpdatePrefsLoadFn loads the global preferences document — the only
+// config location selfUpdate is read from (issue #82). Package variable so
+// tests can substitute a value without touching the filesystem.
+var selfUpdatePrefsLoadFn = func() (prefs.Preferences, error) {
+	return prefs.Load("") // empty baseDir: the XDG global path, never cwd-relative
+}
+
+// selfUpdateIntervalFromPrefs resolves the configured self-update cadence.
+// Zero means off. A preferences file that cannot be read or parsed degrades
+// to off with a logged reason — config trouble must never kill the daemon,
+// and must never silently flip a resident process into auto-upgrading either.
+func selfUpdateIntervalFromPrefs(stderr io.Writer) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(selfUpdateRemovedEnv)); v != "" {
+		path, pathErr := prefs.ConfigPath("")
+		if pathErr != nil {
+			path = "~/.config/gh-monitor/preferences.json"
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"gh-monitor daemon: %s=%s has been removed; set \"selfUpdate\" in %s instead (gh monitor prefs set) — issue #82\n",
+			selfUpdateRemovedEnv, v, path)
 	}
-	if v == "1" || v == "true" {
-		return selfUpdateDefaultInterval
+	p, err := selfUpdatePrefsLoadFn()
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"gh-monitor daemon: reading preferences (%v); self-update defaults to off\n", err)
 	}
-	if d, err := time.ParseDuration(v); err == nil && d > 0 {
-		return d
-	}
-	return 0 // unparseable values disable rather than guess
+	return prefs.SelfUpdateInterval(p.SelfUpdate, selfUpdateDefaultInterval)
 }
 
 // startSelfUpdate launches the optional release-check loop. It only runs when
-// two things are true: the operator asked for it via GH_MONITOR_SELFUPDATE,
-// and the daemon was launched through the runtime-copy launcher — otherwise
-// the running image maps the installed file and an upgrade could not land
-// anyway (the write would fail with ETXTBSY).
+// two things are true: the operator asked for it via the global
+// preferences file's selfUpdate value (issue #82), and the daemon was
+// launched through the runtime-copy launcher — otherwise the running image
+// maps the installed file and an upgrade could not land anyway (the write
+// would fail with ETXTBSY).
 func startSelfUpdate(ctx context.Context, cmd *cobra.Command) {
-	every := selfUpdateIntervalFromEnv()
+	every := selfUpdateIntervalFromPrefs(cmd.ErrOrStderr())
 	if every <= 0 {
 		return
 	}
 	if os.Getenv(reexec.InstalledBinEnv) == "" {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-			"gh-monitor daemon: %s is set but the daemon was not launched from a runtime copy; self-update disabled\n", selfUpdateEnv)
+			"gh-monitor daemon: selfUpdate is enabled in preferences but the daemon was not launched from a runtime copy; self-update disabled\n")
 		return
 	}
 	go checkForReleases(ctx, every, cmd.ErrOrStderr())

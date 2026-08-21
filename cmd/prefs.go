@@ -30,8 +30,13 @@ The document shape:
   {
     "templates":         { "<event-kind>": "<template>" | null, ... },
     "ignoredBots":       ["login", ...],
-    "retriggerComments": false
+    "retriggerComments": false,
+    "selfUpdate":        "30m" | "1" | "" | null
   }
+
+selfUpdate is a global-only setting (issue #82): a Go duration for the
+resident daemon's release-check cadence, "1"/"true" for the default (hourly),
+or ""/"0"/"false"/null to disable (the default).
 
 A null template value resets that key to its built-in default. Event kinds
 include: new-unresolved-threads, new-general-comments, conflict,

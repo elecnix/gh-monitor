@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -294,6 +295,54 @@ func TestLoadPrefersNewPathOverLegacy(t *testing.T) {
 	got, err := Load(base)
 	require.NoError(t, err)
 	assert.Equal(t, "new {prLabel}", got.Templates["merged"])
+}
+
+// TestSelfUpdateInterval pins the selfUpdate spec grammar (issue #82). It
+// mirrors the semantics the removed GH_MONITOR_SELFUPDATE env var had, so a
+// value written for the env var reads identically from the config file: off
+// unless asked, "1"/"true" meaning the default cadence, and any positive Go
+// duration an explicit one. Unparseable values are off — never guessed.
+func TestSelfUpdateInterval(t *testing.T) {
+	cases := []struct {
+		spec string
+		want time.Duration
+	}{
+		{"", 0},                   // absent: off
+		{"0", 0},                  // explicit off
+		{"false", 0},              // explicit off
+		{"1", time.Hour},          // on: default cadence
+		{"true", time.Hour},       // on: default cadence
+		{"30m", 30 * time.Minute}, // custom cadence
+		{"2h", 2 * time.Hour},     // custom cadence
+		{"garbage", 0},            // unparseable: off, never guess
+		{"-5m", 0},                // negative: off
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, SelfUpdateInterval(tc.spec, time.Hour), "spec %q", tc.spec)
+	}
+	// The default cadence is the caller's choice, not baked in.
+	assert.Equal(t, 7*time.Minute, SelfUpdateInterval("1", 7*time.Minute))
+}
+
+func TestLoadSelfUpdate(t *testing.T) {
+	base := t.TempDir()
+
+	// Missing file: off (the default).
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Empty(t, got.SelfUpdate)
+
+	writeStored(t, base, `{"selfUpdate": "30m"}`)
+	got, err = Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, "30m", got.SelfUpdate)
+
+	// Absent key keeps the default even alongside other stored config.
+	writeStored(t, base, `{"ignoredBots": ["dependabot"]}`)
+	got, err = Load(base)
+	require.NoError(t, err)
+	assert.Empty(t, got.SelfUpdate)
+	assert.Equal(t, []string{"dependabot"}, got.IgnoredBots)
 }
 
 // writeStored writes raw JSON to the preferences path under base.
