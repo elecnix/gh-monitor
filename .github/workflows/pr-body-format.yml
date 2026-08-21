@@ -25,15 +25,22 @@ jobs:
   pr-body-format:
     runs-on: arc-runners
     steps:
-      # The arc-runners image is minimal; the python checker needs python3.
-      - name: Ensure python3 is available
+      # The arc-runners image is minimal: no gh, no wget. Both checkers of
+      # gh-pr-body-action shell out to `gh`, so install it first (apt route,
+      # per https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
+      # curl replaces wget; every command runs under pipefail so a failed
+      # download cannot leave an empty keyring behind.
+      - name: Install gh CLI
         run: |
           set -euo pipefail
-          if ! command -v python3 >/dev/null 2>&1; then
-            SUDO=""
-            [ "$(id -u)" != 0 ] && SUDO="sudo"
-            $SUDO apt-get update
-            $SUDO apt-get install -y --no-install-recommends python3
-          fi
+          SUDO=""
+          [ "$(id -u)" != 0 ] && SUDO="sudo"
+          $SUDO install -d -m 755 /etc/apt/keyrings
+          $SUDO curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+            https://cli.github.com/packages/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | $SUDO tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          $SUDO apt-get update
+          $SUDO apt-get install -y gh
       # No actions/checkout needed — the action reads the body via the API.
       - uses: elecnix/gh-pr-body-action@v1
