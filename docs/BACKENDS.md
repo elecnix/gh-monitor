@@ -282,18 +282,18 @@ func main() {
 Whatever a backend learned, it says it in these terms. They are the same kinds
 `--events` filters on and `gh monitor prefs` templates.
 
-| Kind                                                                   | Meaning                                  |
-| ---------------------------------------------------------------------- | ---------------------------------------- |
-| `first-poll`                                                           | Baseline: what is being watched          |
-| `new-failing-checks`, `ci-all-green`, `check-annotations`              | CI outcomes                              |
-| `new-unresolved-threads`, `new-general-comments`                       | Review activity                          |
-| `review-approved`, `review-changes-requested`, `review-dismissed`      | Review decisions                         |
-| `new-commit`, `conflict`, `merged`, `closed`                           | Pull request state                       |
-| `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention` | Issue state                              |
-| `run-queued`, `run-in-progress`, `run-completed`                       | Workflow runs                            |
-| `repo-new-pr`, `repo-new-issue`, `readiness`                           | Repository                               |
-| `degraded`                                                             | A surface could not be read              |
-| `all-clear`                                                            | Everything previously raised is resolved |
+| Kind                                                                   | Meaning                                                                                                            |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `first-poll`                                                           | Baseline: what is being watched                                                                                    |
+| `new-failing-checks`, `ci-all-green`, `check-annotations`              | CI outcomes                                                                                                        |
+| `new-unresolved-threads`, `new-general-comments`                       | Review activity                                                                                                    |
+| `review-approved`, `review-changes-requested`, `review-dismissed`      | Review decisions                                                                                                   |
+| `new-commit`, `conflict`, `merged`, `closed`                           | Pull request state                                                                                                 |
+| `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention` | Issue state                                                                                                        |
+| `run-queued`, `run-in-progress`, `run-completed`                       | Workflow runs                                                                                                      |
+| `repo-new-pr`, `repo-new-issue`, `readiness`                           | Repository                                                                                                         |
+| `degraded`                                                             | A surface could not be read — emitted per episode (entering degraded, error change, recovery), not per failed poll |
+| `all-clear`                                                            | Everything previously raised is resolved                                                                           |
 
 ## The shared-poller daemon
 

@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -216,6 +217,13 @@ type RunOptions struct {
 	// and out of the low state. Nil (the default) preserves today's
 	// budget-blind cadence.
 	Budget *BudgetGuard
+
+	// degradedTracker remembers, per API surface, whether a degraded episode
+	// is in flight and with what message, so repeated failed polls emit one
+	// notification instead of one per poll (issue #66). Owned by the run; a
+	// nil tracker (only in tests that bypass Watch/WatchOnce) behaves as a
+	// fresh tracker whose state is not persisted.
+	degradedTracker *degradedTracker
 }
 
 func (o *RunOptions) now() time.Time {
@@ -299,6 +307,9 @@ func Watch(ctx context.Context, svc *Service, opts RunOptions, emit func(backend
 	if emit == nil {
 		emit = func(backend.Update) {}
 	}
+	if opts.degradedTracker == nil {
+		opts.degradedTracker = newDegradedTracker()
+	}
 	switch opts.Identity.Target {
 	case "ref", "commit":
 		return runRef(ctx, svc, opts, emit)
@@ -325,6 +336,9 @@ func Once(ctx context.Context, svc *Service, opts RunOptions, emit func(Notifica
 func WatchOnce(ctx context.Context, svc *Service, opts RunOptions, emit func(backend.Update)) error {
 	if emit == nil {
 		emit = func(backend.Update) {}
+	}
+	if opts.degradedTracker == nil {
+		opts.degradedTracker = newDegradedTracker()
 	}
 	switch opts.Identity.Target {
 	case "ref", "commit":
@@ -431,6 +445,7 @@ func runPR(ctx context.Context, svc *Service, opts RunOptions, emit func(backend
 			}
 		}
 		errBackoff = 0
+		emitDegradedRecovery(opts, emit)
 
 		curr := Snapshot(resp.Repository.PullRequest, snapOpts)
 		if c.Consume(curr, emit) {
@@ -617,6 +632,7 @@ func runRef(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 			curr = SnapshotRef(resp.Repository.Ref)
 		}
 		errBackoff = 0
+		emitDegradedRecovery(opts, emit)
 
 		firstPoll := prev == nil
 		// On the first poll, diff against an empty baseline so all pre-existing
@@ -730,6 +746,7 @@ func runIssue(ctx context.Context, svc *Service, opts RunOptions, emit func(back
 			continue
 		}
 		errBackoff = 0
+		emitDegradedRecovery(opts, emit)
 
 		curr := SnapshotIssue(resp.Repository.Issue, SnapshotOptions{IgnoredBots: opts.Prefs.IgnoredBots})
 
@@ -1204,6 +1221,7 @@ func runRun(ctx context.Context, svc *Service, opts RunOptions, emit func(backen
 			continue
 		}
 		errBackoff = 0
+		emitDegradedRecovery(opts, emit)
 
 		curr := SnapshotRun(resp)
 
@@ -1393,6 +1411,7 @@ func runRepo(ctx context.Context, svc *Service, opts RunOptions, emit func(backe
 			continue
 		}
 		errBackoff = 0
+		emitDegradedRecovery(opts, emit)
 
 		// Filter by cursor position when running as a named instance.
 		filtered := filterRepoResponse(resp, opts)
@@ -1640,14 +1659,84 @@ func degradedLabel(opts RunOptions) string {
 	}
 }
 
-// emitDegraded emits a degraded event notification for the given surface and
-// error.
+// emitDegraded records a degraded observation of the given API surface and
+// emits a notification only when it is new information: the surface just
+// degraded, or it is degraded with a different message than the last
+// emission. Consecutive failed polls with the same error are one episode, one
+// notification (issue #66) — the recovery notification goes out when the
+// surface next reads cleanly, via emitDegradedRecovery.
 func emitDegraded(opts RunOptions, surface string, err error, emit func(backend.Update)) {
+	msg := err.Error()
+	if prev, ok := opts.degradedTracker.degraded(surface); ok && prev == msg {
+		return
+	}
+	opts.degradedTracker.enter(surface, msg)
 	emit(opts.update(nil, Event{
 		Type:            EventDegraded,
 		DegradedSurface: surface,
-		DegradedMessage: err.Error(),
+		DegradedMessage: msg,
 	}))
+}
+
+// emitDegradedRecovery announces every surface that degraded earlier in this
+// run and has now been read successfully again, then clears the episode. A
+// successful poll proves the surfaces that loop reads are back, so all
+// tracked surfaces recover together. No-op when nothing is degraded.
+func emitDegradedRecovery(opts RunOptions, emit func(backend.Update)) {
+	label := degradedLabel(opts)
+	for _, surface := range opts.degradedTracker.recoveredSurfaces() {
+		emit(opts.notice(fmt.Sprintf("✅ API recovered (%s) on %s", surface, label)))
+	}
+}
+
+// degradedTracker remembers, per API surface, the last emitted degraded
+// message for the life of one run, so a failed poll is an event only on an
+// episode change: entering degraded, the error changing, or recovering
+// (issue #66). It mirrors the transition-noticing pattern budget.go uses for
+// the GraphQL budget.
+type degradedTracker struct {
+	surfaces map[string]string // surface -> last emitted error message
+}
+
+func newDegradedTracker() *degradedTracker {
+	return &degradedTracker{surfaces: make(map[string]string)}
+}
+
+// degraded reports whether the surface is in a degraded episode and the
+// message the last emission carried. A nil tracker behaves as fresh.
+func (t *degradedTracker) degraded(surface string) (msg string, ok bool) {
+	if t == nil {
+		return "", false
+	}
+	m, ok := t.surfaces[surface]
+	return m, ok
+}
+
+// enter records the surface as degraded with the given message. A nil tracker
+// accepts the call and forgets it, so a stateless caller degrades to today's
+// per-poll behaviour rather than panicking.
+func (t *degradedTracker) enter(surface, msg string) {
+	if t == nil {
+		return
+	}
+	t.surfaces[surface] = msg
+}
+
+// recoveredSurfaces returns the sorted list of surfaces currently in a
+// degraded episode and clears them — the caller has just read them
+// successfully again. Deterministic order keeps multi-surface recoveries
+// stable for log diffing.
+func (t *degradedTracker) recoveredSurfaces() []string {
+	if t == nil || len(t.surfaces) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(t.surfaces))
+	for s := range t.surfaces {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	t.surfaces = make(map[string]string)
+	return out
 }
 
 // rateLimitResetSeconds extracts the rate-limit reset time from an error.

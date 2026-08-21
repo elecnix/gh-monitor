@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -310,6 +312,7 @@ func TestHub_ConcurrentSubscribersDoNotRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
 // TestPoller_BroadcastsDegradedOnFetchError verifies the loudness fix: a
 // daemon poller whose fetch fails must reach subscribers with a degraded
 // notification — a silently blind watcher would read as "all clear".
@@ -334,6 +337,154 @@ func TestPoller_BroadcastsDegradedOnFetchError(t *testing.T) {
 		}
 	}
 	assert.True(t, degraded, "a fetch error must reach the subscriber as a degraded notification")
+}
+
+// TestPoller_DegradedEpisodeEmitsOnce verifies hub-side episode dedup
+// (issue #66): consecutive identical failed fetches are one episode, one
+// broadcast — the shared poller must not spend one notification per poll on
+// an outage, exactly like the in-process loops.
+func TestPoller_DegradedEpisodeEmitsOnce(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return nil, errors.New("gh api failed: exit status 1")
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	// The subscribe fetch fails and must degrade loudly, exactly once.
+	waitDegraded(t, ch, "the first failed fetch must broadcast the degradation")
+
+	// Two more identical failed polls via the explicit wake path: neither may
+	// broadcast again.
+	for i := 0; i < 2; i++ {
+		require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+		time.Sleep(20 * time.Millisecond)
+	}
+	assertNoDegraded(t, ch, 200*time.Millisecond,
+		"identical repeated failures are one episode: no further degraded broadcast")
+}
+
+// TestPoller_DegradedChangedMessageEmits verifies a changed error message is
+// new information and re-broadcasts, while identical repeats stay silent.
+func TestPoller_DegradedChangedMessageEmits(t *testing.T) {
+	calls := 0
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		calls++
+		return nil, fmt.Errorf("gh api failed: attempt %d", calls)
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	waitDegraded(t, ch, "the first failure must broadcast")
+	for i := 0; i < 2; i++ {
+		require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+		waitDegraded(t, ch, "each distinct error message must re-broadcast")
+	}
+	assertNoDegraded(t, ch, 100*time.Millisecond, "no broadcast without a further poll")
+}
+
+// TestPoller_DegradedRecoveryEmits verifies the recovery notice: after a
+// degraded episode, the first successful fetch announces the surface is back
+// and clears the episode, so a later failure degrades loudly again.
+func TestPoller_DegradedRecoveryEmits(t *testing.T) {
+	calls := 0
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("gh api failed: exit status 1")
+		}
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	waitDegraded(t, ch, "the first failure must broadcast")
+
+	// The next poll succeeds: a recovery notice must precede (or accompany)
+	// the fresh snapshot.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription closed while waiting for recovery")
+			}
+			if u.Event.Notice != "" && strings.Contains(u.Event.Notice, "recovered") {
+				assert.Contains(t, u.Event.Notice, "graphql", "the recovery notice must name the surface")
+				goto recovered
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the recovery notice")
+		}
+	}
+recovered:
+	// The episode is cleared: another success must not re-announce recovery.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	assertNoDegraded(t, ch, 200*time.Millisecond,
+		"a healthy poll after recovery must not re-announce")
+
+	// And a fresh failure starts a new episode, broadcasting again.
+	swapFetcher(h, func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (*monitor.PullRequest, error) {
+		return nil, errors.New("gh api failed: again")
+	})
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	waitDegraded(t, ch, "a failure after recovery is a new episode and must broadcast")
+}
+
+// waitDegraded reads updates until a fetch-error degraded broadcast arrives.
+// Notices (broker health, tier shed, recovery) carry Notice text rather than
+// DegradedMessage, so they do not satisfy the wait.
+func waitDegraded(t *testing.T, ch <-chan backend.Update, msg string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatalf("subscription closed: %s", msg)
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out: %s", msg)
+		}
+	}
+}
+
+// assertNoDegraded drains ch for the timeout and fails if a fetch-error
+// degraded broadcast arrives in the window.
+func assertNoDegraded(t *testing.T, ch <-chan backend.Update, timeout time.Duration, msg string) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+				t.Fatalf("unexpected degraded broadcast: %s", msg)
+			}
+		case <-deadline:
+			return
+		}
+	}
 }
 
 // TestPoller_TierNoticeOnLowBudget verifies the poller sheds surfaces and

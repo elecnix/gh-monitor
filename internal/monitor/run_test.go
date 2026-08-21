@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -1035,6 +1036,141 @@ func TestRun_RefDegradedOnFetchError(t *testing.T) {
 	}
 	require.NotNil(t, degraded, "ref fetch error must emit degraded")
 	assert.Contains(t, degraded.Message, "graphql")
+}
+
+// ---------------------------------------------------------------------------
+// Degraded-episode dedup tests (issue #66)
+// ---------------------------------------------------------------------------
+
+// cancelAfterSleeps returns a Sleep func that lets the first n sleeps through
+// and then cancels the context, so a multi-poll loop stops after n+1 polls.
+func cancelAfterSleeps(n int, cancel context.CancelFunc) func(context.Context, time.Duration) error {
+	left := n
+	return func(ctx context.Context, d time.Duration) error {
+		if left > 0 {
+			left--
+			return nil
+		}
+		cancel()
+		return ctx.Err()
+	}
+}
+
+func countDegraded(ns []Notification) int {
+	c := 0
+	for _, n := range ns {
+		if n.Type == string(EventDegraded) {
+			c++
+		}
+	}
+	return c
+}
+
+func TestRun_DegradedEpisodeEmitsOnce(t *testing.T) {
+	// Repeated identical failed polls are one episode, one notification — not
+	// one per poll. An outage of N polls must not spend N agent turns.
+	api := failingPRAPI(errors.New("gh api failed: exit status 1"))
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = cancelAfterSleeps(4, cancel)
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	assert.Equal(t, 1, countDegraded(got),
+		"5 identical degraded polls must produce exactly one degraded notification")
+}
+
+func TestRun_DegradedChangedMessageEmits(t *testing.T) {
+	// A degraded surface that changes its error is new information: each
+	// distinct message is emitted, identical repeats are not.
+	n := 0
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			n++
+			return fmt.Errorf("gh api failed: attempt %d", n)
+		},
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			n++
+			return fmt.Errorf("gh api failed: attempt %d", n)
+		},
+	}
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = cancelAfterSleeps(2, cancel)
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	assert.Equal(t, 3, countDegraded(got),
+		"every poll with a changed error message must be emitted")
+}
+
+func TestRun_DegradedRespectsEventFilter(t *testing.T) {
+	// degraded is filterable like any other kind: a --events allowlist that
+	// omits it mutes the noise; one that includes it passes it through.
+	api := failingPRAPI(errors.New("gh api failed: exit status 1"))
+	svc := &Service{API: api}
+
+	run := func(kinds string) int {
+		f, err := ParseEventFilter(kinds)
+		require.NoError(t, err)
+		opts := testRunOptions()
+		opts.EventFilter = f
+		ctx, cancel := context.WithCancel(context.Background())
+		opts.Sleep = cancelAfterSleeps(1, cancel)
+		var got []Notification
+		_ = Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+		return countDegraded(got)
+	}
+
+	assert.Equal(t, 0, run("merged"), "an allowlist without degraded must mute it")
+	assert.Equal(t, 1, run("degraded,merged"), "an allowlist with degraded must pass it through")
+}
+
+func TestRun_DegradedRecoveryEmits(t *testing.T) {
+	// After a degraded episode, the first successful poll must announce the
+	// recovery — the consumer needs to know the outage ended.
+	n := 0
+	api := &fakeAPI{
+		graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			n++
+			if n == 1 {
+				return errors.New("gh api failed: exit status 1")
+			}
+			return assign(result, QueryResponse{Repository: struct {
+				PullRequest *PullRequest `json:"pullRequest"`
+			}{PullRequest: mkPR("OPEN", false, "aaaaaaa", nil)}})
+		},
+		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+			return errors.New("rest not used")
+		},
+	}
+	svc := &Service{API: api}
+
+	opts := testRunOptions()
+	ctx, cancel := context.WithCancel(context.Background())
+	opts.Sleep = cancelAfterSleeps(2, cancel)
+
+	var got []Notification
+	err := Run(ctx, svc, opts, func(n Notification) { got = append(got, n) })
+	require.True(t, errors.Is(err, context.Canceled))
+
+	var degraded []Notification
+	for _, n := range got {
+		if n.Type == string(EventDegraded) {
+			degraded = append(degraded, n)
+		}
+	}
+	require.Len(t, degraded, 2, "one degradation notice and one recovery notice")
+	assert.Contains(t, degraded[0].Message, "degraded (graphql)")
+	assert.Contains(t, degraded[1].Message, "recover")
 }
 
 // ---------------------------------------------------------------------------

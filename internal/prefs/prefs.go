@@ -67,6 +67,10 @@ var defaultTemplates = map[string]string{
 
 	// Check-run annotations
 	"check-annotations": "📋 {annotationCount}{annotationTruncated} annotation(s) from {annotationCheckNames} on {prLabel}",
+
+	// API degradation (one per episode: the transition into degraded state,
+	// a changed error, and the recovery — not one per failed poll).
+	"degraded": "⚠️ API degraded ({degradedSurface}) on {prLabel}: {degradedMessage}",
 }
 
 // DefaultPreferences returns a fresh copy of the built-in defaults.
@@ -127,6 +131,9 @@ var recognizedTokens = map[string]bool{
 	"annotationCheckNames": true,
 	"annotationTruncated":  true,
 	"annotationUrl":        true,
+
+	"degradedSurface": true,
+	"degradedMessage": true,
 }
 
 // tokenRE matches a single {token} placeholder. The token name is captured.

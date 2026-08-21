@@ -107,6 +107,31 @@ func TestRenderBuildsADegradedMessageFromEventFields(t *testing.T) {
 	assert.Equal(t, "⚠️ API degraded (graphql) on o/r#7: boom", n.Message)
 }
 
+func TestRenderDegradedUsesThePrefsTemplate(t *testing.T) {
+	// degraded is a first-class notification kind (issue #66): like every
+	// other kind it has a template key, so a consumer can reword or mute it
+	// via preferences.json.
+	u := backend.Update{
+		Target: backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7},
+		Event: Event{
+			Type:            EventDegraded,
+			DegradedSurface: "graphql",
+			DegradedMessage: "boom",
+		},
+		At: time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC),
+	}
+
+	p := prefs.DefaultPreferences()
+	n := Render(u, p, time.Minute)
+	assert.Equal(t, "⚠️ API degraded (graphql) on o/r#7: boom", n.Message,
+		"the default template must keep today's sentence")
+
+	p.Templates["degraded"] = "DEGRADED {degradedSurface} on {prLabel}: {degradedMessage}"
+	n = Render(u, p, time.Minute)
+	assert.Equal(t, "DEGRADED graphql on o/r#7: boom", n.Message,
+		"a user template must be honoured for degraded, like every other kind")
+}
+
 func TestRenderWithoutStatusStillProducesAMessage(t *testing.T) {
 	// A backend that knows what changed without holding a snapshot leaves
 	// Status nil. That must render from the event alone rather than panic.
