@@ -105,8 +105,22 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.SelfUpdate = &s
 			}
+		case "eventLog":
+			if string(v) == "null" {
+				stored.EventLog = nil
+			} else {
+				var cfg EventLogConfig
+				if err := json.Unmarshal(v, &cfg); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse eventLog: %w (use an object like {\"dir\": \"/path\", \"keepDays\": 10}; both fields optional)", err)
+				}
+				if cfg.KeepDays < 0 {
+					return Preferences{}, fmt.Errorf("invalid eventLog keepDays %d: must be zero (default) or positive", cfg.KeepDays)
+				}
+				stored.EventLog = &cfg
+			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, eventLog)", key)
 		}
 	}
 
@@ -198,6 +212,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.SelfUpdate != nil {
 		prefs.SelfUpdate = *stored.SelfUpdate
+	}
+	if stored.EventLog != nil {
+		prefs.EventLog = stored.EventLog
 	}
 	return prefs
 }

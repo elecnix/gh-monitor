@@ -473,7 +473,18 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+
+#### Event log
+
+Every backend event a watch consumes — from the built-in `gh` backend, the shared daemon, or an out-of-process broker sub-daemon — can be recorded to daily append-only JSONL files ([#86](https://github.com/elecnix/gh-monitor/issues/86)). Logging happens above the backend layer: each line is the raw update envelope exactly as the backend delivered it, before rendering and before notification preferences apply.
+
+```sh
+gh monitor prefs set '{"eventLog": {}}'                          # on, defaults
+gh monitor prefs set '{"eventLog": {"dir": "/var/log/gh-monitor", "keepDays": 30}}'
+```
+
+Both fields are optional: `dir` defaults to the user cache dir's `gh-monitor/events`, and `keepDays` defaults to 10. Rotation is a filename change (`events-YYYY-MM-DD.jsonl`), never a rewrite — a new day means a new file, and files older than the retention window are pruned when the day rolls over. It is off by default; a write failure disables logging for that watch with one loud line and never interrupts watching.
 
 ### Checking which build is running
 
