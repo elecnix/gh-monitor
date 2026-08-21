@@ -49,3 +49,15 @@ jobs:
             echo "==> $pair"
             GOOS="${pair%%/*}" GOARCH="${pair##*/}" go build ./...
           done
+
+  # Delta-aware duplicate-code detection (https://deepwiki.com/elecnix/dupdelta):
+  # scans the branch and its merge-base, and reports only the duplication this
+  # change introduces. It warns inline on the diff; it never fails the build.
+  dupdelta:
+    runs-on: arc-runners
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The merge-base has to be reachable for the delta scan.
+          fetch-depth: 0
+      - uses: elecnix/dupdelta@v0.1.0
