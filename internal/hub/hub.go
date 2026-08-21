@@ -47,6 +47,10 @@ type Hub struct {
 	mu      sync.Mutex
 	pollers map[prKey]*prPoller
 
+	// resumes holds watchers' baselines carried over from a predecessor
+	// daemon (issue #73 handoff), keyed by the watcher's ResumeID, until the
+	// watcher reconnects and claims it.
+	resumes map[string]resumeEntry
 	// brokerMu guards the optional broker-transport health flag and its
 	// extended idle-poll ceiling. See SetBrokerHealth and SetBrokerIdleCap.
 	brokerMu      sync.RWMutex
@@ -77,6 +81,7 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget 
 		interval:  interval,
 		budget:    budget,
 		pollers:   make(map[prKey]*prPoller),
+		resumes:   make(map[string]resumeEntry),
 	}
 }
 
@@ -102,9 +107,16 @@ func (h *Hub) SubscribePR(ctx context.Context, t backend.Target, opts backend.Wa
 	if p == nil {
 		p = newPRPoller(h, identity, h.interval)
 		h.pollers[key] = p
+	}
+	// A poller restored from a handoff already exists but has not started;
+	// whether fresh or restored, it starts with its first subscriber.
+	start := !p.started
+	p.started = true
+	h.mu.Unlock()
+
+	if start {
 		go p.run()
 	}
-	h.mu.Unlock()
 
 	// The consumer only needs enough run configuration to diff and to stamp
 	// the updates it emits; templates never reach the daemon.
@@ -126,14 +138,33 @@ func (h *Hub) SubscribePR(ctx context.Context, t backend.Target, opts backend.Wa
 		notifCh:    make(chan backend.Update, 4),
 		out:        make(chan backend.Update, 16),
 		done:       make(chan struct{}),
+		resumeID:   opts.ResumeID,
+		target:     t,
+		watchOpts:  opts,
 	}
-	go sub.loop()
 
-	// Use the poller's cached ruleset (fetched once on first run).
+	h.mu.Lock()
+	// A watcher reconnecting after a daemon handoff claims the baseline its
+	// predecessor's daemon held for it, so it resumes diffing where it left
+	// off instead of replaying what it already reported (issue #73).
+	if opts.ResumeID != "" {
+		if baseline, ok := h.takeResume(opts.ResumeID); ok {
+			sub.consumer.RestoreBaseline(baseline)
+		}
+	}
+	h.mu.Unlock()
+
+	// Use the poller's cached ruleset (fetched once on first run, or carried
+	// over from a predecessor daemon), and start at the poller's current
+	// tier. A poller restored from a handoff may already be at TierFull, in
+	// which case applyTier never fires for this sub — and distilling its
+	// snapshots at the zero tier would silently shed comments and reviews
+	// exactly as if the budget had run out.
 	p.mu.Lock()
 	if p.ruleset != nil && p.ruleset.Error == "" {
 		sub.snapOpts.RulesetChecks = p.ruleset
 	}
+	sub.snapOpts.Tier = p.tier
 	p.subs[sub] = struct{}{}
 	if p.latest != nil {
 		select {
@@ -155,6 +186,7 @@ func (h *Hub) SubscribePR(ctx context.Context, t backend.Target, opts backend.Wa
 		case <-sub.done:
 		}
 	}()
+	go sub.loop()
 	return sub.out, cancel
 }
 
@@ -315,9 +347,14 @@ type prPoller struct {
 	budget   *monitor.BudgetGuard
 	ruleset  *monitor.RulesetChecks // fetched once at poller start; nil until fetched
 
+	// started records that run() is going. A poller restored from a handoff
+	// (issue #73) exists before any subscriber does; it starts, like a fresh
+	// one, when its first subscriber arrives. Guarded by hub.mu.
+	started bool
+
 	mu       sync.Mutex
 	latest   *monitor.PullRequest
-	noChange int // consecutive fingerprint-unchanged fetches; drives idle backoff
+	noChange int               // consecutive fingerprint-unchanged fetches; drives idle backoff
 	tier     monitor.QueryTier // last fetched tier; drives shed notices
 	subs     map[*prSub]struct{}
 
@@ -346,9 +383,10 @@ func newPRPoller(h *Hub, id resolver.Identity, interval time.Duration) *prPoller
 // (new subscriber, or an explicit RefreshPR) resets the backoff and fetches
 // immediately.
 func (p *prPoller) run() {
-	// Fetch the branch ruleset once at startup. Rulesets rarely change
-	// mid-monitoring; a consumer that needs a refresh can restart.
-	if p.hub.rulesetFn != nil {
+	// Fetch the branch ruleset once at startup — unless a predecessor daemon
+	// handed one over (issue #73). Rulesets rarely change mid-monitoring; a
+	// consumer that needs a refresh can restart.
+	if p.hub.rulesetFn != nil && p.ruleset == nil {
 		rs, err := p.hub.rulesetFn(p.identity.Owner, p.identity.Repo)
 		if err != nil {
 			// Log but continue — the poller still works without ruleset data.
@@ -561,13 +599,20 @@ func (p *prPoller) label() string {
 // prSub is one consumer's handle: its own PRConsumer (baseline), a buffered
 // snapshot inbox, a channel for loop-level notices (degraded / tier-shed), and
 // an output channel of updates.
+//
+// mu guards consumer, the one field mutated after creation (by loop's Consume
+// and by ExportState's baseline read on the handoff path).
 type prSub struct {
+	mu         sync.Mutex
 	consumer   *monitor.PRConsumer
 	snapOpts   monitor.SnapshotOptions
 	snapshotCh chan *monitor.PullRequest
 	notifCh    chan backend.Update
 	out        chan backend.Update
 	done       chan struct{}
+	resumeID   string
+	target     backend.Target
+	watchOpts  backend.WatchOptions
 }
 
 // loop owns the consumer's diff/render goroutine. It reads raw PR payloads
@@ -585,12 +630,14 @@ func (s *prSub) loop() {
 				return
 			}
 			curr := monitor.Snapshot(raw, s.snapOpts)
+			s.mu.Lock()
 			terminal := s.consumer.Consume(curr, func(u backend.Update) {
 				select {
 				case s.out <- u:
 				case <-s.done:
 				}
 			})
+			s.mu.Unlock()
 			if terminal {
 				close(s.out)
 				return

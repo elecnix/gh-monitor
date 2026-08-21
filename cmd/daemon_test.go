@@ -14,6 +14,7 @@ import (
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/gh"
+	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -81,12 +82,33 @@ func unusedBuiltin(reg *backend.Registry) {
 
 // bindTestServer starts an in-process daemon (hub + accept loop) bound to
 // socket. It is the test substitute for the real spawnDaemon re-exec.
-func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string) {
+func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string) *daemonServer {
 	t.Helper()
 	l, err := ipc.Listen(socket)
 	require.NoError(t, err)
+	return bindTestServerOn(t, ctx, h, l)
+}
+
+// bindTestServerOn is bindTestServer for an already-bound listener — the
+// shape a handoff successor has after adopting its predecessor's socket.
+func bindTestServerOn(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener) *daemonServer {
+	t.Helper()
+	// A derived context is what makes a handoff complete: the successor's fd
+	// pass triggers shutdown, which must close every client connection — the
+	// signal watchers use to reconnect to the successor.
+	serveCtx, cancel := context.WithCancel(ctx)
+	var handedOff atomic.Bool
+	srv := &daemonServer{
+		hub:       h,
+		listener:  l,
+		handedOff: &handedOff,
+		shutdown:  func() { cancel(); _ = l.Close() },
+	}
 	var wg sync.WaitGroup
 	t.Cleanup(func() {
+		// Cancel first: serveWatch returns only when its context is done, so
+		// waiting for the serve goroutines before cancelling would deadlock.
+		cancel()
 		_ = l.Close()
 		wg.Wait()
 	})
@@ -100,10 +122,11 @@ func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string
 			go func(c net.Conn) {
 				defer wg.Done()
 				defer func() { _ = c.Close() }()
-				serveClient(ctx, h, c)
+				serveClient(serveCtx, srv, c)
 			}(conn)
 		}
 	}()
+	return srv
 }
 
 // startTestDaemon wires a hub with a counting fake fetcher to a real Unix
@@ -425,11 +448,95 @@ func TestDaemon_NoConfigFallsBackToPolling(t *testing.T) {
 	assert.Empty(t, loaded)
 }
 
+// changedOpenPR is openPR plus one new general comment — the delta an
+// upgraded daemon's first fetch surfaces to a watcher that already saw the
+// plain open PR.
+func changedOpenPR() *monitor.PullRequest {
+	pr := openPR()
+	pr.Comments = monitor.CommentNodes{Nodes: []monitor.Comment{{
+		ID:   "c1",
+		Body: "a brand new comment",
+	}}}
+	pr.Comments.Nodes[0].Author.Login = "reviewer"
+	return pr
+}
+
+// TestDaemon_UpgradeHandoff is the acceptance test for issue #73: while a
+// watcher is connected, an upgraded daemon starts on the same socket, adopts
+// the running daemon's state and listening socket, and the old daemon exits —
+// and the watcher rides across, seeing the break notice, the reconnect, and
+// then only what changed. No replay, no restart, no gap on the socket path.
+func TestDaemon_UpgradeHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	sock, _ := startTestDaemon(t, ctx, openPR) // the "old" daemon
+
+	// A watcher connects to the old daemon and sees its first poll.
+	tr, err := remote.ParseEndpoint("unix:" + sock)
+	require.NoError(t, err)
+	provider, err := remote.Connect(ctx, tr)
+	require.NoError(t, err)
+	opts := backend.WatchOptions{Interval: time.Hour, ResumeID: "watcher-1"}
+	ch, err := provider.Watch(ctx, daemonTarget(), opts)
+	require.NoError(t, err)
+	first := collectUntil(t, ch, backend.EventFirstPoll)
+	require.Contains(t, first, "first-poll")
+
+	// An upgraded daemon starts on the same socket and performs the handoff.
+	// This is what runDaemon does on finding the socket held by a live
+	// predecessor; doing it directly keeps the test on the seam.
+	l2, state, err := listenOrAdopt(ctx, sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l2.Close() })
+	require.NotNil(t, state, "the successor must adopt handoff state")
+	require.Len(t, state.Pollers, 1, "the watched PR must travel")
+	require.Len(t, state.Resumes, 1, "the connected watcher's baseline must travel")
+
+	h2 := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (*monitor.PullRequest, error) {
+		return changedOpenPR(), nil
+	}, nil, 20*time.Millisecond, nil)
+	t.Cleanup(h2.Stop)
+	require.NoError(t, h2.RestoreState(*state))
+	bindTestServerOn(t, ctx, h2, l2)
+
+	// The watcher must ride across: a loud break, a reconnect, and then only
+	// the delta — never a replay of the state it was already shown.
+	var sawDegraded, sawReconnect, sawReplay, sawDelta bool
+	deadline := time.After(10 * time.Second)
+	for done := false; !done; {
+		select {
+		case u, open := <-ch:
+			if !open {
+				done = true
+				break
+			}
+			switch {
+			case u.Event.Type == backend.EventDegraded && u.Event.Notice != "":
+				sawReconnect = true
+			case u.Event.Type == backend.EventDegraded:
+				sawDegraded = true
+			case u.Event.Type == backend.EventFirstPoll:
+				sawReplay = true
+			case u.Event.Type == backend.EventNewGeneralComments:
+				sawDelta = true
+				done = true
+			}
+		case <-deadline:
+			t.Fatalf("handoff never completed: degraded=%v reconnected=%v delta=%v",
+				sawDegraded, sawReconnect, sawDelta)
+		}
+	}
+	assert.True(t, sawDegraded, "the break must be loud, never silent")
+	assert.True(t, sawReconnect, "the watcher must announce it reconnected")
+	assert.True(t, sawDelta, "the watcher must receive the change the new daemon fetched")
+	assert.False(t, sawReplay, "the watcher must not see a second first poll")
+}
+
 // TestDaemon_ReexecsFromRuntimeCopy verifies the daemon command relaunches
 // itself from a runtime copy of the binary before doing anything else
-// (issue #73): an upgrade must be able to rewrite the installed file in place
-// while a daemon is resident, which requires the resident image to map some
-// other inode.
+// (issue #73): an upgrade must be able to rewrite the installed file in place,
+// which requires the resident image to map some other inode.
 func TestDaemon_ReexecsFromRuntimeCopy(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "daemons.conf")

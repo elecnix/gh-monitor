@@ -26,6 +26,11 @@ import (
 // Every other value, including unset, keeps it on.
 const OptOutEnv = "GH_MONITOR_REEXEC"
 
+// InstalledBinEnv names the file the process was originally launched from.
+// The launcher sets it before exec'ing the runtime copy, so a resident daemon
+// can watch the installed binary for upgrades and hand off to it (issue #73).
+const InstalledBinEnv = "GH_MONITOR_INSTALLED_BIN"
+
 // RuntimePath returns the path the resident copy of the binary lives at:
 // $XDG_RUNTIME_DIR/gh-monitor/gh-monitor, falling back to the user cache dir
 // (the same precedence the daemon socket uses). The directory need not exist.
@@ -68,6 +73,9 @@ func MaybeReexec() error {
 	if err := copyExecutable(exe, rt); err != nil {
 		return err
 	}
+	// Remember where we came from: the resident daemon watches that file for
+	// upgrades and hands off to it.
+	_ = os.Setenv(InstalledBinEnv, exe)
 	return reexecTo(rt)
 }
 

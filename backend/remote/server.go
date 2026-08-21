@@ -30,6 +30,13 @@ type ServerConfig struct {
 	Comments  backend.CommentActor
 	Draft     backend.DraftActor
 	Reactions backend.ReactionActor
+	// Resumable is announced in the hello: a dropped watch stream may be
+	// re-established by re-sending the request with the same ResumeID.
+	Resumable bool
+	// HandleOp serves protocol extensions beyond the standard ops. Return
+	// handled=false to let Serve answer "unsupported op" as usual. The
+	// shared-poller daemon uses this for its upgrade handoff (issue #73).
+	HandleOp func(ctx context.Context, conn io.ReadWriter, req Request) (handled bool, err error)
 }
 
 func (c ServerConfig) capabilities() []backend.Capability {
@@ -58,6 +65,11 @@ func (c ServerConfig) capabilities() []backend.Capability {
 	return caps
 }
 
+// WriteFrame writes one response frame. Exported for in-module protocol
+// extensions served through ServerConfig.HandleOp, which answer with the same
+// framing Serve itself uses.
+func WriteFrame(w io.Writer, f Frame) error { return writeJSON(w, f) }
+
 // Serve handles one client connection: it announces the backend, reads the
 // single request, and streams the answer. It returns when the request is
 // finished, the connection drops, or ctx is cancelled.
@@ -78,6 +90,7 @@ func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 		Name:         cfg.Name,
 		Capabilities: caps,
 		Kinds:        cfg.Kinds,
+		Resumable:    cfg.Resumable,
 	}); err != nil {
 		return fmt.Errorf("write hello: %w", err)
 	}
@@ -104,6 +117,11 @@ func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 		return serveWatch(ctx, conn, cfg, req)
 	case OpRead:
 		return serveRead(ctx, conn, cfg, req)
+	}
+	if cfg.HandleOp != nil {
+		if handled, err := cfg.HandleOp(ctx, conn, req); handled {
+			return err
+		}
 	}
 	if handled, err := serveMutation(ctx, conn, cfg, req); handled {
 		return err

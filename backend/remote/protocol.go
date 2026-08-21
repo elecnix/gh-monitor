@@ -89,6 +89,13 @@ type Hello struct {
 	Capabilities []backend.Capability `json:"capabilities"`
 	// Kinds lists the target kinds the server covers. Empty means every kind.
 	Kinds []backend.Kind `json:"kinds,omitempty"`
+	// Resumable announces that a dropped watch stream may be re-established
+	// by re-sending the same request with the same ResumeID, and that the
+	// server will resume from where that watcher left off instead of
+	// replaying what it already delivered. The shared-poller daemon sets it:
+	// its upgrade handoff deliberately breaks every client connection, and a
+	// resident watcher must ride across that, not die of it.
+	Resumable bool `json:"resumable,omitempty"`
 }
 
 // Request is the client's single frame following the hello.

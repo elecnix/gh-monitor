@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -301,6 +303,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return err
 	}
 
+	// A continuous watch gets a ResumeID: if the shared-poller daemon hands
+	// off to an upgraded daemon (issue #73), the watcher re-establishes its
+	// stream under the same ID and resumes from the baseline it was last
+	// shown, instead of replaying what it already reported.
+	var resumeID string
+	if !opts.Once {
+		resumeID = newResumeID()
+	}
+
 	updates, err := source.Watch(ctx, target, backend.WatchOptions{
 		Interval:         runOpts.Interval,
 		Timeout:          runOpts.Timeout,
@@ -309,6 +320,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		IgnoredAuthors:   runOpts.Prefs.IgnoredBots,
 		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
 		AnnotationLevels: runOpts.AnnotationLevels.Names(),
+		ResumeID:         resumeID,
 	})
 	if err != nil {
 		return fmt.Errorf("backend %q: %w", sourceName, err)
@@ -335,6 +347,19 @@ func daemonSocketPath() string {
 		return ""
 	}
 	return ipc.DefaultSocketPath()
+}
+
+// newResumeID generates the identifier one continuous watch keeps across
+// daemon reconnects (issue #73). Cryptographically random so concurrent
+// watchers can never collide; hex so it rides any protocol untouched.
+func newResumeID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// No entropy is not fatal: an empty ID just means a reconnect after a
+		// handoff replays current state instead of resuming a baseline.
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // ---------------------------------------------------------------------------
