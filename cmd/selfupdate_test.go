@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -157,4 +159,163 @@ func TestBuildUpgradeCommand(t *testing.T) {
 	require.NotNil(t, cmd)
 	assert.Equal(t, "/path/gh-monitor", cmd.Path)
 	assert.Equal(t, []string{"daemon", "--socket", "/run/d.sock", "--interval", "90"}, cmd.Args[1:])
+}
+
+// ---------------------------------------------------------------------------
+// Self-update cadence (issue #69)
+// ---------------------------------------------------------------------------
+
+func TestSelfUpdateIntervalFromEnv(t *testing.T) {
+	cases := []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 0},                    // unset: off
+		{"0", 0},                   // explicit off
+		{"false", 0},               // explicit off
+		{"1", time.Hour},           // on: default cadence
+		{"true", time.Hour},        // on: default cadence
+		{"30m", 30 * time.Minute},  // custom cadence
+		{"2h", 2 * time.Hour},      // custom cadence
+		{"garbage", 0},             // unparseable: off, never guess
+		{"-5m", 0},                 // negative: off
+	}
+	for _, tc := range cases {
+		t.Setenv(selfUpdateEnv, tc.env)
+		assert.Equal(t, tc.want, selfUpdateIntervalFromEnv(), "GH_MONITOR_SELFUPDATE=%q", tc.env)
+	}
+}
+
+// TestSelfUpdate_CheckerRunsUpgradeOnCadence verifies the loop end to end:
+// with self-update enabled, the daemon runs `gh extension upgrade` on the
+// configured cadence until cancelled.
+func TestSelfUpdate_CheckerRunsUpgradeOnCadence(t *testing.T) {
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	var mu sync.Mutex
+	checks := 0
+	origUpgrade := extensionUpgradeFn
+	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
+	extensionUpgradeFn = func() error {
+		mu.Lock()
+		checks++
+		mu.Unlock()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		checkForReleases(ctx, 5*time.Millisecond, writerFunc(func(string) {}))
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		n := checks
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected at least 3 upgrade checks, got %d", n)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+}
+
+// TestSelfUpdate_OffByDefault verifies that without GH_MONITOR_SELFUPDATE the
+// checker never runs: a resident daemon must not shell out to `gh extension
+// upgrade` unless the operator asked for it.
+func TestSelfUpdate_OffByDefault(t *testing.T) {
+	t.Setenv(selfUpdateEnv, "")
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	checks := 0
+	origUpgrade := extensionUpgradeFn
+	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
+	extensionUpgradeFn = func() error {
+		checks++
+		return nil
+	}
+
+	cmd := newDaemonCommand()
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(50 * time.Millisecond)
+	assert.Zero(t, checks, "self-update must be opt-in")
+}
+
+// TestSelfUpdate_RequiresRuntimeCopyLaunch verifies the second gate: even
+// when enabled, the checker does not run unless the daemon was launched from
+// a runtime copy — otherwise the running image maps the installed file and an
+// upgrade could not land anyway.
+func TestSelfUpdate_RequiresRuntimeCopyLaunch(t *testing.T) {
+	t.Setenv(selfUpdateEnv, "5ms")
+	t.Setenv(reexec.InstalledBinEnv, "") // not launched via the runtime copy
+
+	var logs []string
+	cmd := newDaemonCommand()
+	cmd.SetErr(writerFunc(func(s string) { logs = append(logs, s) }))
+
+	checks := 0
+	origUpgrade := extensionUpgradeFn
+	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
+	extensionUpgradeFn = func() error {
+		checks++
+		return nil
+	}
+
+	startSelfUpdate(context.Background(), cmd)
+	time.Sleep(30 * time.Millisecond)
+	assert.Zero(t, checks, "no runtime copy: self-update must stay off")
+	require.NotEmpty(t, logs, "the disablement must be announced, never silent")
+}
+
+// TestSelfUpdate_FailedCheckIsNotFatal verifies a failed upgrade check is
+// logged and retried, never fatal to the loop.
+func TestSelfUpdate_FailedCheckIsNotFatal(t *testing.T) {
+	t.Setenv(reexec.InstalledBinEnv, "/some/installed/gh-monitor")
+
+	var mu sync.Mutex
+	attempts := 0
+	origUpgrade := extensionUpgradeFn
+	t.Cleanup(func() { extensionUpgradeFn = origUpgrade })
+	extensionUpgradeFn = func() error {
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		if n == 1 {
+			return fmt.Errorf("network down")
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		checkForReleases(ctx, 5*time.Millisecond, writerFunc(func(string) {}))
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		n := attempts
+		mu.Unlock()
+		if n >= 2 {
+			break // the first failure did not stop the loop
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the loop stopped after a failed check")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
 }

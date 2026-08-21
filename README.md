@@ -367,6 +367,12 @@ Since [#76](https://github.com/elecnix/gh-monitor/issues/76) the daemon is the s
 
 Concurrent auto-starts are race-safe: at most one daemon binds a socket (a second `Listen` refuses to steal a live daemon's socket), so several clients starting at once share a single fetch loop rather than each spawning their own.
 
+The daemon is **persistent once started** ([#69](https://github.com/elecnix/gh-monitor/issues/69)): it has no idle timeout and never exits for lack of attached clients. Auto-start only works if the daemon outlives the client that bootstrapped it — a fleet of short-lived watchers must not spawn a fresh daemon on every invocation. It serves until SIGTERM/SIGINT, or until a successor daemon completes an upgrade handoff.
+
+#### Self-update
+
+A resident daemon can also keep itself current. Set `GH_MONITOR_SELFUPDATE=1` (or a Go duration like `GH_MONITOR_SELFUPDATE=30m`; default cadence when enabled: hourly) and the daemon periodically runs `gh extension upgrade gh-monitor` itself. When an upgrade lands, the existing handoff machinery takes over seamlessly — connected watchers ride across with no replay and no lost polling state. It is off by default (auto-upgrading a CLI under the operator's feet is an explicit choice), it only runs when the daemon was launched through its runtime copy (otherwise the installed file could not be rewritten anyway), and a failed check is logged and retried — never fatal, never disruptive to serving.
+
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
 #### Upgrading while watchers run
