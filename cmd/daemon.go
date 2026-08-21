@@ -111,8 +111,11 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// sub-daemons are expected to bind the socket themselves (they are
 	// backends that speak the backend/remote protocol) — so in this mode the
 	// daemon does not bind it, avoiding contention. With no config file, the
-	// daemon works exactly as it does today (pure polling).
-	entries, cfgOK, subErr := subdaemon.Load(subdaemon.DefaultConfigPath())
+	// daemon works exactly as it does today (pure polling). The config path
+	// resolves per-project first: <cwd>/.gh-monitor.conf if it exists, then
+	// the operator's <user config dir>/gh-monitor/daemons.conf.
+	esc, _ := os.Getwd()
+	entries, cfgOK, subErr := subdaemon.Load(subdaemon.ResolveConfigPath(esc))
 	if subErr != nil {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon config: %v\n", subErr)
 	}

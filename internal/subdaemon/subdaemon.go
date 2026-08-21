@@ -12,9 +12,10 @@
 //
 // # Config file
 //
-// The path is $GH_MONITOR_SUBDAEMONS, otherwise
-// <user config dir>/gh-monitor/daemons.conf. The format is one sub-daemon
-// per line:
+// The path is resolved in order: $GH_MONITOR_SUBDAEMONS if set, else
+// <cwd>/.gh-monitor.conf if it exists, else <user config dir>/gh-monitor/daemons.conf.
+// Precedence is replacement, not merge — a project file that exists is used whole.
+// The format is one sub-daemon per line:
 //
 //	# optional comment
 //	<name> <executable> [args...]
@@ -48,8 +49,14 @@ import (
 // envConfigPath names the environment variable overriding the config path.
 const envConfigPath = "GH_MONITOR_SUBDAEMONS"
 
-// DefaultConfigPath returns the config path: $GH_MONITOR_SUBDAEMONS if set,
-// otherwise <user config dir>/gh-monitor/daemons.conf.
+// projectConfigFile is the per-project sub-daemon config file resolved from
+// the current working directory ahead of the global user config. A repository
+// pins it by dropping this file in its root; the daemon then uses those
+// entries instead of the operator's machine-wide daemons.conf.
+const projectConfigFile = ".gh-monitor.conf"
+
+// DefaultConfigPath returns the global config path: $GH_MONITOR_SUBDAEMONS if
+// set, otherwise <user config dir>/gh-monitor/daemons.conf.
 func DefaultConfigPath() string {
 	if p := strings.TrimSpace(os.Getenv(envConfigPath)); p != "" {
 		return p
@@ -60,6 +67,30 @@ func DefaultConfigPath() string {
 		base = filepath.Join(home, ".config")
 	}
 	return filepath.Join(base, "gh-monitor", "daemons.conf")
+}
+
+// ResolveConfigPath returns the first existing daemon config path in
+// precedence order:
+//
+//  1. $GH_MONITOR_SUBDAEMONS, if set (an explicit admin override)
+//  2. <cwd>/.gh-monitor.conf, the per-project file, if it exists
+//  3. <user config dir>/gh-monitor/daemons.conf, the global config (default)
+//
+// Precedence is replacement, not merge: a project file that exists is used
+// whole, so a repository pins its own sub-daemons without inheriting the
+// operator's. When cwd is empty or the project file is absent, the call falls
+// through to the global config. The final (global) path is returned even when
+// it does not exist — the caller's Load treats a missing file as pure polling.
+func ResolveConfigPath(cwd string) string {
+	if p := strings.TrimSpace(os.Getenv(envConfigPath)); p != "" {
+		return p
+	}
+	if cwd != "" {
+		if _, err := os.Stat(filepath.Join(cwd, projectConfigFile)); err == nil {
+			return filepath.Join(cwd, projectConfigFile)
+		}
+	}
+	return DefaultConfigPath()
 }
 
 // Entry is one sub-daemon to launch.
