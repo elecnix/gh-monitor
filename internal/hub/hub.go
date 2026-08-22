@@ -68,6 +68,24 @@ func WithFailedRunLogFetcher(fn FailedRunLogFetcher) Option {
 	return func(h *Hub) { h.failedLogs = fn }
 }
 
+// WithIdleCeiling overrides the idle-backoff ceiling every poller uses —
+// the idlePollCeiling preference (issue #90). It replaces
+// monitor.MaxIdleInterval for all targets, broker-healthy or not; a value
+// <= 0 keeps the built-in default.
+func WithIdleCeiling(ceiling time.Duration) Option {
+	return func(h *Hub) { h.idleCeiling = ceiling }
+}
+
+// WithPauseWhenBrokerHealthy arms pollWhenBrokerHealthy: false (issue #90).
+// While set and the broker transport reports healthy, timer-driven fetching
+// suspends entirely — scheduled API spend exists only as insurance against
+// event loss. A degrade resumes polling immediately (SetBrokerHealth wakes
+// every poller on the transition), and while paused the timer still ticks at
+// roughly the base interval so a missed transition is noticed within one tick.
+func WithPauseWhenBrokerHealthy(pause bool) Option {
+	return func(h *Hub) { h.pauseWhenBrokerHealthy = pause }
+}
+
 // Hub owns one poller goroutine per identity and fans each fetched snapshot
 // out to every subscribed consumer. It is safe for concurrent use.
 type Hub struct {
@@ -76,6 +94,10 @@ type Hub struct {
 	failedLogs FailedRunLogFetcher
 	interval   time.Duration
 	budget     *monitor.BudgetGuard
+	// idleCeiling is the configured idle-backoff ceiling (idlePollCeiling,
+	// issue #90); 0 means monitor.MaxIdleInterval.
+	idleCeiling            time.Duration
+	pauseWhenBrokerHealthy bool
 
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
@@ -401,10 +423,15 @@ func (h *Hub) SetBrokerIdleCap(cap time.Duration) {
 // notification stream. detail (typically an error's message) is appended
 // to a degraded notice when non-empty; it is ignored for a healthy one.
 //
-// A transition to unhealthy takes effect on the very next poll: nextDelay
+//	A transition to unhealthy takes effect on the very next poll: nextDelay
+//
 // stops honouring the extended idle cap immediately, so a lost broker
 // connection is followed by normal polling within one cycle, not a stale
-// extended wait computed while the broker still looked healthy.
+// extended wait computed while the broker still looked healthy. The
+// transition itself also wakes every poller, so the first post-degrade fetch
+// happens now rather than at whatever tick was scheduled while the wake path
+// still looked live — with pollWhenBrokerHealthy: false (issue #90) that
+// tick can be arbitrarily far away.
 func (h *Hub) SetBrokerHealth(healthy bool, detail string) {
 	h.brokerMu.Lock()
 	changed := h.brokerHealthy != healthy
@@ -427,6 +454,29 @@ func (h *Hub) SetBrokerHealth(healthy bool, detail string) {
 		Type:   monitor.EventDegraded,
 		Notice: msg,
 	})
+	if !healthy {
+		// Insurance polling resumes now: wake every poller for an immediate
+		// fetch instead of waiting out a pause-era tick. Non-blocking sends;
+		// a poller mid-fetch picks the wake up on its next loop iteration.
+		h.wakeAll()
+	}
+}
+
+// wakeAll queues a refresh wake on every active poller. Used on the broker's
+// healthy→degraded transition so the safety-net path re-engages immediately.
+func (h *Hub) wakeAll() {
+	h.mu.Lock()
+	pollers := make([]*poller, 0, len(h.pollers))
+	for _, p := range h.pollers {
+		pollers = append(pollers, p)
+	}
+	h.mu.Unlock()
+	for _, p := range pollers {
+		select {
+		case p.wake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // BrokerHealthy reports the broker transport's last-known health and its
@@ -590,7 +640,6 @@ func rawForKind(kind backend.Kind) any {
 		return &monitor.PullRequest{}
 	}
 }
-
 
 // traitsFor returns the trait table for a target kind. The per-kind pieces
 // are named package functions (below) rather than inline closures so each
@@ -829,10 +878,16 @@ func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 // run fetches ruleset (PR only) once, then fetches immediately and on every
 // tick or wake, until stop. The cadence backs off like the in-process loop's
 // idleInterval: after three consecutive polls whose fingerprint is unchanged,
-// the delay doubles up to the same 300s cap, so a quiet target watched through
-// the shared daemon costs the same GraphQL as one watched in-process. A wake
-// (new subscriber, or an explicit Refresh) resets the backoff and fetches
-// immediately.
+// the delay doubles up to the idle ceiling (idlePollCeiling when configured,
+// otherwise 300s — issue #90), so a quiet target watched through the shared
+// daemon costs the same GraphQL as one watched in-process. A wake
+// (new subscriber, an explicit Refresh, or a broker degrade while pausing is
+// armed) resets the backoff and fetches immediately.
+//
+// With pollWhenBrokerHealthy: false and the broker reporting healthy, timer
+// ticks carry no fetch at all — the loop just re-arms near the base interval
+// until the pause lifts. Wakes always fetch: event-driven updates are the
+// path this policy trusts.
 func (p *poller) run() {
 	// Fetch the branch ruleset once at startup (PR targets only — no other
 	// kind consumes ruleset data) — unless a predecessor daemon handed one
@@ -869,7 +924,9 @@ func (p *poller) run() {
 		case <-p.stopc:
 			return
 		case <-timer.C:
-			p.fetchOnce()
+			if !p.timerPollPaused() {
+				p.fetchOnce()
+			}
 			delay = p.nextDelay()
 			timer.Reset(delay)
 		case <-p.wake:
@@ -886,29 +943,47 @@ func (p *poller) run() {
 	}
 }
 
-// nextDelay returns the jittered idle-interval for the current noChange
-// count, stretched by the advisory GraphQL budget when the guard reports the
-// budget low. Jitter de-phases pollers that subscribed at the same moment, so
-// a fleet attaching many watchers at once does not burst requests in phase.
+// nextDelay returns the delay before the next timer tick, and — via the
+// caller in run — whether that tick should fetch at all.
 //
-// When the hub's optional broker transport reports healthy (and an idle cap
-// was configured via SetBrokerIdleCap), the idle ceiling is extended well
-// past monitor.MaxIdleInterval: a real change now arrives as an immediate
-// wake instead of waiting for the next tick, so the periodic poll only has
-// to serve as a rare safety net. The moment the broker degrades, this reads
-// the normal ceiling again on the very next call — no stale extended wait
-// survives a lost connection.
+// The cadence is the jittered idle-interval for the current noChange count,
+// stretched by the advisory GraphQL budget when the guard reports the budget
+// low. Jitter de-phases pollers that subscribed at the same moment, so a
+// fleet attaching many watchers at once does not burst requests in phase.
+//
+// Ceiling selection: idlePollCeiling when configured (WithIdleCeiling,
+// issue #90), otherwise monitor.MaxIdleInterval; while the optional broker
+// transport reports healthy (and an idle cap was configured via
+// SetBrokerIdleCap) the extended cap wins instead — a real change now arrives
+// as an immediate wake instead of waiting for the next tick, so the periodic
+// poll only has to serve as a rare safety net. The moment the broker degrades,
+// this reads the normal ceiling again on the very next call — no stale
+// extended wait survives a lost connection.
+//
+// When pausing is armed (pollWhenBrokerHealthy: false) and the broker reports
+// healthy, the tick carries no fetch: the returned delay shrinks to roughly
+// the base interval so degradation is noticed within one tick, and run skips
+// the fetch itself. Tier-shedding and budget-guard stretching continue to
+// apply underneath whenever polling does run.
 func (p *poller) nextDelay() time.Duration {
 	p.mu.Lock()
 	noChange := p.noChange
+	interval := p.interval
 	p.mu.Unlock()
 
-	ceiling := monitor.MaxIdleInterval
-	if healthy, cap := p.hub.BrokerHealthy(); healthy && cap > 0 {
-		ceiling = cap
+	ceiling := p.hub.effectiveIdleCeiling()
+	healthy, brokerCap := p.hub.BrokerHealthy()
+	if healthy && brokerCap > 0 {
+		ceiling = brokerCap
 	}
 
-	d := monitor.Jittered(monitor.IdleIntervalCapped(p.interval, noChange, ceiling))
+	if p.timerPollPaused() {
+		// Paused: no fetch rides on this tick, so keep it cheap and short —
+		// just often enough to notice a degrade without the transition wake.
+		return monitor.Jittered(interval)
+	}
+
+	d := monitor.Jittered(monitor.IdleIntervalCapped(interval, noChange, ceiling))
 	// A run of consecutive fetch failures backs the cadence off exactly as
 	// the in-process loops did: the error backoff dominates the idle backoff
 	// until a fetch succeeds again, so a hard-down GitHub is polled at
@@ -926,6 +1001,27 @@ func (p *poller) nextDelay() time.Duration {
 		}
 	}
 	return d
+}
+
+// effectiveIdleCeiling returns the configured idle-backoff ceiling, or the
+// monitor package's default when idlePollCeiling is unset (issue #90).
+func (h *Hub) effectiveIdleCeiling() time.Duration {
+	if h.idleCeiling > 0 {
+		return h.idleCeiling
+	}
+	return monitor.MaxIdleInterval
+}
+
+// timerPollPaused reports whether timer-driven fetching is currently
+// suspended: pauseWhenBrokerHealthy armed (pollWhenBrokerHealthy: false) and
+// the broker transport reporting healthy. Wakes never pause — an event-driven
+// refresh always fetches.
+func (p *poller) timerPollPaused() bool {
+	if !p.hub.pauseWhenBrokerHealthy {
+		return false
+	}
+	healthy, _ := p.hub.BrokerHealthy()
+	return healthy
 }
 
 func (p *poller) stop() {

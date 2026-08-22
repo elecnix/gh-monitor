@@ -83,7 +83,7 @@ gh monitor --text -R owner/repo <pr>     # Human-readable
 gh monitor --once -R owner/repo <pr>     # One-shot, then exit
 ```
 
-Flags: `--interval` (default 60s, min 10), `--timeout` (default 0 = forever), `--ignored-bots <a,b>`.
+Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever), `--ignored-bots <a,b>`.
 
 **Event types:**
 

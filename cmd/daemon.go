@@ -28,6 +28,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/mux"
+	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
 )
@@ -84,6 +85,22 @@ is off by default. It is a global-only setting: it is read from the operator's
 preferences.json and nowhere else, because self-upgrading the installed binary
 is a machine-wide act.
 
+The poll cadence is configurable from the same file (issue #90), so scheduled
+API spend can be tuned without restart-forgetting-flag discipline:
+
+  gh monitor prefs set '{"pollInterval": "10m", "idlePollCeiling": "6h",
+                         "pollWhenBrokerHealthy": false}'
+
+  - pollInterval — the poller's base cadence; overrides --interval. Go
+    duration, or ""/"0"/"false" to keep the flag/default.
+  - idlePollCeiling — caps the exponential idle backoff for every target,
+    broker-healthy or not (replaces the built-in 300s ceiling).
+  - pollWhenBrokerHealthy — false suspends timer-driven fetching entirely
+    while the broker wake path reports healthy; a degrade resumes polling
+    immediately. Default true.
+
+All three are global-only settings beside selfUpdate, read at daemon start.
+
 Self-update works in both daemon configurations, because there is only one:
 the daemon always owns the socket and the polling hub. An upgrade hands off
 seamlessly over the socket — watched targets and connected watchers carry
@@ -120,17 +137,32 @@ normal interval polling within one cycle, never silence. See the README's
 				socket = ipc.DefaultSocketPath()
 			}
 			if interval < 10 {
-				interval = 60
+				// The built-in default (issue #90): a slow trickle that only
+				// exists as insurance against event loss.
+				interval = 300
 			}
 			return runDaemon(cmd, socket, time.Duration(interval)*time.Second)
 		},
 	}
 	cmd.Flags().StringVar(&socket, "socket", "", "Unix socket path (default: $GH_MONITOR_SOCK or $XDG_RUNTIME_DIR/gh-monitor.sock)")
-	cmd.Flags().IntVar(&interval, "interval", 60, "Polling interval in seconds (min 10)")
+	cmd.Flags().IntVar(&interval, "interval", 300, "Polling interval in seconds (min 10)")
 	return cmd
 }
 
 func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error {
+	// Poll-cadence preferences (issue #90): the config file overrides what the
+	// --interval flag selected — the base cadence (pollInterval), the idle
+	// backoff ceiling (idlePollCeiling), and whether timer polling runs at all
+	// while the broker wake path is healthy (pollWhenBrokerHealthy). A load
+	// failure degrades to the flag/default values rather than refusing to
+	// start: a broken preferences file must not take down watching.
+	daemonPrefs, perr := prefs.Load("")
+	if perr != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: ignoring unreadable preferences (%v)\n", perr)
+		daemonPrefs = prefs.DefaultPreferences()
+	}
+	interval, idleCeiling, pauseWhenHealthy := prefs.ResolveDaemonCadence(daemonPrefs, interval)
+
 	// Cancellation and signal handling come first: everything below — the
 	// socket bind, the hub, sub-daemon supervision — stops through this ctx,
 	// and registering the handler before binding means a client that sees the
@@ -227,7 +259,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	budget := monitor.NewBudgetGuard(budgetSvc, interval)
 
 	h := hub.New(fetch, rulesetFn, interval, budget,
-		hub.WithFailedRunLogFetcher(gh.FailedRunLogs(apiClientFactory)))
+		hub.WithFailedRunLogFetcher(gh.FailedRunLogs(apiClientFactory)),
+		hub.WithIdleCeiling(idleCeiling),
+		hub.WithPauseWhenBrokerHealthy(pauseWhenHealthy))
 	defer h.Stop()
 	if adopted != nil {
 		if err := h.RestoreState(*adopted); err != nil {
@@ -245,7 +279,13 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// client — a fleet of short-lived watchers must not bootstrap a fresh
 	// daemon on every invocation. It serves until SIGTERM/SIGINT, or until a
 	// successor daemon completes an upgrade handoff.
-	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s)\n", socket, interval)
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s, idle ceiling %s)",
+		socket, interval, idleCeiling)
+	if pauseWhenHealthy {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), ", timer polling pauses while the broker is healthy")
+	} else {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
+	}
 	startBrokerTransport(ctx, cmd, h)
 	startUpgradeWatcher(ctx, cmd, socket, interval)
 	startSelfUpdate(ctx, cmd)

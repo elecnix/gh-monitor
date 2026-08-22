@@ -205,7 +205,7 @@ gh monitor --once -R owner/repo 42
 
 **Monitor flags:**
 
-- `--interval <seconds>` - Base polling interval (default: 60, min 10)
+- `--interval <seconds>` - Base polling interval (default: 300, min 10)
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
@@ -317,7 +317,7 @@ Every open PR appears in exactly one bucket and the counts reconcile against the
 **Flags:**
 
 - `--viewer <login>` - GitHub login to classify readiness by (default: authenticated user)
-- `--interval <seconds>` - Polling interval (default: 60, min 10)
+- `--interval <seconds>` - Polling interval (default: 300, min 10)
 - `--timeout <seconds>` - Maximum watch time (default: 0 = run forever)
 - `--once` - Fetch once, emit the current readiness snapshot, and exit
 - `--text` - Emit the formatted line instead of NDJSON
@@ -379,6 +379,20 @@ It works identically whether or not sub-daemons are configured ([#84](https://gi
 
 It only runs when the daemon was launched through its runtime copy (otherwise the installed file could not be rewritten anyway), and a failed check is logged and retried — never fatal, never disruptive to serving.
 
+#### Poll cadence
+
+The daemon poller's cadence is configurable from the global preferences file ([#90](https://github.com/elecnix/gh-monitor/issues/90)), so scheduled API spend can be tuned without restart-forgetting-flag discipline. The operating policy these settings express: **scheduled polling is a slow trickle that only exists as insurance against event loss** — timely updates arrive via a broker wake or a new subscriber's initial fetch, never from a timer.
+
+```sh
+gh monitor prefs set '{"pollInterval": "10m", "idlePollCeiling": "6h", "pollWhenBrokerHealthy": false}'
+```
+
+- `pollInterval` — the poller's base cadence, overriding `--interval`. A Go duration (`"10m"`), or `""`/`"0"`/`"false"` to keep the flag/built-in default (5 minutes as of [#90](https://github.com/elecnix/gh-monitor/issues/90)). This governs busy targets and the first few no-change polls.
+- `idlePollCeiling` — caps the exponential idle backoff for every target, busy or quiet, broker-healthy or not, replacing the built-in 300s ceiling. A Go duration (`"6h"`).
+- `pollWhenBrokerHealthy` — default `true`. Set to `false` and timer-driven fetching suspends entirely while the broker wake path reports healthy; the moment the broker degrades, every subscriber gets a loud `degraded` notice and an immediate fetch resumes (the transition itself wakes every poller). Requires the broker transport below.
+
+All three are global-only settings beside `selfUpdate`, read at daemon start; invalid values are rejected at set time.
+
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
 #### Upgrading while watchers run
@@ -420,7 +434,7 @@ The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an a
 }
 ```
 
-**Health is loud, on purpose.** While the broker is connected, a quiet PR's idle-poll ceiling stretches from the default 300s up to `GH_MONITOR_BROKER_IDLE_CAP` — polling becomes a rare safety net because a real change now arrives as an immediate wake. The moment the connection drops, every subscriber gets a `degraded`-type notification and the ceiling reverts to the default within one poll cycle — normal interval polling, not silence. A subscriber that only ever reads "no event arrived" as "nothing changed" would be trading tonight's failure mode for a new transport instead of fixing it, so this transport is built to make that impossible: it always keeps polling underneath, just less often when the broker is doing its job.
+**Health is loud, on purpose.** While the broker is connected, a quiet PR's idle-poll ceiling stretches from the default 300s up to `GH_MONITOR_BROKER_IDLE_CAP` — polling becomes a rare safety net because a real change now arrives as an immediate wake. The moment the connection drops, every subscriber gets a `degraded`-type notification and the ceiling reverts to the default within one poll cycle — normal interval polling, not silence. A subscriber that only ever reads "no event arrived" as "nothing changed" would be trading tonight's failure mode for a new transport instead of fixing it, so this transport is built to make that impossible: by default it always keeps polling underneath, just less often when the broker is doing its job. With `pollWhenBrokerHealthy: false` in preferences (see [Poll cadence](#poll-cadence)), that default becomes stricter still: while the wake path is live there is no timer polling at all, and polling returns the instant the transport degrades.
 
 An event that names a repository but no `pr_number` (check-run/check-suite events, which key off a commit SHA rather than a PR) wakes every PR this daemon is currently watching for that repository, rather than guessing which one changed.
 
@@ -475,7 +489,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 #### Event log
 

@@ -27,7 +27,13 @@ const (
 	MaxIdleInterval = 300 * time.Second
 	maxIdleInterval = MaxIdleInterval
 	maxErrBackoff   = 300 * time.Second
-	defaultInterval = 60 * time.Second
+
+	// defaultInterval is the built-in poll cadence (issue #90): a slow
+	// trickle that only exists as insurance against event loss. The old 60s
+	// default was the aggressive part of the safety net — under a healthy
+	// broker, timer polling adds no freshness that wakes do not already
+	// deliver, so it was pure API spend.
+	defaultInterval = 5 * time.Minute
 )
 
 // MaxFailedLogLines caps the failed-run log snippet embedded in a

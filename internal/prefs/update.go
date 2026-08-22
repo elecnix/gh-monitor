@@ -24,6 +24,14 @@ import (
 //     resets it to the default (off) and removes it from the file. Absent
 //     leaves it untouched. Invalid specs are rejected so a typo never becomes
 //     a silent no-op.
+//   - "pollInterval" / "idlePollCeiling": strings (issue #90) — a positive Go
+//     duration ("5m", "6h") overriding the daemon poller's base cadence or
+//     idle-backoff ceiling, or ""/"0"/"false" to keep the --interval
+//     flag/built-in default. Null resets and removes from the file; invalid
+//     specs are rejected at set time.
+//   - "pollWhenBrokerHealthy": bool (issue #90, default true). false suspends
+//     the daemon's timer-driven fetching while the broker wake path reports
+//     healthy; a degrade resumes polling immediately. Null resets to true.
 //
 // Unknown top-level keys are rejected so callers notice typos. An empty object
 // ("{}") is a no-op: it returns the current effective preferences without
@@ -105,6 +113,42 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.SelfUpdate = &s
 			}
+		case "pollInterval", "idlePollCeiling":
+			if string(v) == "null" {
+				switch key {
+				case "pollInterval":
+					stored.PollInterval = nil
+				case "idlePollCeiling":
+					stored.IdlePollCeiling = nil
+				}
+			} else {
+				var s string
+				if err := json.Unmarshal(v, &s); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse %s: %w (use a Go duration like \"5m\" or \"6h\", or \"\"/\"false\"/\"0\" to keep the flag/default)", key, err)
+				}
+				if !ValidDurationOverride(s) {
+					return Preferences{}, fmt.Errorf(
+						"invalid %s value %q: use a positive Go duration (\"5m\") or \"\"/\"0\"/\"false\" (keep the default)", key, s)
+				}
+				switch key {
+				case "pollInterval":
+					stored.PollInterval = &s
+				case "idlePollCeiling":
+					stored.IdlePollCeiling = &s
+				}
+			}
+		case "pollWhenBrokerHealthy":
+			if string(v) == "null" {
+				stored.PollWhenBrokerHealthy = nil
+			} else {
+				var b bool
+				if err := json.Unmarshal(v, &b); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse pollWhenBrokerHealthy: %w (use true or false; null resets to the default)", err)
+				}
+				stored.PollWhenBrokerHealthy = &b
+			}
 		case "eventLog":
 			if string(v) == "null" {
 				stored.EventLog = nil
@@ -120,7 +164,7 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				stored.EventLog = &cfg
 			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, eventLog)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, eventLog)", key)
 		}
 	}
 
@@ -212,6 +256,15 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.SelfUpdate != nil {
 		prefs.SelfUpdate = *stored.SelfUpdate
+	}
+	if stored.PollInterval != nil {
+		prefs.PollInterval = *stored.PollInterval
+	}
+	if stored.IdlePollCeiling != nil {
+		prefs.IdlePollCeiling = *stored.IdlePollCeiling
+	}
+	if stored.PollWhenBrokerHealthy != nil {
+		prefs.PollWhenBrokerHealthy = *stored.PollWhenBrokerHealthy
 	}
 	if stored.EventLog != nil {
 		prefs.EventLog = stored.EventLog

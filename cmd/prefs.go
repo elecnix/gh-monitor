@@ -28,16 +28,34 @@ Preferences are stored as JSON at the path shown by 'gh monitor prefs path'
 
 The document shape:
   {
-    "templates":         { "<event-kind>": "<template>" | null, ... },
-    "ignoredBots":       ["login", ...],
-    "retriggerComments": false,
-    "selfUpdate":        "30m" | "1" | "" | null,
-    "eventLog":          { "dir": "/path", "keepDays": 10 } | null
+    "templates":            { "<event-kind>": "<template>" | null, ... },
+    "ignoredBots":          ["login", ...],
+    "retriggerComments":    false,
+    "selfUpdate":           "30m" | "1" | "" | null,
+    "pollInterval":         "10m" | "" | null,
+    "idlePollCeiling":      "6h" | "" | null,
+    "pollWhenBrokerHealthy": true | false | null,
+    "eventLog":             { "dir": "/path", "keepDays": 10 } | null
   }
 
 selfUpdate is a global-only setting (issue #82): a Go duration for the
 resident daemon's release-check cadence, "1"/"true" for the default (hourly),
 or ""/"0"/"false"/null to disable (the default).
+
+The poll-cadence keys are global-only settings too (issue #90), read by the
+daemon at start:
+
+  pollInterval sets the poller's base cadence, overriding --interval. A Go
+duration ("10m"), or ""/"0"/"false"/null to keep the flag/default.
+
+  idlePollCeiling caps the exponential idle backoff for every target — busy
+or quiet, broker-healthy or not — replacing the built-in 300s ceiling. A Go
+duration ("6h"), or ""/"0"/"false"/null for the default.
+
+  pollWhenBrokerHealthy (default true): false suspends timer-driven fetching
+entirely while the broker wake path reports healthy; a degrade resumes
+polling immediately. Scheduled API spend becomes pure insurance against event
+loss.
 
 eventLog turns on the backend event log (issue #86): every update a watch
 consumes — from any backend — is appended to daily JSONL files. Both fields
