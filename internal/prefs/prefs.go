@@ -46,13 +46,29 @@ const DefaultEventLogKeepDays = 10
 // SelfUpdate is a global-only setting (issue #82): it decides whether the
 // resident daemon upgrades gh-monitor itself, which is a machine-wide act —
 // this document is the only place it is read from.
+//
+// PollInterval and IdlePollCeiling are global-only settings too (issue #90):
+// they set the daemon poller's base cadence and idle-backoff ceiling without a
+// restart-forgetting-flag dance. Both use the same Go-duration grammar as
+// SelfUpdate; "" keeps whatever the --interval flag or built-in default says.
+// PollWhenBrokerHealthy (default true) is the third lever: false suspends
+// timer-driven fetching entirely while the broker wake path reports healthy,
+// so scheduled API spend exists only as insurance against event loss.
 type Preferences struct {
-	Templates         map[string]string `json:"templates"`
-	IgnoredBots       []string          `json:"ignoredBots"`
-	RetriggerComments bool              `json:"retriggerComments"`
-	SelfUpdate        string            `json:"selfUpdate,omitempty"`
-	EventLog          *EventLogConfig   `json:"eventLog,omitempty"`
+	Templates             map[string]string `json:"templates"`
+	IgnoredBots           []string          `json:"ignoredBots"`
+	RetriggerComments     bool              `json:"retriggerComments"`
+	SelfUpdate            string            `json:"selfUpdate,omitempty"`
+	PollInterval          string            `json:"pollInterval,omitempty"`
+	IdlePollCeiling       string            `json:"idlePollCeiling,omitempty"`
+	PollWhenBrokerHealthy bool              `json:"pollWhenBrokerHealthy"`
+	EventLog              *EventLogConfig   `json:"eventLog,omitempty"`
 }
+
+// DefaultIdlePollCeiling is the idle-backoff ceiling used when idlePollCeiling
+// is unset — the monitor package's own 300s default. Declared here (rather
+// than imported) to keep this package decoupled from internal/monitor.
+const DefaultIdlePollCeiling = 5 * time.Minute
 
 // templateKeys are the exact, authoritative event-kind keys. They intentionally
 // match the monitor's Event.Type strings plus the two loop-level keys
@@ -100,10 +116,13 @@ func DefaultPreferences() Preferences {
 		templates[k] = v
 	}
 	return Preferences{
-		Templates:         templates,
-		IgnoredBots:       []string{},
-		RetriggerComments: false,
-		SelfUpdate:        "",
+		Templates:             templates,
+		IgnoredBots:           []string{},
+		RetriggerComments:     false,
+		SelfUpdate:            "",
+		PollInterval:          "",
+		IdlePollCeiling:       "",
+		PollWhenBrokerHealthy: true,
 	}
 }
 
@@ -124,6 +143,57 @@ func SelfUpdateInterval(spec string, dflt time.Duration) time.Duration {
 		return d
 	}
 	return 0
+}
+
+// durationOverride interprets a poll-cadence preference value against dflt
+// (issue #90). The grammar mirrors what the removed GH_MONITOR_* env variables
+// accepted: absent, "0", or "false" keep the caller's default; any positive Go
+// duration overrides it; anything else falls back rather than being guessed.
+func durationOverride(spec string, dflt time.Duration) time.Duration {
+	switch spec {
+	case "", "0", "false":
+		return dflt
+	}
+	if d, err := time.ParseDuration(spec); err == nil && d > 0 {
+		return d
+	}
+	return dflt
+}
+
+// PollInterval interprets a pollInterval preference value against dflt, the
+// interval the daemon's --interval flag (or its default) selected. It accepts
+// the same Go-duration grammar as SelfUpdateInterval; "" disables the override
+// so the caller falls back to the flag/default.
+func PollInterval(spec string, dflt time.Duration) time.Duration {
+	return durationOverride(spec, dflt)
+}
+
+// IdlePollCeiling interprets an idlePollCeiling preference value against dflt,
+// replacing the built-in idle-backoff ceiling for every target — busy or
+// quiet, broker-healthy or not. Same grammar as PollInterval.
+func IdlePollCeiling(spec string, dflt time.Duration) time.Duration {
+	return durationOverride(spec, dflt)
+}
+
+// ValidDurationOverride reports whether spec is a value UpdateFile accepts for
+// the pollInterval / idlePollCeiling keys, so a typo is rejected at set time
+// rather than becoming a silent no-op.
+func ValidDurationOverride(spec string) bool {
+	switch spec {
+	case "", "0", "false":
+		return true
+	}
+	d, err := time.ParseDuration(spec)
+	return err == nil && d > 0
+}
+
+// ResolveDaemonCadence resolves the three poll-cadence preferences into the
+// values the daemon runs with (issue #90). flagInterval is what the --interval
+// flag (or its default) selected; the config file overrides it when set.
+func ResolveDaemonCadence(p Preferences, flagInterval time.Duration) (interval, idleCeiling time.Duration, pauseWhenHealthy bool) {
+	return PollInterval(p.PollInterval, flagInterval),
+		IdlePollCeiling(p.IdlePollCeiling, DefaultIdlePollCeiling),
+		p.PollWhenBrokerHealthy
 }
 
 // ValidSelfUpdateSpec reports whether spec is a value UpdateFile accepts for
@@ -306,11 +376,14 @@ func legacyPath(baseDir string) (string, error) {
 // JSON null is distinguishable from an absent key: null resets that key to
 // default, absent leaves the default untouched.
 type storedPreferences struct {
-	Templates         map[string]*string `json:"templates"`
-	IgnoredBots       []string           `json:"ignoredBots"`
-	RetriggerComments *bool              `json:"retriggerComments,omitempty"`
-	SelfUpdate        *string            `json:"selfUpdate,omitempty"`
-	EventLog          *EventLogConfig    `json:"eventLog,omitempty"`
+	Templates             map[string]*string `json:"templates"`
+	IgnoredBots           []string           `json:"ignoredBots"`
+	RetriggerComments     *bool              `json:"retriggerComments,omitempty"`
+	SelfUpdate            *string            `json:"selfUpdate,omitempty"`
+	PollInterval          *string            `json:"pollInterval,omitempty"`
+	IdlePollCeiling       *string            `json:"idlePollCeiling,omitempty"`
+	PollWhenBrokerHealthy *bool              `json:"pollWhenBrokerHealthy,omitempty"`
+	EventLog              *EventLogConfig    `json:"eventLog,omitempty"`
 }
 
 // Load starts from DefaultPreferences and overlays the JSON file if present.
