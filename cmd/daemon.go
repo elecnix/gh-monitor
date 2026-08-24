@@ -100,6 +100,9 @@ API spend can be tuned without restart-forgetting-flag discipline:
     immediately. Default true.
 
 All three are global-only settings beside selfUpdate, read at daemon start.
+Run 'gh monitor reload' after changing them: it restarts the daemon through
+the state-preserving upgrade handoff, so the new cadence applies without
+losing watched targets or watcher baselines.
 
 Self-update works in both daemon configurations, because there is only one:
 the daemon always owns the socket and the polling hub. An upgrade hands off
