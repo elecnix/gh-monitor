@@ -258,6 +258,25 @@ The watch runs in the background while Claude works, and **auto-stops** when the
 
 See [docs/CLAUDE_CODE.md](docs/CLAUDE_CODE.md) for the full guide, the event→reaction mapping, template customization, and a hook that auto-suggests monitoring right after `gh pr create`.
 
+### Monitoring a branch (ref watch)
+
+Use `--ref <branch>` to watch a remote branch's head: each poll fetches the ref's current OID, author, headline, and CI state, emitting `new-commit` when someone pushes, plus `new-failing-checks` and `ci-all-green` for that branch's checks. This is the counterpart to PR watching for shared branches — most often "tell me when `main` moves so I know to rebase."
+
+```sh
+gh monitor -R owner/repo --ref main
+```
+
+The first poll normally establishes the baseline silently: whatever the branch points at when the watch starts is treated as already-seen. That is correct for a standing watch but wrong when the caller last looked at the branch _before_ starting it — a push landing in that gap is silently absorbed into the baseline and never reported. `--baseline <oid>` closes this race: pass the commit OID you actually observed (never re-derive it at watch time), and the first poll diffs against it instead.
+
+```sh
+# The agent observes the branch, sees this output, then passes the OID verbatim:
+git fetch origin && git rev-parse origin/main
+# → 3f9c2ab1def0123456789abcdef0123456789ab
+gh monitor -R owner/repo --ref main --baseline 3f9c2ab1def0123456789abcdef0123456789ab
+```
+
+The OID is resolved through GitHub at startup, so a short SHA expands to the exact full form the API reports and a typo'd or inaccessible SHA fails loudly instead of silently never matching; check state at observation time is captured too, so only _newly_ failing checks surface. `--baseline` requires `--ref` and cannot be combined with `--instance`, whose stored cursor already provides a baseline.
+
 ### Monitoring a workflow run
 
 Use `--run-id <id>` to watch a **single GitHub Actions workflow run** until it reaches a terminal conclusion. This works for any non-PR run — deploy workflows on `main`, `workflow_dispatch` runs, scheduled runs, etc. — and is the counterpart to PR CI watching: instead of polling a PR for check suites, it polls the run's `status`/`conclusion` and emits one event per genuinely-new transition (`run-queued`, `run-in-progress`, `run-completed`). The loop **auto-stops** when the run's status becomes `completed`.

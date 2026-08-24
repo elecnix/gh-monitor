@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -423,6 +424,152 @@ func TestMonitorRefWithRepo(t *testing.T) {
 	root.SetArgs([]string{"--ref", "main", "-R", "o/r", "--once"})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, stdout.String(), "first-poll")
+}
+
+// baselineRefFixture is a clean (no failing checks) ref payload for --baseline tests.
+func baselineRefFixture(oid string) obj {
+	return obj{
+		"repository": obj{
+			"ref": obj{
+				"target": obj{
+					"oid":             oid,
+					"messageHeadline": "fix: stuff",
+					"authors":         obj{"nodes": []interface{}{}},
+					"checkSuites":     obj{"nodes": []interface{}{}},
+				},
+			},
+		},
+	}
+}
+
+// baselineCommitFixture is the commit payload answering the --baseline OID lookup.
+func baselineCommitFixture(oid string) obj {
+	return obj{
+		"repository": obj{
+			"object": obj{
+				"oid":             oid,
+				"messageHeadline": "fix: stuff",
+				"authors":         obj{"nodes": []interface{}{}},
+				"checkSuites":     obj{"nodes": []interface{}{}},
+			},
+		},
+	}
+}
+
+const baselineObservedOID = "aaaaaaabbbbccccdddd00000000000000000000"
+
+func TestMonitorOnceWithBaseline(t *testing.T) {
+	t.Run("baseline equal to remote head suppresses everything", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GH_HOST", "")
+		originalFactory := apiClientFactory
+		defer func() { apiClientFactory = originalFactory }()
+
+		fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			if strings.Contains(query, "MonitorCommit") {
+				require.Equal(t, baselineObservedOID, variables["oid"])
+				return assignJSON(result, baselineCommitFixture(baselineObservedOID))
+			}
+			require.Contains(t, query, "MonitorRef")
+			return assignJSON(result, baselineRefFixture(baselineObservedOID))
+		}}
+		apiClientFactory = func(string) ghcli.API { return fake }
+
+		root := newRootCommand()
+		stdout := &bytes.Buffer{}
+		root.SetOut(stdout)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{"--ref", "main", "-R", "o/r", "--once", "--baseline", baselineObservedOID})
+		require.NoError(t, root.Execute())
+		assert.Empty(t, strings.TrimSpace(stdout.String()), "nothing changed since the observed OID: no events")
+	})
+
+	t.Run("push landing after observation is delivered on first poll", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GH_HOST", "")
+		originalFactory := apiClientFactory
+		defer func() { apiClientFactory = originalFactory }()
+
+		advancedOID := "bbbbbbbaaaacccdddd0000000000000000000000"
+		fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			if strings.Contains(query, "MonitorCommit") {
+				return assignJSON(result, baselineCommitFixture(baselineObservedOID))
+			}
+			return assignJSON(result, baselineRefFixture(advancedOID))
+		}}
+		apiClientFactory = func(string) ghcli.API { return fake }
+
+		root := newRootCommand()
+		stdout := &bytes.Buffer{}
+		root.SetOut(stdout)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{"--ref", "main", "-R", "o/r", "--once", "--baseline", baselineObservedOID})
+		require.NoError(t, root.Execute())
+		assert.Contains(t, stdout.String(), "new-commit", "the push since the observed OID must be delivered")
+		assert.NotContains(t, stdout.String(), "first-poll", "a seeded watch is not a first poll")
+	})
+
+	t.Run("a typo'd SHA fails loudly before any watch starts", func(t *testing.T) {
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("GH_HOST", "")
+		apiCalls := 0
+		originalFactory := apiClientFactory
+		defer func() { apiClientFactory = originalFactory }()
+
+		fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+			apiCalls++
+			if strings.Contains(query, "MonitorCommit") {
+				// GitHub answers a nonexistent object with no data.
+				return assignJSON(result, obj{"repository": obj{"object": nil}})
+			}
+			return errors.New("unexpected MonitorRef call: watch must not start past a failed baseline")
+		}}
+		apiClientFactory = func(string) ghcli.API { return fake }
+
+		root := newRootCommand()
+		stdout := &bytes.Buffer{}
+		root.SetOut(stdout)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs([]string{"--ref", "main", "-R", "o/r", "--once", "--baseline", "zzzzzzznotfound"})
+		err := root.Execute()
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "unexpected MonitorRef", "the watch must never start when the baseline is bad")
+	})
+}
+
+func TestMonitorBaselineFlagValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "baseline without ref",
+			args: []string{"--baseline", "3f9c2ab", "-R", "o/r"},
+			want: "--baseline requires --ref",
+		},
+		{
+			name: "baseline with commit target",
+			args: []string{"--baseline", "3f9c2ab", "--commit", "abcdef1", "-R", "o/r"},
+			want: "--baseline requires --ref",
+		},
+		{
+			name: "baseline with instance",
+			args: []string{"--baseline", "3f9c2ab", "--ref", "main", "--instance", "main-watch", "-R", "o/r"},
+			want: "--instance",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := newRootCommand()
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			root.SetArgs(tt.args)
+			err := root.Execute()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
 }
 
 func TestMonitorMutuallyExclusiveTargets(t *testing.T) {

@@ -1336,6 +1336,39 @@ func SnapshotCommit(c *CommitObject) *RefStatus {
 	return SnapshotRef(&target)
 }
 
+// isCommitOID reports whether s looks like a git commit OID: 7–40 hex
+// characters. Seven is a plausible short SHA; forty is the full form.
+func isCommitOID(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+// ResolveRefBaseline turns a caller-supplied commit OID — one the caller
+// observed directly, never one re-derived at watch time — into the JSON-ready
+// RefStatus that seeds a ref watch's baseline (the --baseline flag). The OID
+// is resolved through GitHub so a short SHA expands to the exact full form the
+// API reports, check state at observation time is captured, and a typo'd or
+// inaccessible SHA fails loudly instead of silently never matching.
+func ResolveRefBaseline(api ghcli.API, owner, repo, raw string) (*RefStatus, error) {
+	oid := strings.TrimSpace(raw)
+	if !isCommitOID(oid) {
+		return nil, fmt.Errorf("--baseline %q is not a valid commit OID (expected 7-40 hex characters); pass the full or short SHA you observed", raw)
+	}
+	svc := &Service{API: api}
+	resp, err := svc.FetchCommit(owner, repo, oid)
+	if err != nil {
+		return nil, fmt.Errorf("--baseline: %w", err)
+	}
+	return SnapshotCommit(resp.Repository.Object), nil
+}
+
 // commitChecks extracts check names from check suites and status contexts
 // using the provided classifier function which takes a *PullRequest.
 func commitChecks(suites SuiteNodes, status *CommitStatus, classifier func(*PullRequest) []string) []string {

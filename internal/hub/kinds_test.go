@@ -117,6 +117,49 @@ func TestHub_SubscribeRef(t *testing.T) {
 	assert.Contains(t, got, "new-commit")
 }
 
+func TestHub_SubscribeRefRestoresBaseline(t *testing.T) {
+	// A watcher that seeds its baseline from an OID it observed before
+	// starting (issue #90-style race-free watches) diffs its first fetch
+	// against that OID: a push that landed between observation and watch
+	// start is delivered instead of silently absorbed.
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return refFixture("bbbbbbb", nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	opts := testHubOpts()
+	opts.Baseline = `{"oid":"aaaaaaa"}`
+	ch, cancelSub := h.Subscribe(ctx, targetOf(backend.KindRef), opts)
+	t.Cleanup(cancelSub)
+
+	got := collect(ch, 100*time.Millisecond)
+	assert.NotContains(t, got, "first-poll", "a seeded watch is not a first poll")
+	assert.Contains(t, got, "new-commit", "the push since the observed OID must be delivered")
+}
+
+func TestHub_SubscribeRefBaselineCurrent(t *testing.T) {
+	// Baseline equal to the current head: nothing has changed, so the
+	// watch reports nothing rather than replaying state the caller knows.
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return refFixture("bbbbbbb", nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	opts := testHubOpts()
+	opts.Baseline = `{"oid":"bbbbbbb"}`
+	ch, cancelSub := h.Subscribe(ctx, targetOf(backend.KindRef), opts)
+	t.Cleanup(cancelSub)
+
+	got := collect(ch, 100*time.Millisecond)
+	assert.Empty(t, got, "nothing changed since the baseline: no events")
+}
+
 func TestHub_SubscribeIssue(t *testing.T) {
 	var resp *monitor.IssueQueryResponse
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
