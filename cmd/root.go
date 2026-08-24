@@ -48,6 +48,7 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(newReactCommand())
 	cmd.AddCommand(newPrefsCommand())
 	cmd.AddCommand(newDaemonCommand())
+	cmd.AddCommand(newReloadCommand())
 	cmd.AddCommand(newInstancesCommand())
 	cmd.AddCommand(newBackendsCommand())
 	return cmd

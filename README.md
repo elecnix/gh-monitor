@@ -45,34 +45,35 @@ npx skills add elecnix/gh-monitor
 
 ## Commands
 
-| Command                         | Description                                                                |
-| ------------------------------- | -------------------------------------------------------------------------- |
-| _(default)_                     | Continuously watch a PR, streaming one event per change (NDJSON)           |
-| `monitor` / `watch`             | Continuously watch a PR, streaming one event per change (NDJSON)           |
-| `monitor --run-id <id>`         | Watch a single GitHub Actions workflow run until it completes (NDJSON)     |
-| `monitor -R owner/repo`         | Watch a repository for new PRs and issues (NDJSON)                         |
-| `monitor -R owner/repo --once`  | Repo-wide merge-readiness view: which PRs can be merged now, and by whom   |
-| `draft status`                  | Check if a pull request is a draft                                         |
-| `draft mark`                    | Mark a pull request as draft                                               |
-| `draft ready`                   | Mark a pull request as ready for review                                    |
-| `draft list`                    | List all draft pull requests in the repository                             |
-| `review --start`                | Opens a pending review                                                     |
-| `review --add-comment`          | Adds inline comment (requires `PRR_…` review node ID)                      |
-| `review --edit-comment`         | Updates a comment in a pending review                                      |
-| `review --delete-comment`       | Deletes a comment from a pending review                                    |
-| `review view`                   | Aggregates reviews, inline comments, and replies                           |
-| `review --submit`               | Finalizes a pending review                                                 |
-| `comments reply`                | Replies to a review thread                                                 |
-| `react`                         | Adds a reaction to any GitHub node (comments, reviews, etc.)               |
-| `threads list`                  | Lists review threads for the pull request                                  |
-| `threads view`                  | View full conversation for specific threads by ID                          |
-| `threads resolve` / `unresolve` | Resolves or unresolves review threads                                      |
-| `prefs`                         | View and edit notification preference templates (get/set/reset/path)       |
-| `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch |
-| `instances list`                | List all named instance cursors                                            |
-| `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                  |
-| `backends`                      | List the monitoring backends and the target kinds they cover               |
-| `version` / `--version`         | Print the running binary's version, VCS revision, and build time           |
+| Command                         | Description                                                                          |
+| ------------------------------- | ------------------------------------------------------------------------------------ |
+| _(default)_                     | Continuously watch a PR, streaming one event per change (NDJSON)                     |
+| `monitor` / `watch`             | Continuously watch a PR, streaming one event per change (NDJSON)                     |
+| `monitor --run-id <id>`         | Watch a single GitHub Actions workflow run until it completes (NDJSON)               |
+| `monitor -R owner/repo`         | Watch a repository for new PRs and issues (NDJSON)                                   |
+| `monitor -R owner/repo --once`  | Repo-wide merge-readiness view: which PRs can be merged now, and by whom             |
+| `draft status`                  | Check if a pull request is a draft                                                   |
+| `draft mark`                    | Mark a pull request as draft                                                         |
+| `draft ready`                   | Mark a pull request as ready for review                                              |
+| `draft list`                    | List all draft pull requests in the repository                                       |
+| `review --start`                | Opens a pending review                                                               |
+| `review --add-comment`          | Adds inline comment (requires `PRR_…` review node ID)                                |
+| `review --edit-comment`         | Updates a comment in a pending review                                                |
+| `review --delete-comment`       | Deletes a comment from a pending review                                              |
+| `review view`                   | Aggregates reviews, inline comments, and replies                                     |
+| `review --submit`               | Finalizes a pending review                                                           |
+| `comments reply`                | Replies to a review thread                                                           |
+| `react`                         | Adds a reaction to any GitHub node (comments, reviews, etc.)                         |
+| `threads list`                  | Lists review threads for the pull request                                            |
+| `threads view`                  | View full conversation for specific threads by ID                                    |
+| `threads resolve` / `unresolve` | Resolves or unresolves review threads                                                |
+| `prefs`                         | View and edit notification preference templates (get/set/set from file/reset/path)   |
+| `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch           |
+| `reload`                        | Restart the resident daemon so it re-reads preferences (watching state carries over) |
+| `instances list`                | List all named instance cursors                                                      |
+| `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                            |
+| `backends`                      | List the monitoring backends and the target kinds they cover                         |
+| `version` / `--version`         | Print the running binary's version, VCS revision, and build time                     |
 
 ### Filters
 
@@ -391,7 +392,7 @@ gh monitor prefs set '{"pollInterval": "10m", "idlePollCeiling": "6h", "pollWhen
 - `idlePollCeiling` — caps the exponential idle backoff for every target, busy or quiet, broker-healthy or not, replacing the built-in 300s ceiling. A Go duration (`"6h"`).
 - `pollWhenBrokerHealthy` — default `true`. Set to `false` and timer-driven fetching suspends entirely while the broker wake path reports healthy; the moment the broker degrades, every subscriber gets a loud `degraded` notice and an immediate fetch resumes (the transition itself wakes every poller). Requires the broker transport below.
 
-All three are global-only settings beside `selfUpdate`, read at daemon start; invalid values are rejected at set time.
+All three are global-only settings beside `selfUpdate`, read at daemon start; invalid values are rejected at set time. `gh monitor prefs set` says so when a daemon-read key changes, and `gh monitor reload` applies the change immediately: it swaps in a successor daemon through the same in-memory handoff an upgrade uses, so watched targets, poller state, and connected watchers carry across — a reload, not a cold restart.
 
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
