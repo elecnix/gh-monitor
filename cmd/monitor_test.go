@@ -537,6 +537,19 @@ func TestMonitorOnceWithBaseline(t *testing.T) {
 	})
 }
 
+// expectMonitorError runs the monitor command with args and asserts it fails
+// with want in the error message. Shared by the flag-validation tables.
+func expectMonitorError(t *testing.T, args []string, want string) {
+	t.Helper()
+	root := newRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs(args)
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), want)
+}
+
 func TestMonitorBaselineFlagValidation(t *testing.T) {
 	tests := []struct {
 		name string
@@ -561,13 +574,7 @@ func TestMonitorBaselineFlagValidation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			root := newRootCommand()
-			root.SetOut(&bytes.Buffer{})
-			root.SetErr(&bytes.Buffer{})
-			root.SetArgs(tt.args)
-			err := root.Execute()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.want)
+			expectMonitorError(t, tt.args, tt.want)
 		})
 	}
 }
@@ -601,13 +608,7 @@ func TestMonitorMutuallyExclusiveTargets(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			root := newRootCommand()
-			root.SetOut(&bytes.Buffer{})
-			root.SetErr(&bytes.Buffer{})
-			root.SetArgs(tt.args)
-			err := root.Execute()
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.want)
+			expectMonitorError(t, tt.args, tt.want)
 		})
 	}
 }

@@ -145,7 +145,8 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	var err error
 
 	if opts.Ref != "" {
-		identity, err = resolver.ResolveRef(opts.Ref, opts.Repo, os.Getenv("GH_HOST"))	} else if opts.Commit != "" {
+		identity, err = resolver.ResolveRef(opts.Ref, opts.Repo, os.Getenv("GH_HOST"))
+	} else if opts.Commit != "" {
 		identity, err = resolver.ResolveCommit(opts.Commit, opts.Repo, os.Getenv("GH_HOST"))
 	} else if opts.Issue > 0 {
 		identity, err = resolver.ResolveIssue(opts.Issue, opts.Repo, os.Getenv("GH_HOST"))
