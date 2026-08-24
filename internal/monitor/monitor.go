@@ -55,16 +55,16 @@ type RulesetListResponse []struct {
 
 // RulesetResponse is the minimal envelope for GET /repos/{owner}/{repo}/rulesets/{id}.
 type RulesetResponse struct {
-	ID     int            `json:"id"`
-	Name   string         `json:"name"`
-	Rules  []RulesetRule  `json:"rules"`
-	Target string         `json:"target"`
+	ID     int           `json:"id"`
+	Name   string        `json:"name"`
+	Rules  []RulesetRule `json:"rules"`
+	Target string        `json:"target"`
 }
 
 // RulesetRule is one rule inside a ruleset.
 type RulesetRule struct {
-	Type       string              `json:"type"`
-	Parameters *RulesetParameters  `json:"parameters,omitempty"`
+	Type       string             `json:"type"`
+	Parameters *RulesetParameters `json:"parameters,omitempty"`
 }
 
 // RulesetParameters holds the required_status_checks contexts.
@@ -74,7 +74,7 @@ type RulesetParameters struct {
 
 // RequiredStatusCheck is one required status context from a ruleset.
 type RequiredStatusCheck struct {
-	Context        string `json:"context"`
+	Context       string `json:"context"`
 	IntegrationID int    `json:"integration_id"`
 }
 
@@ -90,9 +90,9 @@ type RulesetChecks struct {
 // FetchRequiredChecks reads the branch ruleset for the repository and returns
 // the required status check context names. It handles three cases:
 //
-//	1. No rulesets at all                     → Contexts=nil, Error=""
-//	2. A ruleset with required_status_checks  → Contexts filled
-//	3. The ruleset API returns 403/404        → Contexts=nil, Error="ruleset not readable"
+//  1. No rulesets at all                     → Contexts=nil, Error=""
+//  2. A ruleset with required_status_checks  → Contexts filled
+//  3. The ruleset API returns 403/404        → Contexts=nil, Error="ruleset not readable"
 //
 // Case 3 is critical: a ruleset you cannot read must degrade loudly, never
 // silently become "nothing is required" — that would reproduce the exact bug
@@ -135,8 +135,8 @@ func (s *Service) FetchRequiredChecks(owner, repo string) (*RulesetChecks, error
 type RateLimitResource struct {
 	Limit     int    `json:"limit"`
 	Remaining int    `json:"remaining"`
-	Reset     int64  `json:"reset"`      // Unix epoch seconds
-	ResetAt   string `json:"-"`          // ISO 8601 derived from Reset
+	Reset     int64  `json:"reset"` // Unix epoch seconds
+	ResetAt   string `json:"-"`     // ISO 8601 derived from Reset
 }
 
 // RateLimitResponse is the parsed response from GET /rate_limit.
@@ -877,7 +877,7 @@ func runVerdict(runs []CheckRun) (CheckRun, bool) {
 		}
 		t, err := time.Parse(time.RFC3339, r.CompletedAt)
 		if err != nil {
-			t = time.Time{}   // unparseable cannot prove it is newer
+			t = time.Time{} // unparseable cannot prove it is newer
 		}
 		if !found || t.After(bestT) {
 			best = *r
@@ -1343,7 +1343,12 @@ func isCommitOID(s string) bool {
 		return false
 	}
 	for _, r := range s {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+		isHex := false
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+			isHex = true
+		}
+		if !isHex {
 			return false
 		}
 	}
