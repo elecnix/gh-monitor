@@ -1020,7 +1020,15 @@ func failingChecks(pr *PullRequest) []string {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
-			if isFailureConclusion(suite.Conclusion) {
+			// Only a suite that carries NO check runs is reported by its own
+			// suite/app conclusion. A container suite that DOES carry runs must
+			// defer entirely to per-run/verdict classification: the API nests each
+			// superseded (CANCELLED) attempt in its own suite concluded CANCELLED,
+			// and every such suite shares the container app name (e.g. "GitHub
+			// Actions"). Reporting the suite name there manufactures a phantom that
+			// never clears even though the per-name verdict — the newer SUCCESS —
+			// is green (measured 2026-08-25, PR #1531).
+			if isFailureConclusion(suite.Conclusion) && len(suite.CheckRuns.Nodes) == 0 {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
@@ -1082,7 +1090,11 @@ func successfulChecks(pr *PullRequest) []string {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
-			if isSuccessConclusion(suite.Conclusion) {
+			// Mirror of the failingChecks rule: a container suite that carries runs
+			// is not credited by its app name either — a SUCCESS container suite
+			// would otherwise pad SuccessfulChecks with the container name, hiding
+			// a name whose own verdict failed. Defer to per-run classification.
+			if isSuccessConclusion(suite.Conclusion) && len(suite.CheckRuns.Nodes) == 0 {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {

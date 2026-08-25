@@ -1073,6 +1073,67 @@ func TestSnapshot_CancelledBesideSuccessIsNotFailing(t *testing.T) {
 	assert.NotEmpty(t, s.SuccessfulChecks, "the success must still be counted as positive evidence")
 }
 
+func TestSnapshot_CancelledContainerSuiteWithRunsIsNotFailing(t *testing.T) {
+	// Measured 2026-08-25 on PrizmalAi/PrizmalSwitch #1531 (release/prod-7f317b0f7):
+	// ghpr-monitor emitted a whole-session "❌ Failing CI checks" for a genuinely
+	// green PR. The live checkSuites payload nests each SUPERSEDED run in its OWN
+	// suite concluded CANCELLED, and every such suite shares the container app name
+	// "GitHub Actions". The per-name runVerdict logic correctly resolves each name
+	// to its newer SUCCESS verdict, but the suite-level classification
+	// (isFailureConclusion(suite.Conclusion) -> add(suiteName(suite))) fires first on
+	// the app name and never clears — a phantom failure that survives the whole
+	// session. A container suite that actually carries runs must NOT be reported by
+	// its suite/app name; classification defers entirely to per-run verdicts.
+	pr := mkPRWithCheckSuites(
+		// The superseded (cancelled) attempt: its own suite, concluded CANCELLED.
+		CheckSuite{Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "pr-body-format", Status: "COMPLETED", Conclusion: "CANCELLED",
+					StartedAt: "2026-08-25T19:29:50Z", CompletedAt: "2026-08-25T19:29:54Z"},
+			}}},
+		// The newer successful attempt: its own suite, concluded SUCCESS.
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "pr-body-format", Status: "COMPLETED", Conclusion: "SUCCESS",
+					StartedAt: "2026-08-25T19:29:57Z", CompletedAt: "2026-08-25T19:30:14Z"},
+			}}},
+	)
+	s := Snapshot(pr, SnapshotOptions{})
+	assert.NotContains(t, s.FailingChecks, "GitHub Actions", "a CANCELLED container suite that carries runs must not report its app name")
+	assert.NotContains(t, s.FailingChecks, "pr-body-format", "a cancelled-beside-success per-name verdict is NOT a failure")
+	assert.Contains(t, s.SuccessfulChecks, "pr-body-format")
+	assert.True(t, ciAllGreen(s), "a PR whose only CANCELLED suites are superseded attempts beside a SUCCESS is green")
+}
+
+func TestSnapshot_CancelledContainerDiffDoesNotFireNewFailingChecks(t *testing.T) {
+	// End-to-end of the reported symptom (pz orchestrator -> ghpr-monitor, 2026-08-25):
+	// a green PR whose only CANCELLED suites are superseded attempts beside a SUCCESS
+	// must not emit EventNewFailingChecks on a later poll. Build a PR with both the
+	// cancelled and successful attempt, snapshot it, and confirm the same-CI snapshot
+	// on the next poll produces zero failing-check events.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "pr-body-format", Status: "COMPLETED", Conclusion: "CANCELLED",
+					StartedAt: "2026-08-25T19:29:50Z", CompletedAt: "2026-08-25T19:29:54Z"},
+			}}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "pr-body-format", Status: "COMPLETED", Conclusion: "SUCCESS",
+					StartedAt: "2026-08-25T19:29:57Z", CompletedAt: "2026-08-25T19:30:14Z"},
+			}}},
+	)
+	// Two identical consecutive snapshots: the second is the same PR polled again,
+	// which is exactly the state in which the false positive used to fire on every
+	// poll after the cancelled run arrived.
+	first := Snapshot(pr, SnapshotOptions{})
+	second := Snapshot(pr, SnapshotOptions{})
+	events := Diff(first, second)
+	assert.Nil(t, findEvent(events, EventNewFailingChecks), "a PR whose only CANCELLED suites are superseded attempts beside SUCCESS must not re-fire failing-checks")
+	assert.Empty(t, first.FailingChecks)
+	assert.True(t, ciAllGreen(first))
+}
+
 func TestSnapshot_LatestVerdictWinsAmongVerdicts(t *testing.T) {
 	// The second half of the rule, learned the hard way on a live PR: the `review`
 	// check had TWO conclusive runs on one head — success at 02:45, FAILURE at 02:47
