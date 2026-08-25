@@ -117,6 +117,44 @@ func TestHub_SubscribeRef(t *testing.T) {
 	assert.Contains(t, got, "new-commit")
 }
 
+// collectRefBaselineEvents runs a ref watch whose fetch always reports
+// headOID, seeded from baseline (JSON), and returns the event types delivered
+// over one collection window. Shared by the --baseline resume tests.
+func collectRefBaselineEvents(t *testing.T, headOID, baseline string) []string {
+	t.Helper()
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return refFixture(headOID, nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	opts := testHubOpts()
+	opts.Baseline = baseline
+	ch, cancelSub := h.Subscribe(ctx, targetOf(backend.KindRef), opts)
+	t.Cleanup(cancelSub)
+
+	return collect(ch, 100*time.Millisecond)
+}
+
+func TestHub_SubscribeRefRestoresBaseline(t *testing.T) {
+	// A watcher that seeds its baseline from an OID it observed before
+	// starting diffs its first fetch against that OID: a push that landed
+	// between observation and watch start is delivered instead of silently
+	// absorbed.
+	got := collectRefBaselineEvents(t, "bbbbbbb", `{"oid":"aaaaaaa"}`)
+	assert.NotContains(t, got, "first-poll", "a seeded watch is not a first poll")
+	assert.Contains(t, got, "new-commit", "the push since the observed OID must be delivered")
+}
+
+func TestHub_SubscribeRefBaselineCurrent(t *testing.T) {
+	// Baseline equal to the current head: nothing has changed, so the
+	// watch reports nothing rather than replaying state the caller knows.
+	got := collectRefBaselineEvents(t, "bbbbbbb", `{"oid":"bbbbbbb"}`)
+	assert.Empty(t, got, "nothing changed since the baseline: no events")
+}
+
 func TestHub_SubscribeIssue(t *testing.T) {
 	var resp *monitor.IssueQueryResponse
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {

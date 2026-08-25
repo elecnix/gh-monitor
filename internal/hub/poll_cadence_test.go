@@ -130,10 +130,16 @@ func TestPoller_NextDelayWhilePausedIsTheRecheckTick(t *testing.T) {
 func TestPoller_PauseRequiresAHealthyBroker(t *testing.T) {
 	var fetches int64
 	newPausedHub := func() *Hub {
+		// The idle ceiling is capped for this test: without it, fifty
+		// milliseconds of eventless polling back the cadence up to hundreds of
+		// milliseconds, and the fixed observation window below can expire
+		// before the next timer tick lands (a race CI hit intermittently).
+		// A 20ms ceiling keeps every tick inside the window without changing
+		// what the assertions verify.
 		return New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 			atomic.AddInt64(&fetches, 1)
 			return prFixture(nil), nil
-		}, nil, 5*time.Millisecond, nil, WithPauseWhenBrokerHealthy(true))
+		}, nil, 5*time.Millisecond, nil, WithPauseWhenBrokerHealthy(true), WithIdleCeiling(20*time.Millisecond))
 	}
 
 	// No broker transport at all: normal interval polling continues.

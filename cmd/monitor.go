@@ -31,6 +31,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
 	cmd.Flags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
 	cmd.Flags().StringVar(&opts.Ref, "ref", "", "Branch or ref to monitor (CI checks only)")
+	cmd.Flags().StringVar(&opts.Baseline, "baseline", "", "Commit OID observed before starting a --ref watch; the first poll diffs against it instead of going silent")
 	cmd.Flags().StringVar(&opts.Commit, "commit", "", "Commit SHA to monitor (CI checks only)")
 	cmd.Flags().IntVar(&opts.Issue, "issue", 0, "Issue number to monitor")
 	cmd.Flags().IntVar(&opts.RunID, "run-id", 0, "GitHub Actions workflow run id to monitor (watches a single run until it completes)")
@@ -52,6 +53,7 @@ type monitorOptions struct {
 	Repo          string
 	Pull          int
 	Ref           string
+	Baseline      string
 	Commit        string
 	Issue         int
 	RunID         int
@@ -78,6 +80,18 @@ func (o *monitorOptions) Validate() error {
 	}
 
 	// Count how many target kinds are specified.
+	// --baseline seeds a ref watch with an explicitly observed commit OID. It
+	// only makes sense for ref targets, and it must not be combined with a
+	// named instance: the stored cursor already carries a baseline, and two
+	// sources of truth for "what was last seen" reintroduce the race --baseline
+	// exists to close. These checks come first so --baseline never silently
+	// reroutes into another watch mode.
+	if strings.TrimSpace(o.Baseline) != "" && o.Ref == "" {
+		return errors.New("--baseline requires --ref")
+	}
+	if strings.TrimSpace(o.Baseline) != "" && o.Instance != "" {
+		return errors.New("--baseline cannot be combined with --instance: the stored cursor already provides the baseline")
+	}
 	targets := 0
 	if o.Selector != "" || o.Pull > 0 {
 		targets++
@@ -151,6 +165,25 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// --baseline: the caller observed a commit OID before starting this watch
+	// and passes it explicitly (re-deriving it at watch time would reopen the
+	// race). Resolve it through GitHub now so a short SHA expands to the exact
+	// full form ref polls report, check state at observation is captured, and
+	// a typo'd or inaccessible SHA fails loudly instead of silently never
+	// matching. The resolved snapshot seeds the watch's baseline below.
+	seededBaseline := ""
+	if strings.TrimSpace(opts.Baseline) != "" {
+		status, err := monitor.ResolveRefBaseline(apiClientFactory(os.Getenv("GH_HOST")), identity.Owner, identity.Repo, opts.Baseline)
+		if err != nil {
+			return err
+		}
+		b, err := json.Marshal(status)
+		if err != nil {
+			return fmt.Errorf("--baseline: encode status: %w", err)
+		}
+		seededBaseline = string(b)
 	}
 
 	p, err := prefs.Load("")
@@ -351,6 +384,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		AnnotationLevels: runOpts.AnnotationLevels.Names(),
 		Baseline:         cursorSnapshot,
 		ResumeID:         resumeID,
+	}
+	if seededBaseline != "" {
+		watchOpts.Baseline = seededBaseline
 	}
 	// A named repo instance with no cursor yet starts at "now" (issue #32):
 	// the daemon polls on the far side of the wire, so the client computes

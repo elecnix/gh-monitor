@@ -55,16 +55,16 @@ type RulesetListResponse []struct {
 
 // RulesetResponse is the minimal envelope for GET /repos/{owner}/{repo}/rulesets/{id}.
 type RulesetResponse struct {
-	ID     int            `json:"id"`
-	Name   string         `json:"name"`
-	Rules  []RulesetRule  `json:"rules"`
-	Target string         `json:"target"`
+	ID     int           `json:"id"`
+	Name   string        `json:"name"`
+	Rules  []RulesetRule `json:"rules"`
+	Target string        `json:"target"`
 }
 
 // RulesetRule is one rule inside a ruleset.
 type RulesetRule struct {
-	Type       string              `json:"type"`
-	Parameters *RulesetParameters  `json:"parameters,omitempty"`
+	Type       string             `json:"type"`
+	Parameters *RulesetParameters `json:"parameters,omitempty"`
 }
 
 // RulesetParameters holds the required_status_checks contexts.
@@ -74,7 +74,7 @@ type RulesetParameters struct {
 
 // RequiredStatusCheck is one required status context from a ruleset.
 type RequiredStatusCheck struct {
-	Context        string `json:"context"`
+	Context       string `json:"context"`
 	IntegrationID int    `json:"integration_id"`
 }
 
@@ -90,9 +90,9 @@ type RulesetChecks struct {
 // FetchRequiredChecks reads the branch ruleset for the repository and returns
 // the required status check context names. It handles three cases:
 //
-//	1. No rulesets at all                     → Contexts=nil, Error=""
-//	2. A ruleset with required_status_checks  → Contexts filled
-//	3. The ruleset API returns 403/404        → Contexts=nil, Error="ruleset not readable"
+//  1. No rulesets at all                     → Contexts=nil, Error=""
+//  2. A ruleset with required_status_checks  → Contexts filled
+//  3. The ruleset API returns 403/404        → Contexts=nil, Error="ruleset not readable"
 //
 // Case 3 is critical: a ruleset you cannot read must degrade loudly, never
 // silently become "nothing is required" — that would reproduce the exact bug
@@ -135,8 +135,8 @@ func (s *Service) FetchRequiredChecks(owner, repo string) (*RulesetChecks, error
 type RateLimitResource struct {
 	Limit     int    `json:"limit"`
 	Remaining int    `json:"remaining"`
-	Reset     int64  `json:"reset"`      // Unix epoch seconds
-	ResetAt   string `json:"-"`          // ISO 8601 derived from Reset
+	Reset     int64  `json:"reset"` // Unix epoch seconds
+	ResetAt   string `json:"-"`     // ISO 8601 derived from Reset
 }
 
 // RateLimitResponse is the parsed response from GET /rate_limit.
@@ -877,7 +877,7 @@ func runVerdict(runs []CheckRun) (CheckRun, bool) {
 		}
 		t, err := time.Parse(time.RFC3339, r.CompletedAt)
 		if err != nil {
-			t = time.Time{}   // unparseable cannot prove it is newer
+			t = time.Time{} // unparseable cannot prove it is newer
 		}
 		if !found || t.After(bestT) {
 			best = *r
@@ -1334,6 +1334,44 @@ func SnapshotCommit(c *CommitObject) *RefStatus {
 	target.Target.CheckSuites = c.CheckSuites
 	target.Target.Status = c.Status
 	return SnapshotRef(&target)
+}
+
+// isCommitOID reports whether s looks like a git commit OID: 7–40 hex
+// characters. Seven is a plausible short SHA; forty is the full form.
+func isCommitOID(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for _, r := range s {
+		isHex := false
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+			isHex = true
+		}
+		if !isHex {
+			return false
+		}
+	}
+	return true
+}
+
+// ResolveRefBaseline turns a caller-supplied commit OID — one the caller
+// observed directly, never one re-derived at watch time — into the JSON-ready
+// RefStatus that seeds a ref watch's baseline (the --baseline flag). The OID
+// is resolved through GitHub so a short SHA expands to the exact full form the
+// API reports, check state at observation time is captured, and a typo'd or
+// inaccessible SHA fails loudly instead of silently never matching.
+func ResolveRefBaseline(api ghcli.API, owner, repo, raw string) (*RefStatus, error) {
+	oid := strings.TrimSpace(raw)
+	if !isCommitOID(oid) {
+		return nil, fmt.Errorf("--baseline %q is not a valid commit OID (expected 7-40 hex characters); pass the full or short SHA you observed", raw)
+	}
+	svc := &Service{API: api}
+	resp, err := svc.FetchCommit(owner, repo, oid)
+	if err != nil {
+		return nil, fmt.Errorf("--baseline: %w", err)
+	}
+	return SnapshotCommit(resp.Repository.Object), nil
 }
 
 // commitChecks extracts check names from check suites and status contexts

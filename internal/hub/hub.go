@@ -757,9 +757,12 @@ func repoDistill(t backend.Target, opts backend.WatchOptions) func(any, monitor.
 }
 
 // refCommitConsumer builds the diff engine shared by ref and commit targets:
-// both distill to a RefStatus and diff with the same rules.
-func refCommitConsumer(_ *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
-	return newHandle(monitor.NewRefConsumer(ro), "")
+// both distill to a RefStatus and diff with the same rules. A caller-supplied
+// baseline (WatchOptions.Baseline — e.g. the --baseline OID an agent observed
+// before starting the watch) seeds it, so the first fetch diffs against that
+// observation instead of going silent.
+func refCommitConsumer(_ *Hub, ro monitor.RunOptions, opts backend.WatchOptions) consumerHandle {
+	return newHandle(monitor.NewRefConsumer(ro), opts.Baseline)
 }
 
 // repoConsumerHandle builds the diff engine for a repository watch.
