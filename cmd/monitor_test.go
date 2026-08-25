@@ -426,34 +426,25 @@ func TestMonitorRefWithRepo(t *testing.T) {
 	assert.Contains(t, stdout.String(), "first-poll")
 }
 
+// cleanTarget is the commit payload body shared by the ref and --baseline
+// fixtures (clean: no failing checks).
+func cleanTarget(oid string) obj {
+	return obj{
+		"oid":             oid,
+		"messageHeadline": "fix: stuff",
+		"authors":         obj{"nodes": []interface{}{}},
+		"checkSuites":     obj{"nodes": []interface{}{}},
+	}
+}
+
 // baselineRefFixture is a clean (no failing checks) ref payload for --baseline tests.
 func baselineRefFixture(oid string) obj {
-	return obj{
-		"repository": obj{
-			"ref": obj{
-				"target": obj{
-					"oid":             oid,
-					"messageHeadline": "fix: stuff",
-					"authors":         obj{"nodes": []interface{}{}},
-					"checkSuites":     obj{"nodes": []interface{}{}},
-				},
-			},
-		},
-	}
+	return obj{"repository": obj{"ref": obj{"target": cleanTarget(oid)}}}
 }
 
 // baselineCommitFixture is the commit payload answering the --baseline OID lookup.
 func baselineCommitFixture(oid string) obj {
-	return obj{
-		"repository": obj{
-			"object": obj{
-				"oid":             oid,
-				"messageHeadline": "fix: stuff",
-				"authors":         obj{"nodes": []interface{}{}},
-				"checkSuites":     obj{"nodes": []interface{}{}},
-			},
-		},
-	}
+	return obj{"repository": obj{"object": cleanTarget(oid)}}
 }
 
 const baselineObservedOID = "aaaaaaabbbbccccdddd00000000000000000000"
