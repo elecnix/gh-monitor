@@ -98,6 +98,70 @@ func TestMonitorOnceTextMode(t *testing.T) {
 	assert.Contains(t, out, ": build")
 }
 
+// TestMonitorOnceNamedInstancePersistsCursor is the regression test for the
+// broker-replay flood (measured 2026-08-24: a fixed set of long-merged PRs
+// re-arrived as "new" every ~5min for hours). A named `--once` instance is
+// the SCHEDULED event-driven read: each tick is one fetch, and a per-instance
+// cursor must make it a DELTA against the last tick, not a full replay. The
+// first tick against an empty baseline surfaces pre-existing issues; the
+// second tick against the same payload must emit NOTHING (the cursor was
+// persisted); a genuinely-new transition on the third tick must emit ONLY
+// that transition, never the already-reported backlog.
+func TestMonitorOnceNamedInstancePersistsCursor(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+
+	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		return assignJSON(result, openPRWithFailingCheck())
+	}}
+	apiClientFactory = func(string) ghcli.API { return fake }
+
+	args := []string{"7", "-R", "o/r", "--once", "--instance", "fleet-pr-7",
+		"--events", "new-failing-checks,merged,review-approved"}
+
+	run := func() []string {
+		root := newRootCommand()
+		stdout := &bytes.Buffer{}
+		root.SetOut(stdout)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		require.NoError(t, root.Execute())
+		var types []string
+		for _, ln := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+			if ln == "" {
+				continue
+			}
+			var n map[string]interface{}
+			require.NoError(t, json.Unmarshal([]byte(ln), &n), "line not valid json: %s", ln)
+			types = append(types, n["type"].(string))
+		}
+		return types
+	}
+
+	// Tick 1: empty baseline — the pre-existing failing check surfaces.
+	first := run()
+	assert.Contains(t, first, "new-failing-checks", "first tick against an empty baseline must surface pre-existing issues")
+
+	// Tick 2: the payload is unchanged — the persisted cursor must suppress
+	// the entire backlog. This is the replay flood, fixed.
+	second := run()
+	assert.Empty(t, second, "an unchanged payload on the next tick must NOT re-emit what was already delivered")
+
+	// Tick 3: a genuinely-new transition (merged) — only THAT event arrives,
+	// never the stale failing-check backlog.
+	fake.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
+		merged := openPRWithFailingCheck()
+		pr := merged["repository"].(obj)["pullRequest"].(obj)
+		pr["state"] = "MERGED"
+		pr["merged"] = true
+		return assignJSON(result, merged)
+	}
+	third := run()
+	assert.Equal(t, []string{"merged"}, third, "a new transition must emit ONLY that transition, never the already-reported backlog")
+}
+
 func TestMonitorRequiresPR(t *testing.T) {
 	// --repo alone is now valid for repo monitoring, but a bare command with no
 	// flags at all still requires a PR number or other target.

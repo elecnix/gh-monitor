@@ -50,13 +50,19 @@ func TestLauncherChildEnvReachesTheChild(t *testing.T) {
 			return append(os.Environ(), "GH_MONITOR_TEST_MARKER=private-socket")
 		},
 		// The child exits immediately (a clean exit under StableRun counts
-		// as a rapid failure), so one attempt and give-up keeps the test fast.
+		// as a rapid failure), so the supervisor settles into its slow-retry
+		// loop; cancel the context once the first attempt has run to end it.
 		MinBackoff:    time.Millisecond,
 		MaxBackoff:    time.Millisecond,
 		MaxRapidFails: 1,
 		Sleep:         func(time.Duration) {},
 	}
-	_ = l.Run(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	_ = l.Run(ctx)
 
 	if !strings.Contains(out.String(), "MARK=private-socket") {
 		t.Fatalf("child did not see the hook's environment; output:\n%s", out.String())
