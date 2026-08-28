@@ -16,9 +16,11 @@ const ackReaction = "eyes"
 
 // notifier acknowledges one reactable GitHub node with a reaction. It is the
 // seam the monitor loop's eyes-on-notify hook calls through; the production
-// implementation delegates to the registry's ReactionActor.
+// implementation delegates to the registry's ReactionActor. The context is
+// the watch's own: a cancelled watch cancels in-flight reactions instead of
+// leaving them unbounded on the update loop.
 type notifier interface {
-	Ack(nodeID, reaction string) error
+	Ack(ctx context.Context, nodeID, reaction string) error
 }
 
 // reactionNotifier adapts a backend Registry's ReactionsFor capability to the
@@ -29,12 +31,12 @@ type reactionNotifier struct {
 	target  backend.Target
 }
 
-func (r *reactionNotifier) Ack(nodeID, reaction string) error {
+func (r *reactionNotifier) Ack(ctx context.Context, nodeID, reaction string) error {
 	actor, err := r.reactFn()
 	if err != nil {
 		return err
 	}
-	return actor.React(context.TODO(), r.target, nodeID, reaction)
+	return actor.React(ctx, r.target, nodeID, reaction)
 }
 
 // ackNodeIDs returns the reactable comment node IDs a delivered update is
@@ -68,9 +70,9 @@ func ackNodeIDs(ev backend.Event) []string {
 // ackOnDeliver reacts to every comment a delivered update is about: one
 // reaction per node, failures logged not fatal. A failure costs one stderr
 // line and the watch continues — a degraded ack beats a lost notification.
-func ackOnDeliver(n notifier, ev backend.Event, errOut io.Writer) {
+func ackOnDeliver(ctx context.Context, n notifier, ev backend.Event, errOut io.Writer) {
 	for _, id := range ackNodeIDs(ev) {
-		if err := n.Ack(id, ackReaction); err != nil {
+		if err := n.Ack(ctx, id, ackReaction); err != nil {
 			_, _ = fmt.Fprintf(errOut,
 				"gh-monitor: eyes-on-notify reaction failed for %s (%v); continuing\n", id, err)
 		}

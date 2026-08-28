@@ -344,7 +344,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	var ack notifier
 	ackEmit := func(ev backend.Event) {
 		if ack != nil && (eventFilter == nil || eventFilter.Allows(string(ev.Type))) {
-			ackOnDeliver(ack, ev, cmd.ErrOrStderr())
+			ackOnDeliver(ctx, ack, ev, cmd.ErrOrStderr())
 		}
 	}
 
