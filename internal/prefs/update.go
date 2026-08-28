@@ -32,6 +32,10 @@ import (
 //   - "pollWhenBrokerHealthy": bool (issue #90, default true). false suspends
 //     the daemon's timer-driven fetching while the broker wake path reports
 //     healthy; a degrade resumes polling immediately. Null resets to true.
+//   - "reactOnNotify": bool (default true). The watch client adds a 👀
+//     reaction to every comment a delivered notification is about. false
+//     turns it off; null resets it to the default and removes it from the
+//     file. Absent leaves it untouched.
 //
 // Unknown top-level keys are rejected so callers notice typos. An empty object
 // ("{}") is a no-op: it returns the current effective preferences without
