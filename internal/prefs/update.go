@@ -149,6 +149,17 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.PollWhenBrokerHealthy = &b
 			}
+		case "reactOnNotify":
+			if string(v) == "null" {
+				stored.ReactOnNotify = nil
+			} else {
+				var b bool
+				if err := json.Unmarshal(v, &b); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse reactOnNotify: %w (use true or false; null resets to the default)", err)
+				}
+				stored.ReactOnNotify = &b
+			}
 		case "eventLog":
 			if string(v) == "null" {
 				stored.EventLog = nil
@@ -164,7 +175,7 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				stored.EventLog = &cfg
 			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, eventLog)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, reactOnNotify, eventLog)", key)
 		}
 	}
 
@@ -265,6 +276,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.PollWhenBrokerHealthy != nil {
 		prefs.PollWhenBrokerHealthy = *stored.PollWhenBrokerHealthy
+	}
+	if stored.ReactOnNotify != nil {
+		prefs.ReactOnNotify = *stored.ReactOnNotify
 	}
 	if stored.EventLog != nil {
 		prefs.EventLog = stored.EventLog
