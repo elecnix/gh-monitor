@@ -409,7 +409,7 @@ gh monitor prefs set '{"pollInterval": "10m", "idlePollCeiling": "6h", "pollWhen
 
 - `pollInterval` — the poller's base cadence, overriding `--interval`. A Go duration (`"10m"`), or `""`/`"0"`/`"false"` to keep the flag/built-in default (5 minutes as of [#90](https://github.com/elecnix/gh-monitor/issues/90)). This governs busy targets and the first few no-change polls.
 - `idlePollCeiling` — caps the exponential idle backoff for every target, busy or quiet, broker-healthy or not, replacing the built-in 300s ceiling. A Go duration (`"6h"`).
-- `pollWhenBrokerHealthy` — default `true`. Set to `false` and timer-driven fetching suspends entirely while the broker wake path reports healthy; the moment the broker degrades, every subscriber gets a loud `degraded` notice and an immediate fetch resumes (the transition itself wakes every poller). Requires the broker transport below.
+- `pollWhenBrokerHealthy` — default `true`. Set to `false` and timer-driven fetching suspends for the repositories the broker has actually been delivering events for; the moment the broker degrades, every subscriber gets a loud `degraded` notice and an immediate fetch resumes (the transition itself wakes every poller). Repositories the broker does not carry keep polling on the normal cadence regardless — see [broker coverage](#broker-coverage-is-per-repository). Requires the broker transport below.
 
 All three are global-only settings beside `selfUpdate`, read at daemon start; invalid values are rejected at set time. `gh monitor prefs set` says so when a daemon-read key changes, and `gh monitor reload` applies the change immediately: it swaps in a successor daemon through the same in-memory handoff an upgrade uses, so watched targets, poller state, and connected watchers carry across — a reload, not a cold restart.
 
@@ -446,6 +446,7 @@ export GH_MONITOR_BROKER_ENDPOINT=your-iot-endpoint.iot.us-east-1.amazonaws.com
 export GH_MONITOR_BROKER_TOPIC=github/+/+/+       # default; narrow to your org/repo if your broker's IAM policy is scoped
 export GH_MONITOR_BROKER_REGION=us-east-1         # default
 export GH_MONITOR_BROKER_IDLE_CAP=1800            # seconds; default 1800 (30m)
+export GH_MONITOR_BROKER_COVERAGE_TTL=21600       # seconds; default 21600 (6h) — see broker coverage below
 
 gh monitor daemon
 ```
@@ -465,6 +466,21 @@ The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an a
 **Health is loud, on purpose.** While the broker is connected, a quiet PR's idle-poll ceiling stretches from the default 300s up to `GH_MONITOR_BROKER_IDLE_CAP` — polling becomes a rare safety net because a real change now arrives as an immediate wake. The moment the connection drops, every subscriber gets a `degraded`-type notification and the ceiling reverts to the default within one poll cycle — normal interval polling, not silence. A subscriber that only ever reads "no event arrived" as "nothing changed" would be trading tonight's failure mode for a new transport instead of fixing it, so this transport is built to make that impossible: by default it always keeps polling underneath, just less often when the broker is doing its job. With `pollWhenBrokerHealthy: false` in preferences (see [Poll cadence](#poll-cadence)), that default becomes stricter still: while the wake path is live there is no timer polling at all, and polling returns the instant the transport degrades.
 
 An event that names a repository but no `pr_number` (check-run/check-suite events, which key off a commit SHA rather than a PR) wakes every PR this daemon is currently watching for that repository, rather than guessing which one changed.
+
+##### Broker coverage is per-repository
+
+**A connected broker does not mean every repository is covered.** One connection carries whichever repositories your webhooks publish to it, so if your webhook is installed on one organisation, watches on repositories outside it have no wake path at all — however healthy the socket looks. Reducing or suspending their polling on the strength of the connection alone would leave them with neither a wake nor a poll, which is the failure this transport exists to prevent, not to relocate.
+
+The daemon therefore tracks coverage per repository, from positive evidence only: **a repository counts as covered once an event for it has actually been delivered here**, and stays covered until `GH_MONITOR_BROKER_COVERAGE_TTL` passes with no further event. Only covered repositories get the extended idle ceiling or the `pollWhenBrokerHealthy: false` pause. Everything else keeps polling normally.
+
+Two consequences worth expecting:
+
+- **A freshly started daemon polls everything normally** until events arrive, because a restart starts with no evidence. Coverage re-establishes itself on the first event per repository, which is also when polling would otherwise be most expensive — a dead-quiet repository is already at the cheap end of its backoff curve, so little is lost.
+- **Coverage expires.** A webhook removed from a repository stops producing evidence, and that repository is back on the normal cadence within a TTL rather than muted forever on the strength of last week's event. The daemon logs one line per repository the first time it sees coverage, so `journalctl`/stderr tells you which repositories the wake path has taken over — and by omission, which are still being polled.
+
+The subscription filter (`GH_MONITOR_BROKER_TOPIC`) deliberately plays no part in this. It says which events the broker is _willing_ to forward, never whether any are being _produced_, so it cannot tell a repository with a webhook apart from one without.
+
+One caveat this design does not close: coverage is per repository, not per event type. A webhook configured to deliver only some events (say `push` but not `pull_request_review`) still reads as covered. On the default `pollWhenBrokerHealthy: true` the safety-net poll absorbs that gap; set it to `false` and you are trusting your webhook's event selection to be complete.
 
 #### Sub-daemons (optional)
 
