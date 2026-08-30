@@ -41,8 +41,11 @@ type Coverage struct {
 	// now is the clock, a field so tests can drive TTL decay without sleeping.
 	now func() time.Time
 
-	mu   sync.RWMutex
-	seen map[string]time.Time
+	mu sync.RWMutex
+	// seen maps "owner/repo" to the last event delivered for it. lastPrune
+	// rate-limits the sweep that keeps the map bounded — see pruneLocked.
+	seen      map[string]time.Time
+	lastPrune time.Time
 }
 
 // envCoverageTTL names the environment variable CoverageTTLFromEnv reads.
@@ -96,7 +99,7 @@ func (c *Coverage) Note(owner, repo string) bool {
 	defer c.mu.Unlock()
 	last, ok := c.seen[key]
 	c.seen[key] = now
-	if len(c.seen) > pruneAbove {
+	if len(c.seen) > pruneAbove && now.Sub(c.lastPrune) >= pruneInterval {
 		c.pruneLocked(now)
 	}
 	return !ok || now.Sub(last) >= c.ttl
@@ -110,10 +113,17 @@ func (c *Coverage) Note(owner, repo string) bool {
 // path of a daemon watching a handful of repositories.
 const pruneAbove = 1024
 
+// pruneInterval rate-limits the sweep. Without it, a daemon whose live working
+// set genuinely exceeds pruneAbove would scan the whole map on every single
+// event and find nothing to drop, turning a safeguard against slow growth into
+// a per-event cost exactly where event volume is highest.
+const pruneInterval = time.Minute
+
 // pruneLocked drops observations that have already lapsed. Called with c.mu
 // held. Dropping a lapsed entry is not a behaviour change: Covers already
 // reports false for it, and a later event simply re-establishes coverage.
 func (c *Coverage) pruneLocked(now time.Time) {
+	c.lastPrune = now
 	for k, seen := range c.seen {
 		if now.Sub(seen) >= c.ttl {
 			delete(c.seen, k)
@@ -134,10 +144,10 @@ func (c *Coverage) Covers(owner, repo string) bool {
 	return ok && c.now().Sub(last) < c.ttl
 }
 
-// coverageKey normalises owner/repo the way GitHub treats them: case
-// -insensitively. Events and watches routinely disagree on casing, and a
-// case-sensitive key would leave a watch polling forever while its own
-// events arrived under a different spelling.
+// coverageKey normalises owner/repo the way GitHub itself does, ignoring case.
+// Events and watches routinely disagree on casing, and a case-sensitive key
+// would leave a watch polling forever while its own events arrived under a
+// different spelling.
 func coverageKey(owner, repo string) string {
 	return strings.ToLower(owner) + "/" + strings.ToLower(repo)
 }
