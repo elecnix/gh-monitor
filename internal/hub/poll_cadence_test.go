@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -57,16 +58,23 @@ func TestPoller_NextDelayHonoursConfiguredIdleCeiling(t *testing.T) {
 // loss. A degrade must resume polling promptly: the first post-degrade fetch
 // happens on the transition itself (a loud wake to every poller), not at
 // some stale timer tick computed while the transport still looked up.
+//
+// The idle ceiling is deliberately capped at 20ms: with a ceiling of hours,
+// an unpaused poller backs off past the observation window within the first
+// collect and then makes no requests either way, so the assertion would hold
+// just as well against a broken pause. A short ceiling keeps ticks landing
+// inside the window, which is what makes their absence mean something.
 func TestPoller_PausesTimerFetchWhileBrokerHealthy(t *testing.T) {
 	var fetches int64
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		atomic.AddInt64(&fetches, 1)
 		return prFixture(nil), nil
 	}, nil, 5*time.Millisecond, nil,
-		WithPauseWhenBrokerHealthy(true), WithIdleCeiling(time.Hour))
+		WithPauseWhenBrokerHealthy(true), WithIdleCeiling(20*time.Millisecond))
 	t.Cleanup(h.Stop)
 
 	h.SetBrokerIdleCap(30 * time.Minute)
+	h.SetBrokerCoverage(coverAll{})
 	h.SetBrokerHealth(true, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -103,6 +111,7 @@ func TestPoller_NextDelayWhilePausedIsTheRecheckTick(t *testing.T) {
 	t.Cleanup(h.Stop)
 
 	h.SetBrokerIdleCap(6 * time.Hour)
+	h.SetBrokerCoverage(coverAll{})
 	h.SetBrokerHealth(true, "")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -155,4 +164,145 @@ func TestPoller_PauseRequiresAHealthyBroker(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 	assert.Greater(t, atomic.LoadInt64(&fetches), noBroker,
 		"with no broker configured, enabling the pause preference must not stop timer polling")
+}
+
+// coverOnly is a BrokerCoverage oracle reporting exactly the listed
+// "owner/repo" keys covered — the shape of a real deployment where a webhook
+// exists on one organisation's repositories and nowhere else.
+type coverOnly map[string]bool
+
+func (c coverOnly) Covers(owner, repo string) bool { return c[owner+"/"+repo] }
+
+// coverAll reports every repository covered. Tests use it when they mean to
+// exercise health-driven cadence and not coverage itself.
+type coverAll struct{}
+
+func (coverAll) Covers(string, string) bool { return true }
+
+// hubTarget builds a PR target for an arbitrary repository, so a test can run
+// two pollers whose only difference is whether the broker covers them.
+func hubTarget(owner, repo string, number int) backend.Target {
+	return backend.Target{Kind: backend.KindPR, Owner: owner, Repo: repo, Number: number, Host: "github.com"}
+}
+
+// pollerFor returns the poller watching owner/repo.
+func pollerFor(h *Hub, owner, repo string) *poller {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, p := range h.pollers {
+		if k.owner == owner && k.repo == repo {
+			return p
+		}
+	}
+	return nil
+}
+
+// TestPoller_PauseIsScopedToCoveredRepositories is the regression test for
+// the bug that motivated coverage at all: pollWhenBrokerHealthy: false used
+// to consult one hub-wide health flag, so a single connected broker silenced
+// timer polling for *every* watched repository — including repositories no
+// webhook published for, which then had neither a wake path nor a poll and
+// went quietly blind. Health is a property of the transport; coverage is a
+// property of the repository, and only the latter may license skipping a poll.
+func TestPoller_PauseIsScopedToCoveredRepositories(t *testing.T) {
+	var covered, uncovered int64
+	h := New(func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (any, error) {
+		if id.Owner == "prizmal-ai" {
+			atomic.AddInt64(&covered, 1)
+		} else {
+			atomic.AddInt64(&uncovered, 1)
+		}
+		return prFixture(nil), nil
+	}, nil, 5*time.Millisecond, nil,
+		WithPauseWhenBrokerHealthy(true), WithIdleCeiling(20*time.Millisecond))
+	t.Cleanup(h.Stop)
+
+	h.SetBrokerIdleCap(30 * time.Minute)
+	h.SetBrokerCoverage(coverOnly{"prizmal-ai/switch": true})
+	h.SetBrokerHealth(true, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	chCovered, cancelCovered := h.SubscribePR(ctx, hubTarget("prizmal-ai", "switch", 7), testHubOpts())
+	t.Cleanup(cancelCovered)
+	chOther, cancelOther := h.SubscribePR(ctx, hubTarget("elecnix", "pi-agent-identity", 3), testHubOpts())
+	t.Cleanup(cancelOther)
+	_ = collect(chCovered, 50*time.Millisecond)
+	_ = collect(chOther, 50*time.Millisecond)
+
+	baseCovered, baseUncovered := atomic.LoadInt64(&covered), atomic.LoadInt64(&uncovered)
+	time.Sleep(40 * time.Millisecond) // many base intervals' worth of ticks
+
+	assert.LessOrEqual(t, atomic.LoadInt64(&covered)-baseCovered, int64(1),
+		"a repository the broker demonstrably covers must stop being timer-polled")
+	assert.Greater(t, atomic.LoadInt64(&uncovered), baseUncovered,
+		"a repository the broker does not cover must keep being polled — a healthy transport it never publishes to is not a wake path for it")
+}
+
+// TestPoller_PauseRequiresACoverageOracle keeps the safe default when the hub
+// is told a broker is healthy but nothing ever says what it covers. Unknown
+// coverage must read as "covers nothing", because the alternative reads a
+// silent transport as a working one.
+func TestPoller_PauseRequiresACoverageOracle(t *testing.T) {
+	var fetches int64
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		atomic.AddInt64(&fetches, 1)
+		return prFixture(nil), nil
+	}, nil, 5*time.Millisecond, nil,
+		WithPauseWhenBrokerHealthy(true), WithIdleCeiling(20*time.Millisecond))
+	t.Cleanup(h.Stop)
+
+	h.SetBrokerHealth(true, "") // healthy, but no coverage was ever installed
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 50*time.Millisecond)
+
+	base := atomic.LoadInt64(&fetches)
+	time.Sleep(40 * time.Millisecond)
+	assert.Greater(t, atomic.LoadInt64(&fetches), base,
+		"a healthy broker with no known coverage must not suppress polling for anything")
+}
+
+// TestPoller_ExtendedIdleCapIsScopedToCoveredRepositories pins the same
+// scoping on the milder lever. Even on the default pollWhenBrokerHealthy:
+// true, a connected broker used to stretch every watched repository's idle
+// ceiling to the broker cap — so an uncovered repo silently went from a 300s
+// worst case to a 30-minute one on the strength of a wake path that would
+// never fire for it.
+func TestPoller_ExtendedIdleCapIsScopedToCoveredRepositories(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, 60*time.Second, nil)
+	t.Cleanup(h.Stop)
+
+	h.SetBrokerIdleCap(2 * time.Hour)
+	h.SetBrokerCoverage(coverOnly{"prizmal-ai/switch": true})
+	h.SetBrokerHealth(true, "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	chCovered, cancelCovered := h.SubscribePR(ctx, hubTarget("prizmal-ai", "switch", 7), testHubOpts())
+	t.Cleanup(cancelCovered)
+	chOther, cancelOther := h.SubscribePR(ctx, hubTarget("elecnix", "pi-agent-identity", 3), testHubOpts())
+	t.Cleanup(cancelOther)
+	_ = collect(chCovered, 50*time.Millisecond)
+	_ = collect(chOther, 50*time.Millisecond)
+
+	deepIdle := func(p *poller) {
+		require.NotNil(t, p)
+		p.mu.Lock()
+		p.noChange = 20
+		p.mu.Unlock()
+	}
+	pCovered, pOther := pollerFor(h, "prizmal-ai", "switch"), pollerFor(h, "elecnix", "pi-agent-identity")
+	deepIdle(pCovered)
+	deepIdle(pOther)
+
+	assert.Greater(t, pCovered.nextDelay(), 2*monitor.MaxIdleInterval,
+		"a covered repository may stretch to the broker's extended idle cap")
+	assert.LessOrEqual(t, pOther.nextDelay(), 2*monitor.MaxIdleInterval,
+		"an uncovered repository must keep the normal ceiling — no wake path will shorten its blind window")
 }

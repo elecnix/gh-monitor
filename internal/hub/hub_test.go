@@ -577,8 +577,10 @@ func TestHub_BrokerHealthy_ReflectsLastSetState(t *testing.T) {
 // TestPoller_NextDelayHonoursBrokerExtendedCap is the mechanism-level "prove
 // it actually reduces polling" test: at the same noChange count (the same
 // point in a quiet PR's backoff curve), nextDelay must return a strictly
-// longer wait once the broker reports healthy with an extended idle cap
-// configured than it does with no broker wired at all. A longer wait between
+// longer wait once the broker reports healthy *and covers this repository*
+// with an extended idle cap configured than it does with no broker wired at
+// all. Scoping the extension to covered repositories is verified separately in
+// TestPoller_ExtendedIdleCapIsScopedToCoveredRepositories. A longer wait between
 // fetches is, by construction, fewer fetches over any fixed window — the
 // exact arithmetic (how many fewer, over a realistic window) is measured
 // separately in internal/monitor's IdleIntervalCapped tests, which don't
@@ -615,6 +617,7 @@ func TestPoller_NextDelayHonoursBrokerExtendedCap(t *testing.T) {
 		"with no broker configured, nextDelay must stay within the default ceiling (plus jitter)")
 
 	h.SetBrokerIdleCap(2 * time.Hour)
+	h.SetBrokerCoverage(coverAll{})
 	h.SetBrokerHealth(true, "")
 	withBroker := p.nextDelay()
 
@@ -636,6 +639,7 @@ func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
 	t.Cleanup(h.Stop)
 
 	h.SetBrokerIdleCap(time.Hour) // deliberately huge: a bug that keeps using it would starve the test
+	h.SetBrokerCoverage(coverAll{})
 	h.SetBrokerHealth(true, "")
 
 	ctx, cancel := context.WithCancel(context.Background())

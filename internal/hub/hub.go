@@ -77,11 +77,14 @@ func WithIdleCeiling(ceiling time.Duration) Option {
 }
 
 // WithPauseWhenBrokerHealthy arms pollWhenBrokerHealthy: false (issue #90).
-// While set and the broker transport reports healthy, timer-driven fetching
-// suspends entirely — scheduled API spend exists only as insurance against
-// event loss. A degrade resumes polling immediately (SetBrokerHealth wakes
-// every poller on the transition), and while paused the timer still ticks at
-// roughly the base interval so a missed transition is noticed within one tick.
+// While set, timer-driven fetching suspends for the repositories the broker
+// demonstrably covers — scheduled API spend exists only as insurance against
+// event loss, and a repository with a live wake path needs none. Repositories
+// the broker does not cover keep polling normally; see BrokerCoverage for why
+// health alone may not speak for them. A degrade resumes polling immediately
+// (SetBrokerHealth wakes every poller on the transition), and while paused the
+// timer still ticks at roughly the base interval so a missed transition — or a
+// lapse in coverage — is noticed within one tick.
 func WithPauseWhenBrokerHealthy(pause bool) Option {
 	return func(h *Hub) { h.pauseWhenBrokerHealthy = pause }
 }
@@ -112,6 +115,27 @@ type Hub struct {
 	brokerMu      sync.RWMutex
 	brokerHealthy bool
 	brokerIdleCap time.Duration // 0 = broker integration not enabled
+	// brokerCoverage answers which repositories the wake path actually
+	// reaches. nil means "unknown", which covers nothing — see brokerCovers.
+	brokerCoverage BrokerCoverage
+}
+
+// BrokerCoverage reports whether changes to a given repository actually reach
+// this daemon through the broker's wake path.
+//
+// It exists because broker health and broker coverage are different facts and
+// only the second one licenses skipping a poll. One connected socket carries
+// many repositories' events, and being connected says nothing about which
+// repositories publish to it: an org-scoped webhook feeding the broker leaves
+// every repository outside that org with no wake path at all, however healthy
+// the transport looks. Suppressing those repositories' polling on the strength
+// of the connection alone would leave them with neither path — the exact
+// "absence read as success" failure the broker transport exists to prevent.
+//
+// Implementations must be safe for concurrent use. See broker.Coverage for the
+// daemon's implementation, which derives coverage from delivered events.
+type BrokerCoverage interface {
+	Covers(owner, repo string) bool
 }
 
 // pollerKey identifies a single poller. Every field a resolver.Identity can
@@ -400,17 +424,46 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 	return out
 }
 
-// SetBrokerIdleCap enables broker-aware cadence stretching: while the
-// broker transport is healthy (SetBrokerHealth), a poller's idle backoff is
-// allowed to grow past monitor.MaxIdleInterval up to cap instead — polling
-// becomes a rare safety net because a real change now wakes the poller
-// immediately via Refresh/RefreshRepo. Call once at daemon startup,
-// before any broker events arrive. cap <= 0 disables the override: pollers
-// keep the normal ceiling even when the broker reports healthy.
+// SetBrokerIdleCap enables broker-aware cadence stretching: for a repository
+// the broker covers (healthy transport per SetBrokerHealth, and coverage per
+// SetBrokerCoverage), a poller's idle backoff is allowed to grow past
+// monitor.MaxIdleInterval up to cap instead — polling becomes a rare safety
+// net because a real change now wakes the poller immediately via
+// Refresh/RefreshRepo. A poller whose repository is not covered keeps the
+// normal ceiling: nothing will wake it early, so nothing may lengthen its
+// blind window. Call once at daemon startup, before any broker events arrive.
+// cap <= 0 disables the override entirely.
 func (h *Hub) SetBrokerIdleCap(cap time.Duration) {
 	h.brokerMu.Lock()
 	h.brokerIdleCap = cap
 	h.brokerMu.Unlock()
+}
+
+// SetBrokerCoverage installs the oracle that decides, per repository, whether
+// the broker wake path is actually answering for it. Call once at daemon
+// startup, before any broker events arrive.
+//
+// Until one is installed — and for every repository an installed one does not
+// vouch for — the hub treats coverage as absent and keeps polling normally,
+// whatever the transport's health. Unknown coverage must never read as full
+// coverage: that reading is what let a single connected broker silence
+// repositories it had never carried an event for.
+func (h *Hub) SetBrokerCoverage(c BrokerCoverage) {
+	h.brokerMu.Lock()
+	h.brokerCoverage = c
+	h.brokerMu.Unlock()
+}
+
+// brokerCovers reports whether the broker wake path is currently answering for
+// owner/repo: the transport is healthy *and* coverage vouches for that
+// specific repository. It is the single gate for every cadence decision the
+// broker is allowed to influence, so health can never speak for a repository
+// coverage says nothing about.
+func (h *Hub) brokerCovers(owner, repo string) bool {
+	h.brokerMu.RLock()
+	healthy, coverage := h.brokerHealthy, h.brokerCoverage
+	h.brokerMu.RUnlock()
+	return healthy && coverage != nil && coverage.Covers(owner, repo)
 }
 
 // SetBrokerHealth records the broker transport's connection state and, on
@@ -432,6 +485,10 @@ func (h *Hub) SetBrokerIdleCap(cap time.Duration) {
 // happens now rather than at whatever tick was scheduled while the wake path
 // still looked live — with pollWhenBrokerHealthy: false (issue #90) that
 // tick can be arbitrarily far away.
+//
+// Health is necessary but never sufficient for suppressing a poll: a healthy
+// transport only affects the cadence of repositories SetBrokerCoverage vouches
+// for.
 func (h *Hub) SetBrokerHealth(healthy bool, detail string) {
 	h.brokerMu.Lock()
 	changed := h.brokerHealthy != healthy
@@ -443,7 +500,7 @@ func (h *Hub) SetBrokerHealth(healthy bool, detail string) {
 
 	var msg string
 	if healthy {
-		msg = "✅ broker transport connected: PR/CI updates now arrive as they happen; polling continues as a rare safety net"
+		msg = "✅ broker transport connected: PR/CI updates arrive as they happen for the repositories it carries events for; every other repository keeps its normal polling cadence"
 	} else {
 		msg = "⚠️ broker transport degraded — falling back to interval polling until it reconnects"
 		if detail != "" {
@@ -887,10 +944,10 @@ func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 // (new subscriber, an explicit Refresh, or a broker degrade while pausing is
 // armed) resets the backoff and fetches immediately.
 //
-// With pollWhenBrokerHealthy: false and the broker reporting healthy, timer
-// ticks carry no fetch at all — the loop just re-arms near the base interval
-// until the pause lifts. Wakes always fetch: event-driven updates are the
-// path this policy trusts.
+// With pollWhenBrokerHealthy: false and the broker covering this repository,
+// timer ticks carry no fetch at all — the loop just re-arms near the base
+// interval until the pause lifts. Wakes always fetch: event-driven updates are
+// the path this policy trusts.
 func (p *poller) run() {
 	// Fetch the branch ruleset once at startup (PR targets only — no other
 	// kind consumes ruleset data) — unless a predecessor daemon handed one
@@ -955,19 +1012,19 @@ func (p *poller) run() {
 // fleet attaching many watchers at once does not burst requests in phase.
 //
 // Ceiling selection: idlePollCeiling when configured (WithIdleCeiling,
-// issue #90), otherwise monitor.MaxIdleInterval; while the optional broker
-// transport reports healthy (and an idle cap was configured via
-// SetBrokerIdleCap) the extended cap wins instead — a real change now arrives
-// as an immediate wake instead of waiting for the next tick, so the periodic
-// poll only has to serve as a rare safety net. The moment the broker degrades,
-// this reads the normal ceiling again on the very next call — no stale
-// extended wait survives a lost connection.
+// issue #90), otherwise monitor.MaxIdleInterval; when the broker covers this
+// poller's repository (and an idle cap was configured via SetBrokerIdleCap)
+// the extended cap wins instead — a real change now arrives as an immediate
+// wake instead of waiting for the next tick, so the periodic poll only has to
+// serve as a rare safety net. The moment the broker degrades or this
+// repository's coverage lapses, this reads the normal ceiling again on the
+// very next call — no stale extended wait survives a lost wake path.
 //
-// When pausing is armed (pollWhenBrokerHealthy: false) and the broker reports
-// healthy, the tick carries no fetch: the returned delay shrinks to roughly
-// the base interval so degradation is noticed within one tick, and run skips
-// the fetch itself. Tier-shedding and budget-guard stretching continue to
-// apply underneath whenever polling does run.
+// When pausing is armed (pollWhenBrokerHealthy: false) and the broker covers
+// this repository, the tick carries no fetch: the returned delay shrinks to
+// roughly the base interval so degradation is noticed within one tick, and run
+// skips the fetch itself. Tier-shedding and budget-guard stretching continue
+// to apply underneath whenever polling does run.
 func (p *poller) nextDelay() time.Duration {
 	p.mu.Lock()
 	noChange := p.noChange
@@ -975,8 +1032,8 @@ func (p *poller) nextDelay() time.Duration {
 	p.mu.Unlock()
 
 	ceiling := p.hub.effectiveIdleCeiling()
-	healthy, brokerCap := p.hub.BrokerHealthy()
-	if healthy && brokerCap > 0 {
+	_, brokerCap := p.hub.BrokerHealthy()
+	if brokerCap > 0 && p.hub.brokerCovers(p.key.owner, p.key.repo) {
 		ceiling = brokerCap
 	}
 
@@ -1017,14 +1074,17 @@ func (h *Hub) effectiveIdleCeiling() time.Duration {
 
 // timerPollPaused reports whether timer-driven fetching is currently
 // suspended: pauseWhenBrokerHealthy armed (pollWhenBrokerHealthy: false) and
-// the broker transport reporting healthy. Wakes never pause — an event-driven
-// refresh always fetches.
+// the broker covering *this poller's repository*, not merely reporting a live
+// connection. Wakes never pause — an event-driven refresh always fetches.
+//
+// Because this is re-read on every tick, a repository whose coverage lapses
+// resumes polling within one base interval without needing any transition
+// signal — the same self-healing the health degrade gets from wakeAll.
 func (p *poller) timerPollPaused() bool {
 	if !p.hub.pauseWhenBrokerHealthy {
 		return false
 	}
-	healthy, _ := p.hub.BrokerHealthy()
-	return healthy
+	return p.hub.brokerCovers(p.key.owner, p.key.repo)
 }
 
 func (p *poller) stop() {
