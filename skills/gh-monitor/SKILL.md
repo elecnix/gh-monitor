@@ -85,6 +85,8 @@ gh monitor --once -R owner/repo <pr>     # One-shot, then exit
 
 Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever), `--ignored-bots <a,b>`.
 
+**Eyes-on-notify (default on):** every comment a delivered notification is about gets a 👀 reaction — the thread's first comment, general PR comments, and issue comments — so humans on the PR can see the notification was received. It is evidence of delivery, not of action. Turn it off with `gh monitor prefs set '{"reactOnNotify": false}'`. A failed reaction costs one stderr line; the watch continues.
+
 **Event types:**
 
 | Type                       | Description                                                               |

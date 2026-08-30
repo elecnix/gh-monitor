@@ -37,6 +37,7 @@ The document shape:
     "pollInterval":         "10m" | "" | null,
     "idlePollCeiling":      "6h" | "" | null,
     "pollWhenBrokerHealthy": true | false | null,
+    "reactOnNotify":        true | false | null,
     "eventLog":             { "dir": "/path", "keepDays": 10 } | null
   }
 
@@ -58,6 +59,12 @@ duration ("6h"), or ""/"0"/"false"/null for the default.
 entirely while the broker wake path reports healthy; a degrade resumes
 polling immediately. Scheduled API spend becomes pure insurance against event
 loss.
+
+reactOnNotify (default true): every comment a delivered notification is about
+gets a 👀 reaction — review threads (first comment), general PR comments, and
+issue comments — so humans on the PR can see the notification was received.
+It is evidence of delivery, not of action. false turns it off; null resets to
+the default.
 
 After changing these (or selfUpdate), run 'gh monitor reload' to apply them
 to the resident daemon immediately — the restart is state-preserving.

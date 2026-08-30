@@ -363,6 +363,11 @@ func TestMonitorOnceIssueEmitsNDJSON(t *testing.T) {
 	defer func() { apiClientFactory = originalFactory }()
 
 	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		// The eyes-on-notify hook issues its own addReaction mutation after the
+		// snapshot query; only the snapshot must carry the MonitorIssue query.
+		if strings.Contains(query, "addReaction") {
+			return nil
+		}
 		require.Contains(t, query, "MonitorIssue")
 		return assignJSON(result, issueWithComment())
 	}}

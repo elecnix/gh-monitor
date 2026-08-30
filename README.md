@@ -415,6 +415,14 @@ All three are global-only settings beside `selfUpdate`, read at daemon start; in
 
 The socket path honours `$GH_MONITOR_SOCK`, then `$XDG_RUNTIME_DIR/gh-monitor.sock`, then `~/.cache/gh-monitor/daemon.sock`. Set `GH_MONITOR_AUTOSTART=0` to keep auto-start off (a client then fails with a clear error when no daemon is running, instead of spawning one). An explicitly configured external backend (`--backend-endpoint` / `$GH_MONITOR_BACKEND_ENDPOINT`) skips daemon attachment entirely — it is an authoritative operator choice for whatever kinds it declares.
 
+#### Eyes on notification
+
+By default every comment a delivered notification is about gets a 👀 reaction — the thread's first comment, general PR comments, and issue comments — so humans on the PR can see an agent received the notification. It is evidence of delivery, not of action: a wedged agent's 👀 still shows, and the loop-breaker remains the 👍 the consumer adds after acting. The hook fires through the same `--events` boundary as the notification itself, so a suppressed kind is never acknowledged, and a failed reaction costs one stderr line, never the watch. Turn it off with:
+
+```sh
+gh monitor prefs set '{"reactOnNotify": false}'
+```
+
 #### Upgrading while watchers run
 
 `gh extension upgrade` rewrites the installed binary in place, which Linux refuses with "text file busy" while any process has it mapped — and the daemon's whole job is to stay resident. Upgrades are therefore seamless end to end ([#73](https://github.com/elecnix/gh-monitor/issues/73)):
@@ -509,7 +517,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 #### Event log
 

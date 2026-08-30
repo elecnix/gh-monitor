@@ -32,6 +32,10 @@ import (
 //   - "pollWhenBrokerHealthy": bool (issue #90, default true). false suspends
 //     the daemon's timer-driven fetching while the broker wake path reports
 //     healthy; a degrade resumes polling immediately. Null resets to true.
+//   - "reactOnNotify": bool (default true). The watch client adds a 👀
+//     reaction to every comment a delivered notification is about. false
+//     turns it off; null resets it to the default and removes it from the
+//     file. Absent leaves it untouched.
 //
 // Unknown top-level keys are rejected so callers notice typos. An empty object
 // ("{}") is a no-op: it returns the current effective preferences without
@@ -149,6 +153,17 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.PollWhenBrokerHealthy = &b
 			}
+		case "reactOnNotify":
+			if string(v) == "null" {
+				stored.ReactOnNotify = nil
+			} else {
+				var b bool
+				if err := json.Unmarshal(v, &b); err != nil {
+					return Preferences{}, fmt.Errorf(
+						"parse reactOnNotify: %w (use true or false; null resets to the default)", err)
+				}
+				stored.ReactOnNotify = &b
+			}
 		case "eventLog":
 			if string(v) == "null" {
 				stored.EventLog = nil
@@ -164,7 +179,7 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				stored.EventLog = &cfg
 			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, eventLog)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, reactOnNotify, eventLog)", key)
 		}
 	}
 
@@ -265,6 +280,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.PollWhenBrokerHealthy != nil {
 		prefs.PollWhenBrokerHealthy = *stored.PollWhenBrokerHealthy
+	}
+	if stored.ReactOnNotify != nil {
+		prefs.ReactOnNotify = *stored.ReactOnNotify
 	}
 	if stored.EventLog != nil {
 		prefs.EventLog = stored.EventLog

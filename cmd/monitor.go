@@ -338,6 +338,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			write(n)
 		}
 	}
+	// Eyes-on-notify fires through the same boundary: a kind the filter
+	// suppressed was not delivered, so nothing about it is acknowledged. ack
+	// itself is built below, once the target and registry exist.
+	var ack notifier
+	ackEmit := func(ev backend.Event) {
+		if ack != nil && (eventFilter == nil || eventFilter.Allows(string(ev.Type))) {
+			ackOnDeliver(ctx, ack, ev, cmd.ErrOrStderr())
+		}
+	}
 
 	// Resolve which backend serves this target. The built-in one covers reads
 	// and mutations for every kind; the shared-poller daemon — mandatory for
@@ -428,6 +437,20 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 	evlogFailed := false
 
+	// Eyes-on-notify (pref reactOnNotify, default on): every comment a
+	// delivered notification is about gets a 👀 reaction, so humans on the PR
+	// can see the notification was received.
+	if runOpts.Prefs.ReactOnNotify {
+		reg2 := reg
+		ack = &reactionNotifier{
+			reactFn: func() (backend.ReactionActor, error) {
+				actor, _, err := reg2.ReactionsFor(target)
+				return actor, err
+			},
+			target: target,
+		}
+	}
+
 	for u := range updates {
 		if !dedup.Allow(u) {
 			continue
@@ -444,6 +467,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			}
 		}
 		emit(monitor.Render(u, runOpts.Prefs, runOpts.Interval))
+		ackEmit(u.Event)
 	}
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		return err

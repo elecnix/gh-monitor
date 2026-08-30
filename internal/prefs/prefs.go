@@ -54,6 +54,11 @@ const DefaultEventLogKeepDays = 10
 // PollWhenBrokerHealthy (default true) is the third lever: false suspends
 // timer-driven fetching entirely while the broker wake path reports healthy,
 // so scheduled API spend exists only as insurance against event loss.
+//
+// ReactOnNotify (default true) adds a 👀 reaction to every comment a watch
+// delivers a notification about (review threads, general PR comments, issue
+// comments), so humans on the PR see the notification was received. It is
+// client-side evidence of delivery, not of action.
 type Preferences struct {
 	Templates             map[string]string `json:"templates"`
 	IgnoredBots           []string          `json:"ignoredBots"`
@@ -62,6 +67,7 @@ type Preferences struct {
 	PollInterval          string            `json:"pollInterval,omitempty"`
 	IdlePollCeiling       string            `json:"idlePollCeiling,omitempty"`
 	PollWhenBrokerHealthy bool              `json:"pollWhenBrokerHealthy"`
+	ReactOnNotify         bool              `json:"reactOnNotify"`
 	EventLog              *EventLogConfig   `json:"eventLog,omitempty"`
 }
 
@@ -123,6 +129,7 @@ func DefaultPreferences() Preferences {
 		PollInterval:          "",
 		IdlePollCeiling:       "",
 		PollWhenBrokerHealthy: true,
+		ReactOnNotify:         true,
 	}
 }
 
@@ -383,6 +390,7 @@ type storedPreferences struct {
 	PollInterval          *string            `json:"pollInterval,omitempty"`
 	IdlePollCeiling       *string            `json:"idlePollCeiling,omitempty"`
 	PollWhenBrokerHealthy *bool              `json:"pollWhenBrokerHealthy,omitempty"`
+	ReactOnNotify         *bool              `json:"reactOnNotify,omitempty"`
 	EventLog              *EventLogConfig    `json:"eventLog,omitempty"`
 }
 
