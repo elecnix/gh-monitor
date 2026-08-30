@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
@@ -58,17 +59,27 @@ func Render(u backend.Update, p prefs.Preferences, interval time.Duration) Notif
 	}
 	if u.Event.Type == EventDegraded {
 		label := degradedLabel(opts)
-		// degraded is a first-class kind: like every other kind it has a
-		// prefs template, so a consumer can reword or mute it. Callers that
-		// render with zero Prefs get the built-in sentence.
-		msg := prefs.Interpolate(p.Templates[string(EventDegraded)], map[string]string{
-			"prLabel":         label,
-			"degradedSurface": u.Event.DegradedSurface,
-			"degradedMessage": u.Event.DegradedMessage,
-		})
-		if msg == "" {
+		// degradedSurfaces names the watched-surface guarantees the degraded
+		// read stopped delivering (issue #98) — a failed PR query can
+		// suppress check outcomes even though the tier system never sheds
+		// them, so the notice must say which guarantees are blind. The
+		// clause is appended only to the built-in sentence: a custom template
+		// owns its wording and gets the list via {degradedSurfaces}.
+		vars := map[string]string{
+			"prLabel":          label,
+			"degradedSurface":  u.Event.DegradedSurface,
+			"degradedMessage":  u.Event.DegradedMessage,
+			"degradedSurfaces": strings.Join(u.Event.DegradedSurfaces, ", "),
+		}
+		msg := ""
+		if tpl := p.Templates[string(EventDegraded)]; tpl != "" && tpl != prefs.DefaultPreferences().Templates[string(EventDegraded)] {
+			msg = prefs.Interpolate(tpl, vars)
+		} else {
 			msg = fmt.Sprintf("⚠️ API degraded (%s) on %s: %s",
 				u.Event.DegradedSurface, label, u.Event.DegradedMessage)
+			if len(u.Event.DegradedSurfaces) > 0 {
+				msg += "; no longer delivering: " + vars["degradedSurfaces"]
+			}
 		}
 		return Notification{
 			Type:      string(EventDegraded),

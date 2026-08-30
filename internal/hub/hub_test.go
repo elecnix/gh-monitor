@@ -515,6 +515,115 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 		"entering a shed tier must broadcast a degraded notice")
 }
 
+// TestPoller_FetchErrorNamesBlindSharedSurfaces verifies issue #98: a PR's
+// check outcomes, head commit, and mergeability ride in the SAME GraphQL
+// query as the shed-able surfaces, so when that query fails, those surfaces
+// go blind too — and the degraded notice must say so. A notice that only
+// says "graphql" lets a caller keep trusting CI signals that a degraded
+// query can no longer deliver.
+func TestPoller_FetchErrorNamesBlindSharedSurfaces(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return nil, errors.New("gh api failed: exit status 1")
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	u := waitDegradedUpdate(t, ch, "a failed PR fetch must broadcast the degradation")
+	require.NotEmpty(t, u.Event.DegradedSurfaces,
+		"the notice must name every surface that went blind, not just the API name")
+	assert.Contains(t, u.Event.DegradedSurfaces, "check outcomes",
+		"checks ride the failed query; a caller must know they are not arriving")
+	assert.Contains(t, u.Event.DegradedSurfaces, "head commit",
+		"the head SHA rides the failed query; a caller must know it cannot see a new push")
+	assert.Contains(t, u.Event.DegradedSurfaces, "mergeability")
+}
+
+// TestPoller_FetchErrorNamesBlindSharedSurfaces_NonPR verifies the blind-
+// surface list is derived per kind: a ref watch carries checks only, so its
+// degraded notice names checks — not comments or reviews it never fetched.
+func TestPoller_FetchErrorNamesBlindSharedSurfaces_NonPR(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return nil, errors.New("gh api failed: exit status 1")
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	refTarget := backend.Target{Kind: backend.KindRef, Owner: "o", Repo: "r", Ref: "refs/heads/main", Host: "github.com"}
+	ch, cancelSub := h.Subscribe(ctx, refTarget, testHubOpts())
+	t.Cleanup(cancelSub)
+
+	u := waitDegradedUpdate(t, ch, "a failed ref fetch must broadcast the degradation")
+	require.NotEmpty(t, u.Event.DegradedSurfaces)
+	assert.Contains(t, u.Event.DegradedSurfaces, "check outcomes",
+		"a ref watch exists to report check outcomes; the notice must say they are blind")
+	assert.NotContains(t, u.Event.DegradedSurfaces, "comments",
+		"ref queries carry no comments; naming them would be a lie in the other direction")
+}
+
+// TestPoller_TierNoticeStatesChecksStayWatched verifies the other half of
+// issue #98: a shed-tier transition must state that PR status and check
+// outcomes REMAIN watched, because "no longer watching comments" alone
+// invites the reader to wonder whether checks went too.
+func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
+	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 100, limit: 5000}}
+	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
+
+	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, budget)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription closed")
+			}
+			if u.Event.Type == monitor.EventDegraded && strings.Contains(u.Event.Notice, "no longer watching") {
+				assert.Contains(t, u.Event.Notice, "PR status and check outcomes remain watched",
+					"the shed notice must state what the tier still covers")
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the tier-shed notice")
+		}
+	}
+}
+
+// waitDegradedUpdate is waitDegraded returning the whole update, for tests
+// that need the structured degraded fields rather than just the event type.
+func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) backend.Update {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatalf("subscription closed: %s", msg)
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+				return u
+			}
+		case <-deadline:
+			t.Fatalf("timed out: %s", msg)
+		}
+	}
+}
+
 // TestHub_SetBrokerHealth_BroadcastsOnceOnTransition verifies the loud
 // signal a broker-backed watcher must give per the module's "absence is not
 // success" guidance: every health transition reaches every subscriber

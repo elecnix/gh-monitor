@@ -370,13 +370,16 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		raw, err := fetch(ctx, identity, monitor.TierFull)
 		if err != nil {
 			// A one-shot read has no next poll to recover on, so a fetch
-			// error is the answer: report it as degraded and stop.
+			// error is the answer: report it as degraded and stop. The
+			// blind-surface list tells the caller which guarantees this one
+			// read failed to deliver (issue #98).
 			out <- backend.Update{
 				Target: monitor.TargetOf(identity),
 				Event: backend.Event{
-					Type:            backend.EventDegraded,
-					DegradedSurface: "graphql",
-					DegradedMessage: err.Error(),
+					Type:             backend.EventDegraded,
+					DegradedSurface:  "graphql",
+					DegradedMessage:  err.Error(),
+					DegradedSurfaces: h.blindSurfaces(keyOf(identity)),
 				},
 				At: time.Now(),
 			}
@@ -1074,11 +1077,13 @@ func (p *poller) fetchOnce() {
 			// one broadcast (issue #66); a changed error re-notifies, and the
 			// recovery notice goes out on the next successful fetch. The
 			// previous snapshot is retained; no inference replaces it.
-			if p.enterDegraded("graphql", fmt.Sprintf("%v", err)) {
+			msg := fmt.Sprintf("%v", err)
+			if p.enterDegraded("graphql", msg) {
 				p.broadcast(monitor.Event{
-					Type:            monitor.EventDegraded,
-					DegradedSurface: "graphql",
-					DegradedMessage: fmt.Sprintf("%v", err),
+					Type:             monitor.EventDegraded,
+					DegradedSurface:  "graphql",
+					DegradedMessage:  msg,
+					DegradedSurfaces: p.hub.blindSurfaces(p.key),
 				})
 			}
 			p.mu.Lock()
@@ -1208,12 +1213,39 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	shed := tier.ShedSurfaces()
 	var msg string
 	if len(shed) > 0 {
-		msg = fmt.Sprintf("⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers",
+		msg = fmt.Sprintf("⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers; PR status and check outcomes remain watched",
 			p.label(), strings.Join(shed, ", "))
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
 	}
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
+}
+
+// blindSurfaces names the watched-surface guarantees a failed fetch of this
+// target's kind stops delivering (issue #98). Surfaces on one query are
+// coupled: a PR's check outcomes, head commit, and mergeability ride the
+// same GraphQL query as its comments and reviews, so a failed PR query
+// suppresses check outcomes even though the tier system never sheds them.
+// Naming only the failed API ("graphql") would let a caller keep trusting
+// CI signals the degraded query can no longer deliver. Ref and commit
+// watches carry check outcomes only; issue/run/repo fetches name what their
+// own query carries, and a backend transport break names nothing because a
+// backend's surfaces are its own to describe.
+func (h *Hub) blindSurfaces(k pollerKey) []string {
+	switch k.kind {
+	case backend.KindPR:
+		return []string{"check outcomes", "head commit", "mergeability"}
+	case backend.KindRef, backend.KindCommit:
+		return []string{"check outcomes"}
+	case backend.KindIssue:
+		return []string{"issue state", "comments"}
+	case backend.KindRun:
+		return []string{"run status"}
+	case backend.KindRepo:
+		return []string{"new PRs and issues"}
+	default:
+		return nil
+	}
 }
 
 // broadcast fans a loop-level event out to every subscriber. Sends are

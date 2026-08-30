@@ -261,8 +261,9 @@ var recognizedTokens = map[string]bool{
 	"annotationTruncated":  true,
 	"annotationUrl":        true,
 
-	"degradedSurface": true,
-	"degradedMessage": true,
+	"degradedSurface":  true,
+	"degradedMessage":  true,
+	"degradedSurfaces": true,
 }
 
 // tokenRE matches a single {token} placeholder. The token name is captured.
