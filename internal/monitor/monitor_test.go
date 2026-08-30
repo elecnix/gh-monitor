@@ -1074,8 +1074,8 @@ func TestSnapshot_CancelledBesideSuccessIsNotFailing(t *testing.T) {
 }
 
 func TestSnapshot_CancelledContainerSuiteWithRunsIsNotFailing(t *testing.T) {
-	// Measured 2026-08-25 on PrizmalAi/PrizmalSwitch #1531 (release/prod-7f317b0f7):
-	// ghpr-monitor emitted a whole-session "❌ Failing CI checks" for a genuinely
+	// Measured against a real repository: a cancelled container suite carrying
+	// runs was reported as failing. ghpr-monitor emitted a whole-session "❌ Failing CI checks" for a genuinely
 	// green PR. The live checkSuites payload nests each SUPERSEDED run in its OWN
 	// suite concluded CANCELLED, and every such suite shares the container app name
 	// "GitHub Actions". The per-name runVerdict logic correctly resolves each name
