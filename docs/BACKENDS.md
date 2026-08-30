@@ -149,13 +149,21 @@ started at all; report everything after that as a degraded update.
 out <- backend.Update{
 	Target: t,
 	Event: backend.Event{
-		Type:            backend.EventDegraded,
-		DegradedSurface: "upstream",
-		DegradedMessage: err.Error(),
+		Type:             backend.EventDegraded,
+		DegradedSurface:  "upstream",
+		DegradedMessage:  err.Error(),
+		DegradedSurfaces: []string{"check outcomes", "comments"},
 	},
 	At: time.Now(),
 }
 ```
+
+Set `DegradedSurfaces` to the watched-surface guarantees the failed read
+stopped delivering ([#98](https://github.com/elecnix/gh-monitor/issues/98)) —
+surfaces are coupled on one query, so a failed PR query suppresses check
+outcomes even though the tier system never sheds them. The list reaches
+callers both as a structured field and in the rendered sentence; leave it
+empty when a backend has no per-surface claims to make.
 
 ## Running a backend as a server
 
@@ -282,18 +290,18 @@ func main() {
 Whatever a backend learned, it says it in these terms. They are the same kinds
 `--events` filters on and `gh monitor prefs` templates.
 
-| Kind                                                                   | Meaning                                                                                                            |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `first-poll`                                                           | Baseline: what is being watched                                                                                    |
-| `new-failing-checks`, `ci-all-green`, `check-annotations`              | CI outcomes                                                                                                        |
-| `new-unresolved-threads`, `new-general-comments`                       | Review activity                                                                                                    |
-| `review-approved`, `review-changes-requested`, `review-dismissed`      | Review decisions                                                                                                   |
-| `new-commit`, `conflict`, `merged`, `closed`                           | Pull request state                                                                                                 |
-| `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention` | Issue state                                                                                                        |
-| `run-queued`, `run-in-progress`, `run-completed`                       | Workflow runs                                                                                                      |
-| `repo-new-pr`, `repo-new-issue`, `readiness`                           | Repository                                                                                                         |
-| `degraded`                                                             | A surface could not be read — emitted per episode (entering degraded, error change, recovery), not per failed poll |
-| `all-clear`                                                            | Everything previously raised is resolved                                                                           |
+| Kind                                                                   | Meaning                                                                                                                                                                                 |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `first-poll`                                                           | Baseline: what is being watched                                                                                                                                                         |
+| `new-failing-checks`, `ci-all-green`, `check-annotations`              | CI outcomes                                                                                                                                                                             |
+| `new-unresolved-threads`, `new-general-comments`                       | Review activity                                                                                                                                                                         |
+| `review-approved`, `review-changes-requested`, `review-dismissed`      | Review decisions                                                                                                                                                                        |
+| `new-commit`, `conflict`, `merged`, `closed`                           | Pull request state                                                                                                                                                                      |
+| `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention` | Issue state                                                                                                                                                                             |
+| `run-queued`, `run-in-progress`, `run-completed`                       | Workflow runs                                                                                                                                                                           |
+| `repo-new-pr`, `repo-new-issue`, `readiness`                           | Repository                                                                                                                                                                              |
+| `degraded`                                                             | A surface could not be read — emitted per episode (entering degraded, error change, recovery), not per failed poll. Names what the failed read stopped delivering (`degraded_surfaces`) |
+| `all-clear`                                                            | Everything previously raised is resolved                                                                                                                                                |
 
 ## The shared-poller daemon
 

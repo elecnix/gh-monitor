@@ -102,6 +102,19 @@ type Event struct {
 	// DegradedMessage carries the error detail for EventDegraded.
 	DegradedMessage string `json:"degraded_message,omitempty"`
 
+	// DegradedSurfaces names the WATCHED-SURFACE guarantees the degraded
+	// read stopped delivering, as distinct from the API surface that failed
+	// (DegradedSurface). It exists because a target's surfaces are coupled:
+	// a PR's check outcomes, head commit, and mergeability ride the same
+	// GraphQL query as its comments and reviews, so a failed PR query can
+	// suppress check outcomes even though the tier system never sheds them
+	// (issue #98). A caller that only knows "graphql failed" cannot tell
+	// whether CI results are still trustworthy; one that knows "check
+	// outcomes and head commit stopped arriving" can fall back to REST.
+	// Empty for non-degraded events and for degraded surfaces that carry no
+	// per-target state (e.g. a backend transport break).
+	DegradedSurfaces []string `json:"degraded_surfaces,omitempty"`
+
 	// DegradedResetAt is an ISO 8601 timestamp of the rate-limit reset (when
 	// known). When set, the caller should back off until this time.
 	DegradedResetAt string `json:"degraded_reset_at,omitempty"`

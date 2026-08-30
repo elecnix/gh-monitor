@@ -64,6 +64,39 @@ func TestRenderDegradedUsesThePrefsTemplate(t *testing.T) {
 		"a user template must be honoured for degraded, like every other kind")
 }
 
+func TestRenderDegradedNamesBlindSharedSurfaces(t *testing.T) {
+	// Issue #98: a failed PR query stops delivering check outcomes, head
+	// commit, and mergeability — surfaces the tier system never sheds — so
+	// the rendered notice must name them, not just the API surface.
+	u := backend.Update{
+		Target: backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7},
+		Event: Event{
+			Type:             EventDegraded,
+			DegradedSurface:  "graphql",
+			DegradedMessage:  "boom",
+			DegradedSurfaces: []string{"check outcomes", "head commit", "mergeability"},
+		},
+		At: time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC),
+	}
+	n := Render(u, prefs.DefaultPreferences(), time.Minute)
+	assert.Contains(t, n.Message, "check outcomes, head commit, mergeability",
+		"the built-in sentence must name what the failed query stopped delivering")
+
+	// The structured field is also available as a template token.
+	p := prefs.DefaultPreferences()
+	p.Templates["degraded"] = "down ({degradedSurface}); blind: {degradedSurfaces}"
+	n = Render(u, p, time.Minute)
+	assert.Equal(t, "down (graphql); blind: check outcomes, head commit, mergeability", n.Message,
+		"{degradedSurfaces} must be interpolable like every other token")
+
+	// A degraded event with no blind-surface list keeps the sentence clean:
+	// a backend transport break has no per-surface claims to make.
+	u.Event.DegradedSurfaces = nil
+	n = Render(u, prefs.DefaultPreferences(), time.Minute)
+	assert.NotContains(t, n.Message, "no longer delivering",
+		"an empty blind-surface list must not append an empty clause")
+}
+
 func TestRenderWithoutStatusStillProducesAMessage(t *testing.T) {
 	// A backend that knows what changed without holding a snapshot leaves
 	// Status nil. That must render from the event alone rather than panic.
