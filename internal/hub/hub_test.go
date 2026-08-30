@@ -624,6 +624,80 @@ func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) back
 	}
 }
 
+// TestPoller_RecoveryDeclaresTheGap verifies issue #99: the recovery notice
+// after a degraded episode must declare the blind window with structured
+// from/to timestamps, so a caller that knows it has a hole can fill it from
+// REST. The cursor contract never replays — a cursor advances only on a
+// successful fetch — so without the declaration, whatever happened during
+// the window is missed forever and the recovery notice reads as an all-clear.
+func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
+	calls := 0
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("gh api failed: exit status 1")
+		}
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	waitDegraded(t, ch, "the first failure must broadcast")
+
+	// The next poll succeeds: the recovery notice must carry the gap window.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription closed")
+			}
+			if u.Event.Type == monitor.EventDegraded && u.Event.Notice != "" && strings.Contains(u.Event.Notice, "recovered") {
+				assert.NotEmpty(t, u.Event.DegradedFrom,
+					"the recovery notice must mark when the blind window opened")
+				assert.NotEmpty(t, u.Event.DegradedTo,
+					"the recovery notice must mark when the blind window closed")
+				from, err := time.Parse(time.RFC3339, u.Event.DegradedFrom)
+				require.NoError(t, err, "DegradedFrom must be RFC 3339")
+				to, err := time.Parse(time.RFC3339, u.Event.DegradedTo)
+				require.NoError(t, err, "DegradedTo must be RFC 3339")
+				assert.True(t, !from.After(to), "the window must run forward: %s -> %s", from, to)
+				assert.Contains(t, u.Event.Notice, "were not observed",
+					"the recovery notice must say events inside the window were missed")
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the recovery notice")
+		}
+	}
+}
+
+// TestPoller_RecoveryWithoutBlindWindowDeclaresNothing verifies a plain
+// recovery (no degraded episode) carries no gap declaration: a broker-health
+// notice or tier recovery must not read as a blind window.
+func TestPoller_RecoveryWithoutBlindWindowDeclaresNothing(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	got := collect(ch, 200*time.Millisecond)
+	assert.NotContains(t, got, string(monitor.EventDegraded),
+		"a healthy watch emits no degraded events at all")
+}
+
 // TestHub_SetBrokerHealth_BroadcastsOnceOnTransition verifies the loud
 // signal a broker-backed watcher must give per the module's "absence is not
 // success" guidance: every health transition reaches every subscriber

@@ -859,6 +859,7 @@ type poller struct {
 	tier       monitor.QueryTier // last fetched tier; drives shed notices
 	degraded   map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
 	errBackoff time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
+	blindFrom  time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
 	subs       map[*sub]struct{}
 
 	wake  chan struct{}
@@ -1077,6 +1078,13 @@ func (p *poller) fetchOnce() {
 			// one broadcast (issue #66); a changed error re-notifies, and the
 			// recovery notice goes out on the next successful fetch. The
 			// previous snapshot is retained; no inference replaces it.
+			// Record when the blind window opened: the last successful
+			// observation before the first failure of the episode (issue #99).
+			p.mu.Lock()
+			if p.blindFrom.IsZero() {
+				p.blindFrom = time.Now()
+			}
+			p.mu.Unlock()
 			msg := fmt.Sprintf("%v", err)
 			if p.enterDegraded("graphql", msg) {
 				p.broadcast(monitor.Event{
@@ -1096,10 +1104,24 @@ func (p *poller) fetchOnce() {
 	// flight: announce the recovery before the fresh snapshot, so a
 	// consumer never reads the outage as ongoing past this point.
 	for _, surface := range p.recoverDegraded() {
-		p.broadcast(monitor.Event{
+		// Declare the gap (issue #99): the cursor contract never replays — a
+		// cursor advances only on successful fetches — so events missed
+		// during the blind window stay missed, and the recovery notice must
+		// say so instead of reading as an all-clear. From marks the last
+		// successful observation before the failure; To marks recovery.
+		now := time.Now()
+		ev := monitor.Event{
 			Type:   monitor.EventDegraded,
 			Notice: fmt.Sprintf("✅ API recovered (%s) on %s", surface, p.label()),
-		})
+		}
+		if blindFrom, ok := p.clearBlindWindow(); !blindFrom.IsZero() && ok {
+			ev.DegradedFrom = blindFrom.UTC().Format(time.RFC3339)
+			ev.DegradedTo = now.UTC().Format(time.RFC3339)
+			ev.Notice = fmt.Sprintf(
+				"✅ API recovered (%s) on %s — events between %s and %s were not observed and will not be replayed; backfill from REST if completeness matters",
+				surface, p.label(), ev.DegradedFrom, ev.DegradedTo)
+		}
+		p.broadcast(ev)
 	}
 	p.mu.Lock()
 	p.errBackoff = 0
@@ -1161,6 +1183,18 @@ func (p *poller) recoverDegraded() []string {
 	sort.Strings(out)
 	p.degraded = nil
 	return out
+}
+
+// clearBlindWindow returns and clears the blind-window start recorded by the
+// degraded episode that just recovered. ok is true when a window was open;
+// a false/zero return means the recovery carries no gap declaration (no
+// degraded episode preceded this success).
+func (p *poller) clearBlindWindow() (blindFrom time.Time, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	blindFrom = p.blindFrom
+	p.blindFrom = time.Time{}
+	return blindFrom, !blindFrom.IsZero()
 }
 
 // selectTier returns the fetch tier for the next poll: TierFull when no

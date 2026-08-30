@@ -158,12 +158,17 @@ out <- backend.Update{
 }
 ```
 
-Set `DegradedSurfaces` to the watched-surface guarantees the failed read
-stopped delivering ([#98](https://github.com/elecnix/gh-monitor/issues/98)) —
-surfaces are coupled on one query, so a failed PR query suppresses check
 outcomes even though the tier system never sheds them. The list reaches
 callers both as a structured field and in the rendered sentence; leave it
 empty when a backend has no per-surface claims to make.
+
+When the surface recovers, declare the gap
+([#99](https://github.com/elecnix/gh-monitor/issues/99)): set
+`DegradedFrom` and `DegradedTo` (RFC 3339) on the recovery notice to the
+blind window's boundaries, and say in the notice that events between them
+were not observed. The cursor contract never replays — a cursor advances
+only on successful fetches — so without the declaration, what a caller
+missed stays invisible to it forever.
 
 ## Running a backend as a server
 

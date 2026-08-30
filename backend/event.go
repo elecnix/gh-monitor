@@ -119,6 +119,20 @@ type Event struct {
 	// known). When set, the caller should back off until this time.
 	DegradedResetAt string `json:"degraded_reset_at,omitempty"`
 
+	// DegradedFrom is set on the RECOVERY notice of a degraded episode: an
+	// RFC 3339 timestamp marking when the blind window opened — the last
+	// successful observation before the failed fetch. DegradedTo is set on
+	// the same notice: the instant recovery was confirmed. Together they
+	// declare the gap (issue #99): events between the two were not observed,
+	// and a cursor contract that never replays (cursors advance only on
+	// successful fetches) means whatever happened in that window will not
+	// be delivered later. A caller that needs completeness can re-read the
+	// window from REST; a caller that does not know it has a hole cannot.
+	// From is zero on the recovery notice only when the failure carried no
+	// usable timestamp, never on a healthy notice.
+	DegradedFrom string `json:"degraded_from,omitempty"`
+	DegradedTo   string `json:"degraded_to,omitempty"`
+
 	// Notice carries a fully-rendered message for diagnostics a Source raises
 	// about itself rather than about the target — the built-in poller uses it
 	// to say which surfaces it stopped watching under a tight API budget.
