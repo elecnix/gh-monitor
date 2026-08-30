@@ -47,7 +47,7 @@ func TestParse(t *testing.T) {
 	in := strings.NewReader(`
 # a comment, ignored
 
-broker-subscriber /usr/local/bin/broker-subscriber daemon --repo PrizmalAi/PrizmalSwitch
+broker-subscriber /usr/local/bin/broker-subscriber daemon --repo owner/repo
 
    # indented comment
 other-daemon "/path with space/other" --flag value
@@ -56,7 +56,7 @@ other-daemon "/path with space/other" --flag value
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 	assert.Equal(t, "broker-subscriber", entries[0].Name)
-	assert.Equal(t, []string{"/usr/local/bin/broker-subscriber", "daemon", "--repo", "PrizmalAi/PrizmalSwitch"}, entries[0].Cmd)
+	assert.Equal(t, []string{"/usr/local/bin/broker-subscriber", "daemon", "--repo", "owner/repo"}, entries[0].Cmd)
 	assert.Equal(t, "other-daemon", entries[1].Name)
 	assert.Equal(t, []string{"/path with space/other", "--flag", "value"}, entries[1].Cmd)
 }
