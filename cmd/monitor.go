@@ -455,8 +455,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		if !dedup.Allow(u) {
 			continue
 		}
-		// The daemon path persists cursor state from what each update carries.
-		if persistFromUpdate != nil && sourceName == DaemonBackendName {
+		// A named instance persists cursor state from what each update carries,
+		// whatever backend delivered it — the shared daemon, an external broker
+		// sub-daemon, or a one-shot read through the built-in backend. This is
+		// what makes a scheduled `--once --instance` tick a DELTA against the
+		// last tick instead of a full replay: the stored baseline is re-diffed
+		// on the next run, so an unchanged payload emits nothing (issue: broker
+		// replay flood — a fixed set of long-merged PRs re-arrived every poll
+		// pass because the once path never persisted its baseline).
+		if persistFromUpdate != nil {
 			persistFromUpdate(u)
 		}
 		if evlog != nil && !evlogFailed {

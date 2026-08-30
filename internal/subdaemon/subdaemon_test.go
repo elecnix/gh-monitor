@@ -226,27 +226,72 @@ func (l *Launcher) out() string {
 	return l.Out.(*bytes.Buffer).String()
 }
 
-// TestLauncher_RapidFailureGivesUp verifies an entry that crashes under the
-// stable-run threshold stops after MaxRapidFails crashes — the visible-failure
-// path that keeps a broken sub-daemon from churning forever.
-func TestLauncher_RapidFailureGivesUp(t *testing.T) {
+// TestLauncher_RapidFailuresSettleIntoSlowRetry verifies an entry that
+// crashes under the stable-run threshold backs off up to the cap and keeps
+// retrying instead of giving up — a configured sub-daemon is the daemon's
+// event-driven wake path, and abandoning it (measured 2026-08-22: the
+// broker-subscriber gave up after 5 rapid crashes and gh-monitor fell back to
+// polling-only) is exactly the shared-GraphQL-burn defect this loop exists to
+// prevent. The retry stays armed until ctx is cancelled.
+func TestLauncher_RapidFailuresSettleIntoSlowRetry(t *testing.T) {
 	s := newScriptedSpawn()
 	s.runs["broken"] = []runOutcome{
 		{nil, 1 * time.Millisecond}, // rapid fail 1
 		{nil, 1 * time.Millisecond}, // rapid fail 2
-		{nil, 1 * time.Millisecond}, // rapid fail 3 → give up
+		{nil, 1 * time.Millisecond}, // rapid fail 3 → slow retry
 	}
 	l := newTestLauncher([]Entry{{Name: "broken", Cmd: []string{"x"}}}, s.spawn)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
 	_ = l.Run(ctx)
 
 	out := l.out()
-	assert.Contains(t, out, "giving up after 3 rapid crashes")
-	// A "rapid failure" line is logged only for crashes that do NOT give up,
-	// so three crashes produce two such lines (the third gives up instead).
-	assert.Equal(t, 2, strings.Count(out, "rapid failure"), "logged each non-final rapid failure")
+	assert.Contains(t, out, "retrying slowly", "a rapid-crash burst must settle into a slow retry, never a give-up")
+	assert.NotContains(t, out, "giving up", "a configured sub-daemon is never abandoned")
+	// A "rapid failure N/M" line is logged only for the pre-cap failures: three
+	// crashes produce two such lines (the third enters the slow-retry loop).
+	// "rapid failures exceed" is a different line — count the spaced form.
+	assert.Equal(t, 2, strings.Count(out, "rapid failure "), "logged each non-final rapid failure")
+}
+
+// TestLauncher_RapidFailuresRetrySlowlyAndRecover is the regression test for
+// the broker-replay defect's launcher half (measured 2026-08-22: the
+// broker-subscriber gave up after 5 rapid crashes during an upgrade-handoff
+// socket collision, and gh-monitor fell back to polling-only — the shared
+// GraphQL burn source). A configured sub-daemon is the daemon's event-driven
+// wake path: the supervisor must NEVER abandon it permanently. A rapid-crash
+// burst settles into a slow retry at maxBackoff (cheap, self-healing the
+// moment the transient condition clears), and the entry must still recover
+// into a stable run once it stops crashing — the retry loop lives until ctx
+// is cancelled, not until a crash count is spent.
+func TestLauncher_RapidFailuresRetrySlowlyAndRecover(t *testing.T) {
+	s := newScriptedSpawn()
+	s.runs["flaky"] = []runOutcome{
+		{nil, 1 * time.Millisecond},   // rapid fail 1
+		{nil, 1 * time.Millisecond},   // rapid fail 2
+		{nil, 1 * time.Millisecond},   // rapid fail 3 → slow retry begins
+		{nil, 100 * time.Millisecond}, // slow retry lands on a stable run → recovered
+	}
+	l := newTestLauncher([]Entry{{Name: "flaky", Cmd: []string{"x"}}}, s.spawn)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	_ = l.Run(ctx)
+
+	out := l.out()
+	assert.Contains(t, out, "retrying slowly", "a rapid-crash burst must settle into a slow retry")
+	assert.NotContains(t, out, "giving up", "the supervisor never abandons a configured sub-daemon")
+	// The 4th spawn (the stable run) must have happened: recovery proves the
+	// loop kept retrying after the burst instead of returning. Runtimes are
+	// logged rounded to seconds, so count spawns, not printed durations.
+	assert.Equal(t, 4, strings.Count(out, `"flaky" ran`), "the entry must be retried after the burst and run to stability")
 }
 
 // TestLauncher_StableRunResetsBackoff verifies a run that lasts past
@@ -258,18 +303,22 @@ func TestLauncher_StableRunResetsBackoff(t *testing.T) {
 		{nil, 100 * time.Millisecond}, // stable → reset
 		{nil, 1 * time.Millisecond},   // rapid fail 1 (not 2)
 		{nil, 1 * time.Millisecond},   // rapid fail 2
-		{nil, 1 * time.Millisecond},   // rapid fail 3 → give up
+		{nil, 1 * time.Millisecond},   // rapid fail 3 → slow retry
 	}
 	l := newTestLauncher([]Entry{{Name: "flaky", Cmd: []string{"x"}}}, s.spawn)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
 	_ = l.Run(ctx)
 
 	out := l.out()
 	// The stable run must have reset the counter: three rapid crashes after it
-	// are required to give up (not two).
-	assert.Contains(t, out, "giving up after 3 rapid crashes")
+	// are required to reach the slow-retry state (not two).
+	assert.Contains(t, out, "retrying slowly")
+	assert.NotContains(t, out, "giving up")
 }
 
 // TestLauncher_NotFoundStopsImmediately verifies a missing binary is logged
@@ -292,14 +341,14 @@ func TestLauncher_NotFoundStopsImmediately(t *testing.T) {
 	assert.Contains(t, l.out(), "not started")
 }
 
-// TestLauncher_MultipleEntriesIndependent verifies one entry giving up does
-// not stop another — supervision is per-entry.
+// TestLauncher_MultipleEntriesIndependent verifies one entry settling into
+// its slow-retry loop does not stop another — supervision is per-entry.
 func TestLauncher_MultipleEntriesIndependent(t *testing.T) {
 	s := newScriptedSpawn()
 	s.runs["broken"] = []runOutcome{
 		{nil, 1 * time.Millisecond},
 		{nil, 1 * time.Millisecond},
-		{nil, 1 * time.Millisecond}, // give up after 3
+		{nil, 1 * time.Millisecond}, // slow retry after 3
 	}
 	s.runs["healthy"] = []runOutcome{
 		{nil, 100 * time.Millisecond}, // stable, loops forever after script
@@ -310,7 +359,7 @@ func TestLauncher_MultipleEntriesIndependent(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// Let broken give up, then cancel to release healthy.
+	// Let broken settle into its slow retry, then cancel to release healthy.
 	go func() {
 		time.Sleep(200 * time.Millisecond)
 		cancel()
@@ -318,7 +367,8 @@ func TestLauncher_MultipleEntriesIndependent(t *testing.T) {
 	_ = l.Run(ctx)
 
 	out := l.out()
-	assert.Contains(t, out, `"broken": giving up after 3 rapid crashes`)
+	assert.Contains(t, out, `"broken": rapid failures exceed 3`)
+	assert.NotContains(t, out, "giving up")
 	// healthy must still have been launched and run its stable pass.
 	assert.Contains(t, out, `"healthy" ran`)
 }

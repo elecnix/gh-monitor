@@ -291,8 +291,14 @@ type superviseConfig struct {
 	sleep      func(time.Duration)
 }
 
-// superviseOne runs one entry's restart loop until ctx is cancelled or the
-// entry gives up after maxFails rapid crashes.
+// superviseOne runs one entry's restart loop until ctx is cancelled. A
+// configured sub-daemon is never abandoned: a rapid-crash burst backs off up
+// to maxBackoff and keeps retrying — the event-driven wake path must
+// self-heal the moment the transient condition clears (measured 2026-08-22:
+// a broker-subscriber that gave up permanently after 5 rapid crashes left
+// gh-monitor polling-only, the shared GraphQL burn source). The only
+// permanent condition is a missing binary, which can never start and stops
+// that entry immediately.
 func superviseOne(ctx context.Context, out io.Writer, e Entry, cfg superviseConfig) {
 	backoff := cfg.minBackoff
 	consecutive := 0
@@ -311,8 +317,13 @@ func superviseOne(ctx context.Context, out io.Writer, e Entry, cfg superviseConf
 			_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: spawn: %v\n", e.Name, err)
 			consecutive++
 			if consecutive >= cfg.maxFails {
-				_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: giving up after %d spawn failures\n", e.Name, consecutive)
-				return
+				// The burst is spent: settle into a slow retry at the cap
+				// instead of giving up — the condition may be transient
+				// (a socket collision during an upgrade handoff), and a
+				// permanent fall to polling-only is exactly the defect.
+				_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: rapid failures exceed %d — retrying slowly every %s (the wake path stays armed)\n", e.Name, cfg.maxFails, cfg.maxBackoff)
+				cfg.sleep(cfg.maxBackoff)
+				continue
 			}
 			cfg.sleep(backoff)
 			backoff = nextBackoff(backoff, cfg.maxBackoff)
@@ -344,8 +355,9 @@ func superviseOne(ctx context.Context, out io.Writer, e Entry, cfg superviseConf
 		}
 		consecutive++
 		if consecutive >= cfg.maxFails {
-			_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: giving up after %d rapid crashes (each under %s)\n", e.Name, consecutive, cfg.stable)
-			return
+			_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: rapid failures exceed %d — retrying slowly every %s (the wake path stays armed)\n", e.Name, cfg.maxFails, cfg.maxBackoff)
+			cfg.sleep(cfg.maxBackoff)
+			continue
 		}
 		_, _ = fmt.Fprintf(out, "gh-monitor subdaemon: %q: rapid failure %d/%d — backing off %s\n", e.Name, consecutive, cfg.maxFails, backoff)
 		cfg.sleep(backoff)
