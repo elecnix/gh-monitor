@@ -853,14 +853,15 @@ type poller struct {
 	// one, when its first subscriber arrives. Guarded by hub.mu.
 	started bool
 
-	mu         sync.Mutex
-	latest     any               // raw payload of the last successful fetch
-	noChange   int               // consecutive fingerprint-unchanged fetches; drives idle backoff
-	tier       monitor.QueryTier // last fetched tier; drives shed notices
-	degraded   map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
-	errBackoff time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
-	blindFrom  time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
-	subs       map[*sub]struct{}
+	mu          sync.Mutex
+	latest      any               // raw payload of the last successful fetch
+	noChange    int               // consecutive fingerprint-unchanged fetches; drives idle backoff
+	tier        monitor.QueryTier // last fetched tier; drives shed notices
+	degraded    map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
+	errBackoff  time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
+	blindFrom   time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
+	lastSuccess time.Time         // when the last successful fetch completed; the honest lower bound for a blind window that opens later
+	subs        map[*sub]struct{}
 
 	wake  chan struct{}
 	stopc chan struct{}
@@ -1080,9 +1081,17 @@ func (p *poller) fetchOnce() {
 			// previous snapshot is retained; no inference replaces it.
 			// Record when the blind window opened: the last successful
 			// observation before the first failure of the episode (issue #99).
+			// time.Now() here would stamp the discovery of the blindness, not
+			// its start — events between the last success and this failure
+			// would fall outside the declared window and the recovery notice
+			// would claim they were observed. When no success has ever been
+			// recorded (first fetch failed, or a handoff resumed with no
+			// observation yet) the window's start is honestly unknowable, so
+			// blindFrom stays zero and the recovery declares no interval at
+			// all rather than a precise-looking lie.
 			p.mu.Lock()
 			if p.blindFrom.IsZero() {
-				p.blindFrom = time.Now()
+				p.blindFrom = p.lastSuccess
 			}
 			p.mu.Unlock()
 			msg := fmt.Sprintf("%v", err)
@@ -1140,6 +1149,7 @@ func (p *poller) fetchOnce() {
 		p.noChange++
 	}
 	p.latest = curr
+	p.lastSuccess = time.Now()
 	for s := range p.subs {
 		select {
 		case s.snapshotCh <- curr:

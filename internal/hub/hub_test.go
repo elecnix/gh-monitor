@@ -634,7 +634,7 @@ func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
 	calls := 0
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		calls++
-		if calls == 1 {
+		if calls == 2 {
 			return nil, errors.New("gh api failed: exit status 1")
 		}
 		return prFixture(nil), nil
@@ -647,7 +647,13 @@ func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
-	waitDegraded(t, ch, "the first failure must broadcast")
+	// The first fetch must succeed (an honest blind window opens at the last
+	// success) before the second, forced one fails.
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
+	require.Eventually(t, func() bool { return calls >= 2 },
+		2*time.Second, 5*time.Millisecond, "the failing fetch must run")
+
+	waitDegraded(t, ch, "the failure must broadcast")
 
 	// The next poll succeeds: the recovery notice must carry the gap window.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
