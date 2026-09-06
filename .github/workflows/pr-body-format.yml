@@ -25,16 +25,23 @@ jobs:
   pr-body-format:
     runs-on: arc-runners
     steps:
-      # The arc-runners image is minimal: no gh, no wget. Both checkers of
-      # gh-pr-body-action shell out to `gh`, so install it first (apt route,
-      # per https://github.com/cli/cli/blob/trunk/docs/install_linux.md).
-      # curl replaces wget; every command runs under pipefail so a failed
-      # download cannot leave an empty keyring behind.
+      # Prefer a preinstalled gh (e.g. ghcr.io/elecnix/actions-runner bakes it
+      # in) and fall back to the apt route (per
+      # https://github.com/cli/cli/blob/trunk/docs/install_linux.md) on the
+      # stock actions-runner image, which has neither gh nor curl.
       - name: Install gh CLI
         run: |
           set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version | head -1
+            exit 0
+          fi
           SUDO=""
           [ "$(id -u)" != 0 ] && SUDO="sudo"
+          if ! command -v curl >/dev/null 2>&1; then
+            $SUDO apt-get update
+            $SUDO apt-get install -y --no-install-recommends curl
+          fi
           $SUDO install -d -m 755 /etc/apt/keyrings
           $SUDO curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
             https://cli.github.com/packages/githubcli-archive-keyring.gpg
