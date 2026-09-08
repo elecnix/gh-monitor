@@ -285,7 +285,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s, idle ceiling %s)",
 		socket, interval, idleCeiling)
 	if pauseWhenHealthy {
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), ", timer polling pauses while the broker is healthy")
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), ", timer polling pauses for repositories the broker delivers events for")
 	} else {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 	}
@@ -411,6 +411,12 @@ type hubSource struct{ hub *hub.Hub }
 // h.SetBrokerHealth so a lost connection is loud and falls back to normal
 // interval polling within one poll cycle — never silence, per the "absence
 // is not success" guidance in the broker's own operator documentation.
+//
+// A wake also records coverage for the repository it names. That record, not
+// the connection's health, is what lets the hub reduce or suspend a target's
+// polling: one broker connection carries whichever repositories its webhooks
+// publish, and repositories outside that set must keep being polled however
+// healthy the socket looks. See hub.BrokerCoverage.
 func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 	cfg, ok := broker.ConfigFromEnv()
 	if !ok {
@@ -420,6 +426,13 @@ func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 	}
 
 	h.SetBrokerIdleCap(broker.IdleCapFromEnv(brokerIdleCapDefault))
+
+	// Coverage is what actually licenses skipping a poll — see
+	// hub.BrokerCoverage. It starts empty and fills in as events arrive, so a
+	// freshly started daemon polls every target normally until the broker has
+	// proved, repository by repository, that it carries their events.
+	coverage := broker.NewCoverage(broker.CoverageTTLFromEnv(broker.DefaultCoverageTTL))
+	h.SetBrokerCoverage(coverage)
 
 	w := broker.NewWatcher(cfg)
 	w.OnState = func(state broker.State, err error) {
@@ -436,6 +449,16 @@ func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 		}
 	}
 	w.OnWake = func(owner, repo string, prNumber int) {
+		// Every delivered event is evidence that this repository reaches us,
+		// whether or not anything is watching it right now. Announce the first
+		// one per repository so an operator can see which repositories the
+		// wake path has actually taken over — and, by omission, which are
+		// still being polled.
+		if coverage.Note(owner, repo) {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+				"gh-monitor daemon: broker covers %s/%s — its watches now lean on wake events, polling stays the safety net for repositories not listed here\n",
+				owner, repo)
+		}
 		if prNumber > 0 {
 			_ = h.RefreshPR(resolver.Identity{Owner: owner, Repo: repo, Number: prNumber})
 			return
