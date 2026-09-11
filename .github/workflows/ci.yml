@@ -9,7 +9,7 @@ on:
 
 jobs:
   test:
-    runs-on: arc-runners
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: 0
     steps:
@@ -33,7 +33,7 @@ jobs:
   # Cross-compile check: every target script/build.sh publishes.
   # Keep this list in sync with script/build.sh (source of truth).
   cross-compile:
-    runs-on: arc-runners
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: 0
     steps:
@@ -54,7 +54,7 @@ jobs:
   # scans the branch and its merge-base, and reports only the duplication this
   # change introduces. It warns inline on the diff; it never fails the build.
   dupdelta:
-    runs-on: arc-runners
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
