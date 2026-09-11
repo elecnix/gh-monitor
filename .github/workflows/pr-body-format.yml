@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   pr-body-format:
-    runs-on: arc-runners
+    runs-on: ubuntu-latest
     steps:
       # Prefer a preinstalled gh (e.g. ghcr.io/elecnix/actions-runner bakes it
       # in) and fall back to the apt route (per
