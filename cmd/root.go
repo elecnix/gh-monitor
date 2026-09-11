@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -55,8 +56,15 @@ func newRootCommand() *cobra.Command {
 }
 
 // ExecuteOrExit runs the command tree and exits with a non-zero status on error.
+// A --until watch that ended without the condition firing exits 2 (mirroring
+// await: 0 = condition met, 2 = the watch ended first), so callers can branch
+// on the exit status without parsing output.
 func ExecuteOrExit() {
 	if err := Execute(); err != nil {
+		if errors.Is(err, errUntilNotMet) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

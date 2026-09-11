@@ -143,8 +143,9 @@ prints nothing and the hook is a no-op.
 
 The `await` command has been removed. Use these `monitor` equivalents:
 
-| Old `await` command            | New `monitor` equivalent | Notes                                                                                                                  |
-| ------------------------------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `await --check-only`           | `monitor --once`         | Emits one or more NDJSON notifications instead of a single JSON `AwaitResult`; use `--text` for human-readable output. |
-| `await --mode all --timeout N` | `monitor --timeout N`    | Continuous streaming instead of a single result at timeout.                                                            |
-| `await --mode comments`        | not directly replaced    | Use `monitor` — the event types (`new-unresolved-threads`, `new-general-comments`) give finer-grained control.         |
+| Old `await` command            | New `monitor` equivalent      | Notes                                                                                                                  |
+| ------------------------------ | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `await --check-only`           | `monitor --once`              | Emits one or more NDJSON notifications instead of a single JSON `AwaitResult`; use `--text` for human-readable output. |
+| `await --mode all --timeout N` | `monitor --timeout N`         | Continuous streaming instead of a single result at timeout.                                                            |
+| `await --until <event>`        | `monitor --until <kind,kind>` | Exits 0 the first time any listed event kind fires (triggering event reported first); exit 2 if the watch ends first.  |
+| `await --mode comments`        | not directly replaced         | Use `monitor` — the event types (`new-unresolved-threads`, `new-general-comments`) give finer-grained control.         |

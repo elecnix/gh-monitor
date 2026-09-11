@@ -40,6 +40,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
 	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
 	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
+	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first)")
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
@@ -62,6 +63,7 @@ type monitorOptions struct {
 	Timeout       int
 	IgnoredBots   string
 	Events        string
+	Until         string
 	Annotations   string
 	Once          bool
 	Text          bool
@@ -305,6 +307,21 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		eventFilter = filter
 	}
 
+	// --until: a comma-separated set of event kinds using the same syntax and
+	// validation as --events (ParseEventFilter rejects a typo loudly). The
+	// watch ends the FIRST time any member fires; the flag is applied here at
+	// the consumer loop, not in per-backend code, so it works whatever
+	// transport serves the watch — the shared-poller daemon, an external
+	// backend, or the in-process --once path.
+	var untilFilter *monitor.EventFilter
+	if strings.TrimSpace(opts.Until) != "" {
+		filter, err := monitor.ParseEventFilter(opts.Until)
+		if err != nil {
+			return err
+		}
+		untilFilter = filter
+	}
+
 	// --annotation-levels: a per-annotation-level filter applied at snapshot
 	// time. Omitted (nil) → default (warning + failure).
 	if strings.TrimSpace(opts.Annotations) != "" {
@@ -437,6 +454,11 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 	evlogFailed := false
 
+	// untilMet records whether a --until member fired before the stream
+	// ended; the check after the loop turns "ended without firing" into the
+	// errUntilNotMet sentinel (exit code 2).
+	untilMet := false
+
 	// Eyes-on-notify (pref reactOnNotify, default on): every comment a
 	// delivered notification is about gets a 👀 reaction, so humans on the PR
 	// can see the notification was received.
@@ -473,14 +495,40 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 					"gh-monitor: event log write failed (%v); logging disabled for this watch\n", err)
 			}
 		}
-		emit(monitor.Render(u, runOpts.Prefs, runOpts.Interval))
+		n := monitor.Render(u, runOpts.Prefs, runOpts.Interval)
+		// --until: the first member to fire ends the watch. It is written
+		// DIRECTLY, bypassing the --events emit() suppression, so the caller
+		// always learns which event triggered the exit even if that kind is
+		// not in the --events allowlist. Cursor persist and the event log ran
+		// above, so cursor and log stay correct on the early exit too.
+		if untilFilter != nil && untilFilter.Allows(n.Type) {
+			write(n)
+			ackEmit(u.Event)
+			untilMet = true
+			break
+		}
+		emit(n)
 		ackEmit(u.Event)
 	}
-	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		return err
+	ctxErr := ctx.Err()
+	if ctxErr != nil && !errors.Is(ctxErr, context.Canceled) {
+		return ctxErr
+	}
+	// The sentinel only covers a watch that ended on its own — timeout or a
+	// closed stream. A Ctrl-C (context.Canceled) is the user cancelling, not
+	// the condition failing, so it exits 0 as before.
+	if untilFilter != nil && !untilMet && ctxErr == nil {
+		return errUntilNotMet
 	}
 	return nil
 }
+
+// errUntilNotMet is the sentinel runMonitor returns when a --until watch ends
+// without any member of the set having fired (e.g. the --timeout safeguard
+// expired or the stream closed). ExecuteOrExit maps it to exit code 2 so a
+// caller can tell "condition met" (0) from "gave up" (2) without parsing
+// output; a Ctrl-C (context.Canceled) is neither and exits 0 as before.
+var errUntilNotMet = errors.New("--until condition not met before the watch ended")
 
 // daemonSocketPath returns the daemon socket path. It honours $GH_MONITOR_SOCK
 // for tests.
