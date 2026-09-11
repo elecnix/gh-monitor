@@ -210,6 +210,7 @@ gh monitor --once -R owner/repo 42
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
+- `--until <kind,kind>` - Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
 - `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
@@ -227,6 +228,22 @@ gh monitor --run-id 30433642 -R owner/repo --events run-completed
 ```
 
 The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`, `degraded`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+
+#### Exiting when a condition fires with `--until`
+
+`--events` shapes what is streamed; `--until` turns the watch itself into an await: it takes the same comma-separated set of event kinds (validated identically, so a typo fails loudly) and ends the watch the FIRST time any member fires — any member, not all of them. The triggering event is always written to stdout before exiting, even when `--events` would have suppressed it, so the caller can tell what woke the watch.
+
+```sh
+# Wake as soon as CI turns all green or starts failing, for at most 30 minutes:
+gh monitor -R owner/repo 42 --until ci-all-green,new-failing-checks --timeout 1800
+
+# Exit the moment the PR merges:
+gh monitor -R owner/repo 42 --until merged
+```
+
+The exit code carries the answer: **0** means the condition was met (the triggering event was reported, then the watch exited), and **2** means the watch ended without the condition firing — the `--timeout` safeguard expired or the target stream closed. `--timeout` stays a maximum watch time, never a completion condition. A Ctrl-C is still just a cancel and exits 0. With `--once`, the single snapshot is the whole watch: exit 0 if a set member is present in that snapshot, else 2.
+
+The flag is applied at the consumer layer, so it behaves identically whichever transport serves the watch — the shared-poller daemon, an out-of-process backend, or the in-process `--once` path. An already-green PR emits `ci-all-green` on its first poll, so `--until ci-all-green` on a green PR exits almost immediately.
 
 `degraded` reports that an API surface (graphql or rest) could not be read. It is emitted per **episode**, not per failed poll, so an outage costs a consumer a handful of notifications instead of one per poll: once when a surface degrades, once more if the error message changes while it stays degraded, and once — a ✅ recovery notice — when the next successful poll shows it is back. The recovery notice **declares the gap** ([#99](https://github.com/elecnix/gh-monitor/issues/99)): events missed during the blind window are not replayed afterwards — the cursor contract advances only on successful fetches — so the notice carries `degraded_from`/`degraded_to` RFC 3339 timestamps of the blind window and says events between them were not observed and will not be replayed. A caller that knows it has a hole can backfill from REST; a caller that does not know it has a hole cannot. The notice names what the failed read stopped **delivering**, not just which API failed: a PR's check outcomes, head commit, and mergeability ride the same GraphQL query as its comments and reviews, so a failed PR query can suppress check outcomes even though the tier system never sheds them ([#98](https://github.com/elecnix/gh-monitor/issues/98)). The structured event carries the list in `degraded_surfaces`, the built-in sentence appends `; no longer delivering: …`, and custom templates interpolate it as `{degradedSurfaces}`. Like every other kind it has a preferences template key (rewordable in the preferences file) and can be included in or excluded from `--events`; leaving it out of an allowlist mutes the warnings entirely.
 
