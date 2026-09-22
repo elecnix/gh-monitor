@@ -81,14 +81,39 @@ func cleanFailedLogLine(line string) string {
 	return fields[1] + "\t" + logTsRE.ReplaceAllString(fields[2], "")
 }
 
+// FailedLogHint returns the exact `gh` command that prints the whole
+// failed-step log of a workflow run, for embedding in a truncated snippet's
+// marker line. It exists so an agent reading a notification needs no second
+// guess about the run id, the repository argument, or the right subcommand:
+// `gh run view --log-failed` re-fetches precisely the log the snippet was cut
+// from, complete instead of tail-only.
+//
+// The repository is rendered the way `gh --repo` accepts it —
+// [HOST/]OWNER/REPO, with github.com left bare so gh resolves it by default
+// (the same form ghcli.Client.FailedRunLogs uses). An identity missing its
+// owner/repo or a zero run id yields "", and SummarizeFailedLog then falls
+// back to a marker with no command rather than printing a broken one.
+func FailedLogHint(id resolver.Identity, runID int) string {
+	if runID == 0 || id.Owner == "" || id.Repo == "" {
+		return ""
+	}
+	repoArg := id.Owner + "/" + id.Repo
+	if host := strings.TrimSpace(id.Host); host != "" && host != "github.com" {
+		repoArg = host + "/" + repoArg
+	}
+	return fmt.Sprintf("gh run view %d --repo %s --log-failed", runID, repoArg)
+}
+
 // SummarizeFailedLog cleans and tail-truncates the failed-run log output so
 // the snippet carries the error (which lives at the end of the `--log-failed`
 // output) plus its immediate context. When the cleaned log fits within
 // maxLines it is returned verbatim; otherwise the last maxLines lines are
 // kept, prefixed by a one-line marker noting how many earlier lines were
-// dropped. Empty input yields "". It is exported so the shared poller daemon
+// dropped. hint, when non-empty, is appended to that marker so the truncation
+// states exactly which command fetches the dropped lines (see FailedLogHint).
+// Empty input yields "". It is exported so the shared poller daemon
 // summarizes snippets exactly as the watch path always has.
-func SummarizeFailedLog(s string, maxLines int) string {
+func SummarizeFailedLog(s string, maxLines int, hint string) string {
 	s = strings.TrimPrefix(s, "\ufeff") // strip a leading BOM if present
 	if strings.TrimSpace(s) == "" {
 		return ""
@@ -105,7 +130,19 @@ func SummarizeFailedLog(s string, maxLines int) string {
 		return strings.Join(cleaned, "\n")
 	}
 	dropped := len(cleaned) - maxLines
-	return fmt.Sprintf("… (%d earlier lines truncated)\n%s", dropped, strings.Join(cleaned[len(cleaned)-maxLines:], "\n"))
+	return truncationMarker(dropped, hint) + "\n" + strings.Join(cleaned[len(cleaned)-maxLines:], "\n")
+}
+
+// truncationMarker renders the single line that stands in for the dropped head
+// of a truncated snippet. It is deliberately explicit: a bare "truncated" is a
+// dead end for a consumer that only sees the notification, while a marker
+// naming the command that fetches the full failed-step log is actionable
+// without an extra discovery turn. hint == "" keeps the marker command-free.
+func truncationMarker(dropped int, hint string) string {
+	if hint == "" {
+		return fmt.Sprintf("… (%d earlier lines truncated)", dropped)
+	}
+	return fmt.Sprintf("… (%d earlier lines truncated — full failed-step log: %s)", dropped, hint)
 }
 
 // Notification is one emitted event, rendered for a consumer. It serializes to a

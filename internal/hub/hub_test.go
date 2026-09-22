@@ -910,3 +910,56 @@ func TestPoller_ErrorAfterTierSelectionStillBroadcasts(t *testing.T) {
 	}
 	assert.True(t, degraded, "an error after the first success must still degrade loudly")
 }
+
+// TestFailedRunLogDetail_TruncationNamesTheFetchCommand pins the contract an
+// agent reads off a failed run-completed notification: when the log snippet is
+// truncated, its first line must name the exact command that fetches the rest
+// of the failed step, with the run id and the repository argument resolved for
+// the host being watched.
+func TestFailedRunLogDetail_TruncationNamesTheFetchCommand(t *testing.T) {
+	var longLog strings.Builder
+	for i := 0; i < monitor.MaxFailedLogLines+12; i++ {
+		fmt.Fprintf(&longLog, "ci\tbuild\t2026-01-01T00:00:00.000Z line %d\n", i)
+	}
+
+	t.Run("hint carries run id and bare repo on github.com", func(t *testing.T) {
+		var askedRunID int
+		h := &Hub{failedLogs: func(owner, repo string, runID int) (string, error) {
+			assert.Equal(t, "elecnix", owner)
+			assert.Equal(t, "gh-monitor", repo)
+			askedRunID = runID
+			return longLog.String(), nil
+		}}
+		detail := h.failedRunLogDetail(resolver.Identity{
+			Owner: "elecnix", Repo: "gh-monitor", Host: "github.com", Target: "run", RunID: 30433642,
+		})(30433642)
+
+		assert.Equal(t, 30433642, askedRunID)
+		lines := strings.Split(detail, "\n")
+		require.Len(t, lines, monitor.MaxFailedLogLines+1, "marker + snippet, nothing else")
+		assert.Contains(t, lines[0], "12 earlier lines truncated")
+		assert.Contains(t, lines[0], "gh run view 30433642 --repo elecnix/gh-monitor --log-failed")
+	})
+
+	t.Run("hint keeps the enterprise host", func(t *testing.T) {
+		h := &Hub{failedLogs: func(_, _ string, _ int) (string, error) { return longLog.String(), nil }}
+		detail := h.failedRunLogDetail(resolver.Identity{
+			Owner: "octo", Repo: "demo", Host: "ghe.example.com", Target: "run", RunID: 13,
+		})(13)
+		assert.Contains(t, strings.Split(detail, "\n")[0], "gh run view 13 --repo ghe.example.com/octo/demo --log-failed")
+	})
+
+	t.Run("short log carries no marker and no hint", func(t *testing.T) {
+		h := &Hub{failedLogs: func(_, _ string, _ int) (string, error) {
+			return "ci\tbuild\t2026-01-01T00:00:00.000Z boom\n", nil
+		}}
+		detail := h.failedRunLogDetail(resolver.Identity{Owner: "octo", Repo: "demo"})(13)
+		assert.Equal(t, "build\tboom", detail)
+		assert.NotContains(t, detail, "gh run view")
+	})
+
+	t.Run("no fetcher yields no detail", func(t *testing.T) {
+		h := &Hub{}
+		assert.Equal(t, "", h.failedRunLogDetail(resolver.Identity{Owner: "octo", Repo: "demo"})(13))
+	})
+}

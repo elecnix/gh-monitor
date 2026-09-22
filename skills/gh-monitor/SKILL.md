@@ -136,7 +136,7 @@ Same flags as PR monitoring (`--interval`, `--timeout`, `--once`, `--text`, `-R`
 | `run-in-progress` | Run transitioned to `in_progress`                     |
 | `run-completed`   | Run finished — `conclusion` field carries the outcome |
 
-The `run-completed` event's `conclusion` is one of: `success`, `failure`, `timed_out`, `cancelled`, `neutral`, `action_required`, `stale`, `skipped`. Each event includes `run_id`, the run URL (`pr_url`), and the head commit. For a failure conclusion (`failure`, `timed_out`, `cancelled`, `action_required`), the event also includes a `detail` body with the first 50 lines of the failed-job logs (`gh run view <run-id> --log-failed`), so an agent can diagnose without an extra API call.
+The `run-completed` event's `conclusion` is one of: `success`, `failure`, `timed_out`, `cancelled`, `neutral`, `action_required`, `stale`, `skipped`. Each event includes `run_id`, the run URL (`pr_url`), and the head commit. For a failure conclusion (`failure`, `timed_out`, `cancelled`, `action_required`), the event also includes a `detail` body with the last 50 lines of the failed-job logs (`gh run view <run-id> --log-failed`), so an agent can diagnose without an extra API call. When the log is longer than those 50 lines, the body's first line says how many lines were dropped and spells out the command that fetches the whole failed-step log (e.g. `gh run view 30433642 --repo owner/repo --log-failed`) — run that rather than guessing the run id or repository.
 
 ## Critical Workflows
 
