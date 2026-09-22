@@ -401,7 +401,7 @@ Emitted by `monitor` as one NDJSON object per line (one event per genuinely-new 
     },
     "detail": {
       "type": "string",
-      "description": "Rich, self-contained body with per-thread/comment excerpts and act-on-it hints (new-unresolved-threads / new-general-comments), or a truncated snippet of the failed-job logs for a failed run-completed (first 50 lines of `gh run view --log-failed`); lets a consumer act without extra API calls"
+      "description": "Rich, self-contained body with per-thread/comment excerpts and act-on-it hints (new-unresolved-threads / new-general-comments), or the last 50 lines of the failed-job logs for a failed run-completed (`gh run view <run-id> --log-failed`). A truncated snippet opens with a one-line marker stating how many earlier lines were dropped and the exact command that fetches the full failed-step log (`gh run view <run-id> --repo <owner>/<repo> --log-failed`); lets a consumer act without extra API calls"
     },
     "pr_url": {
       "type": "string",

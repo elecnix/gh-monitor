@@ -5,19 +5,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSummarizeFailedLog(t *testing.T) {
 	t.Run("empty stays empty", func(t *testing.T) {
-		assert.Equal(t, "", SummarizeFailedLog("", 50))
-		assert.Equal(t, "", SummarizeFailedLog("   \n  ", 50))
+		assert.Equal(t, "", SummarizeFailedLog("", 50, ""))
+		assert.Equal(t, "", SummarizeFailedLog("   \n  ", 50, ""))
 	})
 
 	t.Run("under limit cleaned and joined", func(t *testing.T) {
 		in := "admin-ci\tbuild\t2026-01-01T00:00:00.000Z step one\nadmin-ci\tbuild\t2026-01-01T00:00:01.000Z step two\n"
-		out := SummarizeFailedLog(in, 50)
+		out := SummarizeFailedLog(in, 50, "")
 		assert.Equal(t, "build\tstep one", strings.Split(out, "\n")[0])
 		assert.Equal(t, "build\tstep two", strings.Split(out, "\n")[1])
 		assert.NotContains(t, out, "2026-01-01")
@@ -28,7 +29,7 @@ func TestSummarizeFailedLog(t *testing.T) {
 		for i := 0; i < 60; i++ {
 			b.WriteString("wf\tjob\t2026-01-01T00:00:00.000Z line " + strconv.Itoa(i) + "\n")
 		}
-		out := SummarizeFailedLog(b.String(), 50)
+		out := SummarizeFailedLog(b.String(), 50, "")
 		lines := strings.Split(out, "\n")
 		require.Len(t, lines, 51) // marker + 50
 		assert.Contains(t, lines[0], "earlier lines truncated")
@@ -39,15 +40,54 @@ func TestSummarizeFailedLog(t *testing.T) {
 		assert.NotContains(t, out, "line 0")
 	})
 
+	t.Run("over limit names the fetch command when hinted", func(t *testing.T) {
+		var b strings.Builder
+		for i := 0; i < 60; i++ {
+			b.WriteString("wf\tjob\t2026-01-01T00:00:00.000Z line " + strconv.Itoa(i) + "\n")
+		}
+		hint := "gh run view 30433642 --repo elecnix/gh-monitor --log-failed"
+		out := SummarizeFailedLog(b.String(), 50, hint)
+		lines := strings.Split(out, "\n")
+		require.Len(t, lines, 51) // marker + 50: the hint must not add lines
+		assert.Equal(t, "… (10 earlier lines truncated — full failed-step log: "+hint+")", lines[0])
+		// One marker, not one per dropped line.
+		assert.Equal(t, 1, strings.Count(out, "truncated"))
+		assert.Contains(t, lines[50], "line 59")
+	})
+
 	t.Run("exactly at limit no marker", func(t *testing.T) {
 		var b strings.Builder
 		for i := 0; i < 50; i++ {
 			b.WriteString("wf\tjob\t2026-01-01T00:00:00.000Z line " + strconv.Itoa(i) + "\n")
 		}
-		out := SummarizeFailedLog(b.String(), 50)
+		out := SummarizeFailedLog(b.String(), 50, "gh run view 1 --repo o/r --log-failed")
 		lines := strings.Split(out, "\n")
 		assert.Len(t, lines, 50)
 		assert.NotContains(t, out, "truncated")
+		assert.NotContains(t, out, "gh run view")
+	})
+}
+
+func TestFailedLogHint(t *testing.T) {
+	t.Run("github.com leaves the repository bare", func(t *testing.T) {
+		id := resolver.Identity{Owner: "elecnix", Repo: "gh-monitor", Host: "github.com"}
+		assert.Equal(t, "gh run view 30433642 --repo elecnix/gh-monitor --log-failed", FailedLogHint(id, 30433642))
+	})
+
+	t.Run("empty host resolves like github.com", func(t *testing.T) {
+		id := resolver.Identity{Owner: "elecnix", Repo: "gh-monitor"}
+		assert.Equal(t, "gh run view 7 --repo elecnix/gh-monitor --log-failed", FailedLogHint(id, 7))
+	})
+
+	t.Run("enterprise host is kept so the command targets the right server", func(t *testing.T) {
+		id := resolver.Identity{Owner: "octo", Repo: "demo", Host: "ghe.example.com"}
+		assert.Equal(t, "gh run view 13 --repo ghe.example.com/octo/demo --log-failed", FailedLogHint(id, 13))
+	})
+
+	t.Run("incomplete identity or run yields no hint", func(t *testing.T) {
+		assert.Equal(t, "", FailedLogHint(resolver.Identity{}, 5))
+		assert.Equal(t, "", FailedLogHint(resolver.Identity{Owner: "octo"}, 5))
+		assert.Equal(t, "", FailedLogHint(resolver.Identity{Owner: "octo", Repo: "demo"}, 0))
 	})
 }
 

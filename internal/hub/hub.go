@@ -876,6 +876,11 @@ func repoCursor(raw any) string {
 // needs, bound to the hub's injected FailedRunLogFetcher (WithFailedRunLogFetcher).
 // Without one, failed-run notifications carry no log snippet — degraded, not
 // broken.
+//
+// When the snippet is truncated, its marker line names the exact command that
+// fetches the full failed-step log (monitor.FailedLogHint), resolved against
+// the identity being watched so the command is copy-pasteable — including the
+// host for enterprise identities.
 func (h *Hub) failedRunLogDetail(id resolver.Identity) func(runID int) string {
 	return func(runID int) string {
 		if h.failedLogs == nil {
@@ -886,7 +891,7 @@ func (h *Hub) failedRunLogDetail(id resolver.Identity) func(runID int) string {
 			fmt.Fprintf(os.Stderr, "gh-monitor: failed-run log fetch error: %v\n", err)
 			return ""
 		}
-		return monitor.SummarizeFailedLog(out, monitor.MaxFailedLogLines)
+		return monitor.SummarizeFailedLog(out, monitor.MaxFailedLogLines, monitor.FailedLogHint(id, runID))
 	}
 }
 
