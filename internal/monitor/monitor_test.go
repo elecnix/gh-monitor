@@ -1154,6 +1154,97 @@ func TestSnapshot_LatestVerdictWinsAmongVerdicts(t *testing.T) {
 	assert.False(t, ciAllGreen(s), "a PR with a failing verdict is not green")
 }
 
+func TestSnapshot_EmptyContainerSuitesAreNotChecks(t *testing.T) {
+	// Measured live (2026-09-22) on a large private repository: every check run
+	// concluded SUCCESS or SKIPPED, and the monitor still printed "Failing CI
+	// checks: GitHub Actions" — the app label, not a check. The head carried 7
+	// suites with the container app name "GitHub Actions", concluded CANCELLED,
+	// status COMPLETED, and ZERO check runs.
+	//
+	// #96's premise was that such a suite is a superseded attempt whose runs
+	// live in the CANCELLED suite. GitHub does not work that way: a cancelled
+	// attempt's runs stay attached to their own suite and keep that suite's
+	// SUCCESS conclusion, so a runless CANCELLED container suite is a phantom
+	// with no runs anywhere. Treating it as a verdict manufactures a red that
+	// never clears — the identical symptom #96 set out to fix, one shape over.
+	pr := mkPRWithCheckSuites(
+		// The real head also carries genuinely empty container suites concluded
+		// SUCCESS; they must not pad the positive evidence either.
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "GitHub Actions"}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "GitHub Actions"}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "build / vet / fmt / test", Status: "COMPLETED", Conclusion: "SUCCESS",
+					CompletedAt: "2026-09-22T14:39:57Z"},
+			}}},
+	)
+	s := Snapshot(pr, SnapshotOptions{})
+	assert.Empty(t, s.FailingChecks, "an empty container suite is not a check and cannot fail")
+	assert.NotContains(t, s.SuccessfulChecks, "GitHub Actions", "an empty container suite is not a check and cannot vouch for CI either")
+	assert.Contains(t, s.SuccessfulChecks, "build / vet / fmt / test")
+	assert.Empty(t, s.PendingChecks)
+	assert.True(t, ciAllGreen(s), "a PR whose only red is an empty container suite is green")
+}
+
+func TestSnapshot_EmptyContainerDiffDoesNotFireNewFailingChecks(t *testing.T) {
+	// End-to-end of the reported symptom: the false red landed in FailingChecks
+	// on the FIRST poll, so a watch armed with new-failing-checks resolved
+	// immediately on a green PR. Two identical polls must emit no failing-check
+	// event, and the first snapshot must already be clean.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{Status: "COMPLETED", Conclusion: "CANCELLED", App: AppInfo{Name: "GitHub Actions"}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "build / vet / fmt / test", Status: "COMPLETED", Conclusion: "SUCCESS",
+					CompletedAt: "2026-09-22T14:39:57Z"},
+			}}},
+	)
+	first := Snapshot(pr, SnapshotOptions{})
+	second := Snapshot(pr, SnapshotOptions{})
+	events := Diff(first, second)
+	assert.Nil(t, findEvent(events, EventNewFailingChecks), "an empty container suite must not arm a red that resolves a watch")
+	assert.Empty(t, first.FailingChecks)
+	assert.True(t, ciAllGreen(first))
+}
+
+func TestSnapshot_EmptyPendingContainerSuiteIsNotPending(t *testing.T) {
+	// The pending side reads the same phantom. GitHub materialises a suite per
+	// workflow — IN_PROGRESS and runless — before its jobs exist (measured in
+	// cli/cli and kubernetes/kubernetes), and it carries the container app name.
+	// Naming it holds a finished PR out of green, and because every workflow
+	// shares that one name the pending can never be attributed or cleared.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{Status: "IN_PROGRESS", App: AppInfo{Name: "GitHub Actions"}},
+		CheckSuite{Status: "COMPLETED", Conclusion: "SUCCESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "build / vet / fmt / test", Status: "COMPLETED", Conclusion: "SUCCESS",
+					CompletedAt: "2026-09-22T14:39:57Z"},
+			}}},
+	)
+	s := Snapshot(pr, SnapshotOptions{})
+	assert.NotContains(t, s.PendingChecks, "GitHub Actions", "an empty container suite is not a check in flight")
+	assert.Empty(t, s.PendingChecks)
+	assert.True(t, ciAllGreen(s))
+}
+
+func TestSnapshot_PendingContainerSuiteWithRunsStillCounts(t *testing.T) {
+	// The other side of the pending rule, kept deliberately: a container suite
+	// reports its app name, but when the suite carries runs the verdict it
+	// produces is still right — a run IS in flight, and the name stops being
+	// pending once that run concludes. Suppressing the app name here would lose
+	// the pending reading entirely and let a PR report green while a job runs.
+	pr := mkPRWithCheckSuites(
+		CheckSuite{Status: "IN_PROGRESS", App: AppInfo{Name: "GitHub Actions"},
+			CheckRuns: RunNodes{Nodes: []CheckRun{
+				{Name: "build", Status: "IN_PROGRESS", StartedAt: "2026-09-22T14:39:57Z"},
+			}}},
+	)
+	s := Snapshot(pr, SnapshotOptions{})
+	assert.NotEmpty(t, s.PendingChecks, "a run still in flight keeps the PR out of green")
+	assert.False(t, ciAllGreen(s), "CI is not green while a run is still in flight")
+}
+
 func TestSnapshot_CancelledRequiredCheckIsFailure(t *testing.T) {
 	// CANCELLED on a check that ran does not count as a pass. It is already in
 	// failureConclusions, which failingChecks catches. This test proves the

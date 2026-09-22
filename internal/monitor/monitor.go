@@ -1001,6 +1001,39 @@ func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) (annotations 
 	return out, truncated, url
 }
 
+// suiteCarriesRuns reports whether a suite has at least one check run attached.
+//
+// A suite with NO runs is never a verdict on its own. GitHub leaves runs
+// attached to the suite that created them, and keeps that suite's conclusion —
+// a superseded attempt's suite reads CANCELLED only when the attempt had no
+// runs to conclude, i.e. it is the empty container suite the GitHub Actions app
+// materialises per workflow. Those suites all share the container app name, so
+// reading one as a result manufactures a check named "GitHub Actions" that no
+// run backs and that never clears. Classifying by the app name is the same
+// phantom #96 fixed for the with-runs shape; this is the empty-suite shape of
+// it (measured live 2026-09-22 on a large private repo: 7 empty CANCELLED
+// "GitHub Actions" suites, every run SUCCESS or SKIPPED, and the monitor still
+// reported a failing check).
+//
+// The cost is the opposite phantom, accepted deliberately: a cancelled required
+// check that never produced a run reads as absent rather than red, which lands
+// it in AwaitingChecks and still holds CI out of green.
+func suiteCarriesRuns(s *CheckSuite) bool { return len(s.CheckRuns.Nodes) > 0 }
+
+// containerApps are the apps GitHub uses as a CONTAINER for check runs, never
+// as the check itself: the app runs workflows and each run carries its own job
+// name. A suite from one of these that carries no runs has nothing to report,
+// so its own conclusion is not a result. Matched on slug and name, because the
+// tests build suites by name and the API offers both.
+var containerApps = map[string]bool{
+	"github-actions": true,
+	"github actions": true,
+}
+
+func isContainerApp(s *CheckSuite) bool {
+	return containerApps[strings.ToLower(s.App.Slug)] || containerApps[strings.ToLower(s.App.Name)]
+}
+
 // failingChecks collects names of failing check suites/runs plus old-style
 // status contexts in FAILURE/ERROR states.
 func failingChecks(pr *PullRequest) []string {
@@ -1020,15 +1053,12 @@ func failingChecks(pr *PullRequest) []string {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
-			// Only a suite that carries NO check runs is reported by its own
-			// suite/app conclusion. A container suite that DOES carry runs must
-			// defer entirely to per-run/verdict classification: the API nests each
-			// superseded (CANCELLED) attempt in its own suite concluded CANCELLED,
-			// and every such suite shares the container app name (e.g. "GitHub
-			// Actions"). Reporting the suite name there manufactures a phantom that
-			// never clears even though the per-name verdict — the newer SUCCESS —
-			// is green (measured 2026-08-25, PR #1531).
-			if isFailureConclusion(suite.Conclusion) && len(suite.CheckRuns.Nodes) == 0 {
+			// A suite's own conclusion is a result ONLY when the suite carries no
+			// runs — a lone non-container check (e.g. the "CI" app) that concluded
+			// CANCELLED and produced nothing. Where runs exist, classification
+			// defers to them per name; where the app is the container, an empty
+			// suite is not a check at all (see suiteCarriesRuns).
+			if isFailureConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
@@ -1090,11 +1120,11 @@ func successfulChecks(pr *PullRequest) []string {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
-			// Mirror of the failingChecks rule: a container suite that carries runs
-			// is not credited by its app name either — a SUCCESS container suite
-			// would otherwise pad SuccessfulChecks with the container name, hiding
-			// a name whose own verdict failed. Defer to per-run classification.
-			if isSuccessConclusion(suite.Conclusion) && len(suite.CheckRuns.Nodes) == 0 {
+			// Mirror of the failingChecks rule: a suite's own conclusion is a result
+			// only when it carries no runs and is not the container app. A SUCCESS
+			// container suite would otherwise pad SuccessfulChecks with the app
+			// name, and every PR on GitHub has such a suite.
+			if isSuccessConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
@@ -1147,7 +1177,13 @@ func pendingChecks(pr *PullRequest) []string {
 		c := &pr.Commits.Nodes[i].Commit
 		for j := range c.CheckSuites.Nodes {
 			suite := &c.CheckSuites.Nodes[j]
-			if isPendingStatus(suite.Status) {
+			// Same rule as the other two classifiers: an empty container suite is
+			// not a check. GitHub materialises one per workflow, runless, before
+			// its jobs exist. Where the suite DOES carry runs, the app name is
+			// still reported — imprecise, but the verdict it produces is right,
+			// because a run is genuinely in flight and the suite clears when it
+			// concludes.
+			if isPendingStatus(suite.Status) && (!isContainerApp(suite) || suiteCarriesRuns(suite)) {
 				add(suiteName(suite))
 			}
 		}
