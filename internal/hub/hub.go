@@ -422,7 +422,9 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			case <-ctx.Done():
 			}
 		}
-		handle.consume(distill(raw, snapOpts), emit)
+		add, flush := backend.Batch(emit)
+		handle.consume(distill(raw, snapOpts), add)
+		flush()
 	}()
 	return out
 }
@@ -1455,9 +1457,13 @@ func (s *sub) loop() {
 				}
 			}
 			curr := s.distill(raw, s.snapOpts)
+			// One poll's diff goes out as one batch, so a --until watch
+			// can print the rest of the batch that fired it (issue #116).
+			add, flush := backend.Batch(emit)
 			s.mu.Lock()
-			terminal := s.handle.consume(curr, emit)
+			terminal := s.handle.consume(curr, add)
 			s.mu.Unlock()
+			flush()
 			if terminal {
 				close(s.out)
 				return
