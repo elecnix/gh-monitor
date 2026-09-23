@@ -49,7 +49,7 @@ flowchart LR
     C2 --> S
     S --> RS
     RS -- "kind served by a live child" --> B
-    RS -- "other kinds,\ndead-child fallback" --> HUB
+    RS -- "other kinds, pr backlog,\ndead-child fallback" --> HUB
     L -- "launches, sets GH_MONITOR_SOCK\nto the private path" --> B
     REG -- "remote.Connect probe" --> B
     REG -. "kinds discovered from hello" .-> RS
@@ -57,14 +57,21 @@ flowchart LR
 
 Practical consequences when debugging or extending the daemon:
 
-- broker-subscriber serves a `pr` watch **without touching the GitHub API**.
-  The hub never creates a poller for it. Continuous watches carry a
-  `ResumeID` and route to the child too
+- broker-subscriber serves a continuous `pr` watch after its first poll. The
+  child knows a PR only from the webhook events it saw, so it has no record of
+  comments, threads or failing checks from before the watch. The hub fetches
+  the PR once at the full tier and sends that first-poll batch, which is the
+  backlog. Then the child serves the rest of the watch, with its baseline set
+  to the hub's snapshot, and the router drops the child's own first poll
+  ([#119](https://github.com/elecnix/gh-monitor/issues/119)). The hub never
+  creates a poller for the watch. Continuous watches carry a `ResumeID` and
+  route to the child too
   ([#114](https://github.com/elecnix/gh-monitor/issues/114)). Polling for `pr`
   happens only as a fallback: the child's dial fails or it ends a watch early.
   The watch then gets a notice that states the child's name, and the daemon log records it.
-- A `--once` read uses a daemon that is already listening, so a child can
-  answer it. It never spawns one.
+- A `--once` read is the backlog, so the hub answers it with one fetch and the
+  child never sees it. The read uses a daemon that is already listening and
+  never spawns one.
 - Sub-daemon children bind private sockets next to the daemon socket
   (`subdaemon-<name>.sock`); the launcher redirects them via
   `GH_MONITOR_SOCK`. If you see one bound to the public path, something is

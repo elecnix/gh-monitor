@@ -511,8 +511,9 @@ func TestDaemon_SubdaemonConfig_ProjectFileOwnsSocket(t *testing.T) {
 
 // TestDaemon_RoutesSubdaemonKinds pins the end-to-end multiplexing contract
 // (issue #88): a client watching a kind a live sub-daemon serves gets the
-// sub-daemon's updates through the daemon socket, while the hub is never
-// consulted for it — and gh-monitor still owns and advertises the socket.
+// sub-daemon's updates through the daemon socket, while the hub fetches the
+// target only once, for the backlog (issue #119) — and gh-monitor still owns
+// and advertises the socket.
 func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	serveCtx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -526,12 +527,12 @@ func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	sub := &holdingSubdaemonSource{resumeIDs: make(chan string, 1)}
 	startFakeSubdaemon(t, serveCtx, brokerSock, []backend.Kind{backend.KindPR}, sub)
 
-	// The hub under the daemon's routing layer: a fetch that fails the test
-	// if it is ever consulted — a pr watch must go to the sub-daemon.
-	var hubCalled atomic.Bool
+	// The hub under the daemon's routing layer counts its fetches: the
+	// backlog read is the only one a pr watch may cost.
+	var hubFetches atomic.Int64
 	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
-		hubCalled.Store(true)
-		return nil, errors.New("hub must not be consulted while the sub-daemon serves pr")
+		hubFetches.Add(1)
+		return openPR(), nil
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
 
@@ -562,12 +563,18 @@ func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	select {
 	case got := <-ch:
 		if got.Event.Type != backend.EventFirstPoll {
-			t.Fatalf("got %q, want the sub-daemon's first-poll", got.Event.Type)
+			t.Fatalf("got %q, want the backlog's first-poll", got.Event.Type)
 		}
 	case <-ctx.Done():
-		t.Fatal("the sub-daemon's update never reached the client through the daemon socket")
+		t.Fatal("the first poll never reached the client through the daemon socket")
 	}
-	assert.False(t, hubCalled.Load(), "the hub must not poll for a kind the sub-daemon serves")
+	select {
+	case <-sub.resumeIDs:
+	case <-ctx.Done():
+		t.Fatal("the sub-daemon never received the watch")
+	}
+	assert.Equal(t, int64(1), sub.watches.Load(), "the sub-daemon serves the watch after the backlog")
+	assert.Equal(t, int64(1), hubFetches.Load(), "the hub fetches a kind the sub-daemon serves only for the backlog")
 }
 
 // TestDaemon_NoConfigFallsBackToPolling verifies that with no sub-daemon config

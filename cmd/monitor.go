@@ -381,8 +381,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// watch. A one-shot read never spawns a daemon: the built-in backend
 	// answers --once with a single in-process fetch (hub.Once), so a daemon
 	// per read would buy nothing. It does use a daemon that is already
-	// running, because that daemon may route the kind to a sub-daemon that
-	// answers without spending the GraphQL budget (issue #114).
+	// running (issue #114). That daemon answers --once from one fetch in its
+	// hub, even for a kind a sub-daemon serves, because a sub-daemon may
+	// have no record of the backlog a one-shot read reports (issue #119).
 	if opts.Backend.endpoint() == "" {
 		if !opts.Once {
 			if err := attachDaemon(ctx, reg, target, runOpts.Interval); err != nil {

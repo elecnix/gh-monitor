@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,23 +27,33 @@ func shortSock(t *testing.T, name string) string {
 	return filepath.Join(dir, name)
 }
 
-// recordingSource is a backend.Source that records the targets it is asked
-// to watch and optionally emits updates before closing.
+// recordingSource is a backend.Source that records the watches it is asked
+// to serve and optionally emits updates before closing.
 type recordingSource struct {
+	mu      sync.Mutex
 	calls   []backend.Target
+	opts    []backend.WatchOptions
 	updates []backend.Update
-	// hold, when set, keeps the channel open until ctx is cancelled (a hub
-	// stand-in for timeout tests).
+	// hold, when set, keeps a continuous watch open until ctx is cancelled
+	// (a hub stand-in for timeout tests). A --once watch always closes.
 	hold bool
+	// err, when set, fails every watch.
+	err error
 }
 
-func (s *recordingSource) Watch(ctx context.Context, t backend.Target, _ backend.WatchOptions) (<-chan backend.Update, error) {
+func (s *recordingSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	s.mu.Lock()
 	s.calls = append(s.calls, t)
+	s.opts = append(s.opts, opts)
+	s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
+	}
 	ch := make(chan backend.Update, len(s.updates)+1)
 	for _, u := range s.updates {
 		ch <- u
 	}
-	if s.hold {
+	if s.hold && !opts.Once {
 		go func() {
 			<-ctx.Done()
 			close(ch)
@@ -51,6 +62,13 @@ func (s *recordingSource) Watch(ctx context.Context, t backend.Target, _ backend
 	}
 	close(ch)
 	return ch, nil
+}
+
+// watches returns a copy of the options of every watch served so far.
+func (s *recordingSource) watches() []backend.WatchOptions {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]backend.WatchOptions(nil), s.opts...)
 }
 
 // startFakeBackend serves the remote protocol on sockPath as a sub-daemon
@@ -140,56 +158,111 @@ func TestRegistryRunRecoversWhenSubdaemonComesUp(t *testing.T) {
 	t.Fatal("Run's probe loop never discovered the sub-daemon that came up late")
 }
 
+// probedRegistry tracks a fake sub-daemon on sock that serves kinds from src.
+func probedRegistry(t *testing.T, ctx context.Context, sock string, kinds []backend.Kind, src backend.Source) *Registry {
+	t.Helper()
+	startFakeBackend(t, ctx, sock, kinds, src)
+	reg := NewRegistry(os.Stderr)
+	tr, _ := remote.ParseEndpoint("unix:" + sock)
+	reg.Track("broker", tr)
+	reg.Probe(ctx)
+	return reg
+}
+
+// backlogOnly fails the test unless the fallback served exactly one watch,
+// and that watch was the one-shot backlog read.
+func backlogOnly(t *testing.T, fallback *recordingSource) {
+	t.Helper()
+	got := fallback.watches()
+	if len(got) != 1 || !got[0].Once {
+		t.Fatalf("the fallback must serve only the backlog read; watches: %+v", got)
+	}
+}
+
 // TestRoutingSourceRoutesByKind pins the core of issue #88: watches for a
 // kind a live sub-daemon serves go to the sub-daemon; kinds it does not
 // advertise go to the fallback.
 func TestRoutingSourceRoutesByKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sock := shortSock(t, "route.sock")
-	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{
+	reg := probedRegistry(t, ctx, shortSock(t, "route.sock"), []backend.Kind{backend.KindPR}, &recordingSource{
 		updates: []backend.Update{{At: time.Now()}},
+		hold:    true,
 	})
-
-	reg := NewRegistry(os.Stderr)
-	tr, _ := remote.ParseEndpoint("unix:" + sock)
-	reg.Track("broker", tr)
-	reg.Probe(ctx)
 
 	fallback := &recordingSource{}
 	rs := RoutingSource{Reg: reg, Fallback: fallback}
 
 	// pr → sub-daemon: its update comes back through the returned channel.
-	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{Once: true})
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{})
 	if err != nil {
 		t.Fatalf("routed watch: %v", err)
 	}
 	if _, ok := <-ch; !ok {
 		t.Fatal("the sub-daemon's update never arrived — the watch was not routed to it")
 	}
-	for range ch {
-	}
-	if len(fallback.calls) != 0 {
-		t.Fatalf("pr watch must not hit the fallback, but it was called with %v", fallback.calls)
-	}
+	backlogOnly(t, fallback)
 
 	// run → fallback (the sub-daemon does not serve it).
 	if _, err := rs.Watch(ctx, backend.Target{Kind: backend.KindRun, Owner: "o", Repo: "r", RunID: 9}, backend.WatchOptions{}); err != nil {
 		t.Fatalf("fallback watch: %v", err)
 	}
-	if len(fallback.calls) != 1 || fallback.calls[0].Kind != backend.KindRun {
+	fallback.mu.Lock()
+	defer fallback.mu.Unlock()
+	if len(fallback.calls) != 2 || fallback.calls[1].Kind != backend.KindRun {
 		t.Fatalf("a run watch must go to the fallback; calls: %v", fallback.calls)
 	}
 }
 
-// optsSource hands each watch's options to the test, emits one update, and
-// holds the stream open until ctx is cancelled — a continuous sub-daemon.
-type optsSource struct{ seen chan backend.WatchOptions }
+// TestRoutingSourceOnceReadsTheBacklog pins issue #119 for --once: the read
+// is the target's backlog, which a sub-daemon fed by events may never have
+// seen, so the fallback answers it and the sub-daemon is not asked.
+func TestRoutingSourceOnceReadsTheBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sub := &recordingSource{updates: []backend.Update{{Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now()}}}
+	reg := probedRegistry(t, ctx, shortSock(t, "once.sock"), []backend.Kind{backend.KindPR}, sub)
+
+	fallback := &recordingSource{updates: []backend.Update{
+		{Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now(), More: true},
+		{Event: backend.Event{Type: backend.EventNewGeneralComments}, At: time.Now()},
+	}}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{Once: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []backend.EventType
+	for u := range ch {
+		types = append(types, u.Event.Type)
+	}
+	if len(types) != 2 || types[1] != backend.EventNewGeneralComments {
+		t.Fatalf("a --once read must deliver the fallback's backlog; got %v", types)
+	}
+	backlogOnly(t, fallback)
+	if n := len(sub.watches()); n != 0 {
+		t.Fatalf("the sub-daemon must not serve a --once read; it served %d", n)
+	}
+}
+
+// optsSource hands each watch's options to the test, emits its updates (one
+// untyped update by default), and holds the stream open until ctx is
+// cancelled — a continuous sub-daemon.
+type optsSource struct {
+	seen    chan backend.WatchOptions
+	updates []backend.Update
+}
 
 func (s optsSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
 	s.seen <- opts
-	ch := make(chan backend.Update, 1)
-	ch <- backend.Update{Target: t, At: time.Now()}
+	updates := s.updates
+	if updates == nil {
+		updates = []backend.Update{{Target: t, At: time.Now()}}
+	}
+	ch := make(chan backend.Update, len(updates))
+	for _, u := range updates {
+		ch <- u
+	}
 	go func() {
 		<-ctx.Done()
 		close(ch)
@@ -204,14 +277,8 @@ func (s optsSource) Watch(ctx context.Context, t backend.Target, opts backend.Wa
 func TestRoutingSourceRoutesResumableWatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sock := shortSock(t, "resume.sock")
 	sub := optsSource{seen: make(chan backend.WatchOptions, 1)}
-	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, sub)
-
-	reg := NewRegistry(os.Stderr)
-	tr, _ := remote.ParseEndpoint("unix:" + sock)
-	reg.Track("broker", tr)
-	reg.Probe(ctx)
+	reg := probedRegistry(t, ctx, shortSock(t, "resume.sock"), []backend.Kind{backend.KindPR}, sub)
 
 	fallback := &recordingSource{}
 	rs := RoutingSource{Reg: reg, Fallback: fallback}
@@ -231,8 +298,105 @@ func TestRoutingSourceRoutesResumableWatch(t *testing.T) {
 	if _, ok := <-ch; !ok {
 		t.Fatal("the sub-daemon's update never arrived")
 	}
-	if len(fallback.calls) != 0 {
-		t.Fatalf("a resumable pr watch must not hit the fallback; calls: %v", fallback.calls)
+	backlogOnly(t, fallback)
+}
+
+// testStatus is a Status the fallback attaches to its backlog updates.
+type testStatus struct {
+	Note string `json:"note"`
+}
+
+func (testStatus) TargetKind() backend.Kind { return backend.KindPR }
+
+// TestRoutingSourceStartsWithTheBacklog pins issue #119 for a continuous
+// watch: the fallback's first-poll batch comes first, the sub-daemon is
+// seeded with the snapshot that batch carried, and the sub-daemon's own
+// status-only first poll is dropped so the watch reports one first poll.
+func TestRoutingSourceStartsWithTheBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	target := backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}
+	sub := optsSource{seen: make(chan backend.WatchOptions, 1), updates: []backend.Update{
+		{Target: target, Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now()},
+		{Target: target, Event: backend.Event{Type: backend.EventReviewApproved}, At: time.Now()},
+	}}
+	reg := probedRegistry(t, ctx, shortSock(t, "backlog.sock"), []backend.Kind{backend.KindPR}, sub)
+
+	fallback := &recordingSource{updates: []backend.Update{
+		{Target: target, Event: backend.Event{Type: backend.EventFirstPoll}, Status: testStatus{Note: "seed"}, At: time.Now(), More: true},
+		{Target: target, Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, Status: testStatus{Note: "seed"}, At: time.Now()},
+	}}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, target, backend.WatchOptions{ResumeID: "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []backend.EventType
+	for len(types) < 3 {
+		select {
+		case u := <-ch:
+			types = append(types, u.Event.Type)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("the watch stalled after %v", types)
+		}
+	}
+	want := []backend.EventType{backend.EventFirstPoll, backend.EventNewUnresolvedThreads, backend.EventReviewApproved}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("got %v, want %v", types, want)
+		}
+	}
+	if opts := <-sub.seen; opts.Baseline != `{"note":"seed"}` {
+		t.Fatalf("the sub-daemon must be seeded with the backlog's snapshot; Baseline = %q", opts.Baseline)
+	}
+	backlogOnly(t, fallback)
+}
+
+// TestRoutingSourceReportsBacklogFailure: when the backlog read fails, the
+// watch says so before the sub-daemon's own first poll, instead of starting
+// with a first poll that reads as a PR with nothing on it.
+func TestRoutingSourceReportsBacklogFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	target := backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}
+	sub := optsSource{seen: make(chan backend.WatchOptions, 1), updates: []backend.Update{
+		{Target: target, Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now()},
+	}}
+	reg := probedRegistry(t, ctx, shortSock(t, "nobacklog.sock"), []backend.Kind{backend.KindPR}, sub)
+
+	fallback := &recordingSource{err: errors.New("no route to the hub")}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, target, backend.WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := <-ch
+	if first.Event.Type != backend.EventDegraded || !strings.Contains(first.Event.Notice, "no route to the hub") {
+		t.Fatalf("the first update must report the failed backlog read, got %+v", first.Event)
+	}
+	if second := <-ch; second.Event.Type != backend.EventFirstPoll {
+		t.Fatalf("with no backlog, the sub-daemon's first poll must pass through, got %+v", second.Event)
+	}
+}
+
+// TestRoutingSourceTerminalBacklogEndsWatch: a target the backlog read finds
+// merged or closed is finished; there is nothing for a sub-daemon to serve.
+func TestRoutingSourceTerminalBacklogEndsWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sub := &recordingSource{hold: true}
+	reg := probedRegistry(t, ctx, shortSock(t, "merged.sock"), []backend.Kind{backend.KindPR}, sub)
+
+	fallback := &recordingSource{updates: []backend.Update{{Event: backend.Event{Type: backend.EventMerged}, At: time.Now(), Terminal: true}}}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	if n := len(sub.watches()); n != 0 {
+		t.Fatalf("a finished target must not reach the sub-daemon; it served %d", n)
 	}
 }
 
@@ -244,12 +408,7 @@ func TestRoutingSourceReportsDialFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	sock := shortSock(t, "gone.sock")
-	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{})
-
-	reg := NewRegistry(os.Stderr)
-	tr, _ := remote.ParseEndpoint("unix:" + sock)
-	reg.Track("broker", tr)
-	reg.Probe(ctx)
+	reg := probedRegistry(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{})
 	// The sub-daemon dies between the probe and the watch.
 	if err := os.Remove(sock); err != nil {
 		t.Fatal(err)
@@ -262,18 +421,21 @@ func TestRoutingSourceReportsDialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a failed dial must fall back, not error: %v", err)
 	}
-	first, ok := <-ch
+	if _, ok := <-ch; !ok {
+		t.Fatal("the backlog never arrived")
+	}
+	notice, ok := <-ch
 	if !ok {
 		t.Fatal("the fallback stream closed before saying why it served the watch")
 	}
-	if first.Event.Type != backend.EventDegraded || !strings.Contains(first.Event.Notice, "fakebroker") {
-		t.Fatalf("first update must be a notice naming the sub-daemon, got %+v", first.Event)
+	if notice.Event.Type != backend.EventDegraded || !strings.Contains(notice.Event.Notice, "fakebroker") {
+		t.Fatalf("the update after the backlog must be a notice naming the sub-daemon, got %+v", notice.Event)
 	}
 	if _, ok := <-ch; !ok {
 		t.Fatal("the fallback's own update must follow the notice")
 	}
-	if len(fallback.calls) != 1 {
-		t.Fatalf("the hub must serve the watch; calls: %v", fallback.calls)
+	if got := fallback.watches(); len(got) != 2 || got[1].Once {
+		t.Fatalf("the hub must serve the backlog, then the watch; watches: %+v", got)
 	}
 }
 
@@ -284,14 +446,8 @@ func TestRoutingSourceReportsDialFailure(t *testing.T) {
 func TestRoutingSourceFailsOverWhenStreamEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sock := shortSock(t, "ends.sock")
 	// recordingSource closes at once: the stream ends with no terminal update.
-	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{})
-
-	reg := NewRegistry(os.Stderr)
-	tr, _ := remote.ParseEndpoint("unix:" + sock)
-	reg.Track("broker", tr)
-	reg.Probe(ctx)
+	reg := probedRegistry(t, ctx, shortSock(t, "ends.sock"), []backend.Kind{backend.KindPR}, &recordingSource{})
 
 	fallback := &recordingSource{hold: true}
 	rs := RoutingSource{Reg: reg, Fallback: fallback}
@@ -311,8 +467,8 @@ func TestRoutingSourceFailsOverWhenStreamEnds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no failover notice")
 	}
-	if len(fallback.calls) != 1 {
-		t.Fatalf("the hub must take over the watch; calls: %v", fallback.calls)
+	if got := fallback.watches(); len(got) != 2 || got[1].Once {
+		t.Fatalf("the hub must serve the backlog, then take over the watch; watches: %+v", got)
 	}
 }
 
@@ -321,15 +477,9 @@ func TestRoutingSourceFailsOverWhenStreamEnds(t *testing.T) {
 func TestRoutingSourceNoFailoverAfterTerminal(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	sock := shortSock(t, "term.sock")
-	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{
+	reg := probedRegistry(t, ctx, shortSock(t, "term.sock"), []backend.Kind{backend.KindPR}, &recordingSource{
 		updates: []backend.Update{{At: time.Now(), Terminal: true}},
 	})
-
-	reg := NewRegistry(os.Stderr)
-	tr, _ := remote.ParseEndpoint("unix:" + sock)
-	reg.Track("broker", tr)
-	reg.Probe(ctx)
 
 	fallback := &recordingSource{}
 	rs := RoutingSource{Reg: reg, Fallback: fallback}
@@ -340,9 +490,7 @@ func TestRoutingSourceNoFailoverAfterTerminal(t *testing.T) {
 	}
 	for range ch {
 	}
-	if len(fallback.calls) != 0 {
-		t.Fatalf("a terminal stream must not fail over; calls: %v", fallback.calls)
-	}
+	backlogOnly(t, fallback)
 }
 
 func TestRoutingSourceFallsBackWhenSubdaemonDead(t *testing.T) {
@@ -357,7 +505,7 @@ func TestRoutingSourceFallsBackWhenSubdaemonDead(t *testing.T) {
 	if _, err := rs.Watch(context.Background(), backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 2}, backend.WatchOptions{}); err != nil {
 		t.Fatalf("a dead sub-daemon must fall back, not error: %v", err)
 	}
-	if len(fallback.calls) != 1 {
+	if len(fallback.watches()) != 1 {
 		t.Fatal("the fallback must have served the watch")
 	}
 }
@@ -392,7 +540,7 @@ func TestRoutingSourceWithoutRegistryIsPureFallback(t *testing.T) {
 	if _, err := rs.Watch(context.Background(), backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r"}, backend.WatchOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(fallback.calls) != 1 {
+	if len(fallback.watches()) != 1 {
 		t.Fatal("a nil registry must route everything to the fallback")
 	}
 }
