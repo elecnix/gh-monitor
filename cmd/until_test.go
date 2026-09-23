@@ -63,7 +63,8 @@ func notificationTypes(t *testing.T, stdout string) []string {
 
 // TestMonitorUntilFiresAndReportsTheTriggeringEvent is the exit-0 path: the
 // first event in the stream whose kind is in the --until set is reported and
-// the watch stops, without replaying the rest of the stream.
+// the watch stops at the end of its batch. Neither update sets More, so each
+// is a batch of its own and the second never prints.
 func TestMonitorUntilFiresAndReportsTheTriggeringEvent(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
@@ -99,7 +100,7 @@ func TestMonitorUntilFiresAndReportsTheTriggeringEvent(t *testing.T) {
 
 	types := notificationTypes(t, stdout.String())
 	// The triggering event is reported, then the watch stops: the second
-	// stream member never arrives.
+	// update belongs to the next batch.
 	require.Equal(t, []string{"new-failing-checks"}, types)
 }
 
@@ -210,7 +211,7 @@ func TestMonitorUntilMultiMemberSetFiresOnFirstMatchingMember(t *testing.T) {
 
 	types := notificationTypes(t, stdout.String())
 	// new-failing-checks is emitted (it is not a member) and conflict is the
-	// first member to fire; nothing after it is replayed.
+	// first member to fire; the next batch is never replayed.
 	require.Equal(t, []string{"new-failing-checks", "conflict"}, types)
 }
 
@@ -300,4 +301,107 @@ func TestMonitorUntilRejectsUnknownKind(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not-a-real-kind")
+}
+
+// redPRWithBacklog builds an OPEN PR whose only check run failed and which
+// already carries an unresolved review thread and a general comment. Its first
+// poll diffs against an empty baseline, so the batch replays that backlog, and
+// the diff orders new-failing-checks ahead of the thread and the comment.
+func redPRWithBacklog() obj {
+	comment := func(id string) obj {
+		return obj{"id": id, "body": "fix this", "author": obj{"login": "reviewer"}, "createdAt": "2026-01-01T00:00:00Z", "reactionGroups": []interface{}{}}
+	}
+	return obj{
+		"repository": obj{
+			"pullRequest": obj{
+				"state":     "OPEN",
+				"merged":    false,
+				"mergeable": "MERGEABLE",
+				"comments":  obj{"nodes": []interface{}{comment("IC_general1")}},
+				"reviewThreads": obj{"nodes": []interface{}{obj{
+					"id": "PRRT_1", "isResolved": false, "isOutdated": false, "path": "main.go",
+					"comments": obj{"nodes": []interface{}{comment("PRRC_first")}},
+				}}},
+				"commits": obj{"nodes": []interface{}{obj{"commit": obj{
+					"oid": "abcdef1234",
+					"checkSuites": obj{"nodes": []interface{}{obj{
+						"app":       obj{"name": "CI"},
+						"status":    "COMPLETED",
+						"checkRuns": obj{"nodes": []interface{}{obj{"name": "build", "status": "COMPLETED", "conclusion": "FAILURE"}}},
+					}}},
+				}}}},
+			},
+		},
+	}
+}
+
+// TestMonitorUntilPrintsTheWholeFirstPollBatch is issue #116: a --until
+// member that fires partway through the first poll's batch must not drop the
+// events the diff orders after it. The watch prints the whole batch, then
+// exits on that same poll.
+func TestMonitorUntilPrintsTheWholeFirstPollBatch(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+
+	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		if strings.Contains(query, "addReaction") {
+			return nil
+		}
+		return assignJSON(result, redPRWithBacklog())
+	}}
+	apiClientFactory = func(string) ghcli.API { return fake }
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--once", "--until", "new-failing-checks"})
+	require.NoError(t, root.Execute())
+
+	types := notificationTypes(t, stdout.String())
+	require.Contains(t, types, "new-failing-checks")
+	assert.Contains(t, types, "new-unresolved-threads",
+		"the thread follows the trigger in the same batch and must still print")
+	assert.Contains(t, types, "new-general-comments",
+		"the comment follows the trigger in the same batch and must still print")
+}
+
+// TestMonitorUntilExitsAtTheEndOfTheTriggeringBatch pins where the watch
+// stops: every update the source marks as part of the trigger's batch
+// (Update.More) prints, and the next batch never does.
+func TestMonitorUntilExitsAtTheEndOfTheTriggeringBatch(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	endpoint := serveTestBackend(t, remote.ServerConfig{
+		Name:  "relay",
+		Kinds: []backend.Kind{backend.KindPR},
+		Source: &staticSource{
+			updates: []backend.Update{
+				// First batch: the trigger, then two events after it.
+				{Event: backend.Event{Type: backend.EventNewFailingChecks, Checks: []string{"build"}}, At: at, More: true},
+				{Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, At: at, More: true},
+				{Event: backend.Event{Type: backend.EventCheckAnnotations}, At: at},
+				// Second batch: must never be reported.
+				{Event: backend.Event{Type: backend.EventNewGeneralComments}, At: at},
+			},
+		},
+	})
+	t.Setenv(backendEndpointEnv, endpoint)
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	apiClientFactory = func(string) ghcli.API { return &commandFakeAPI{} }
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--until", "new-failing-checks"})
+	require.NoError(t, root.Execute())
+
+	require.Equal(t, []string{"new-failing-checks", "new-unresolved-threads", "check-annotations"},
+		notificationTypes(t, stdout.String()))
 }

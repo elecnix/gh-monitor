@@ -50,6 +50,13 @@ type Update struct {
 	// after delivering a terminal update.
 	Terminal bool `json:"terminal,omitempty"`
 
+	// More reports that another update from the same observation follows
+	// this one: one poll's diff arrives as a batch, and every update in the
+	// batch but the last carries More. A --until watch uses it to print the
+	// rest of the batch that fired it before it exits. A Source that never
+	// sets it delivers each update as a batch of its own.
+	More bool `json:"more,omitempty"`
+
 	// RawStatus holds the encoded Status when an Update arrives from an
 	// external backend and no decoder is registered for its kind. It lets a
 	// consumer pass the payload through rather than lose it silently.

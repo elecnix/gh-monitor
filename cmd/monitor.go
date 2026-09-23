@@ -481,6 +481,11 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 
 	for u := range updates {
 		if !dedup.Allow(u) {
+			// A dropped redelivery can still be the update that closes the
+			// batch a --until member fired in.
+			if untilMet && !u.More {
+				break
+			}
 			continue
 		}
 		// A named instance persists cursor state from what each update carries,
@@ -509,12 +514,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// above, so cursor and log stay correct on the early exit too.
 		if untilFilter != nil && untilFilter.Allows(n.Type) {
 			write(n)
-			ackEmit(u.Event)
 			untilMet = true
+		} else {
+			emit(n)
+		}
+		ackEmit(u.Event)
+		// The watch exits at the end of the batch the member fired in, not
+		// on the member itself: the rest of that poll's batch was already
+		// fetched, and on a first poll it is the PR's backlog (issue #116).
+		if untilMet && !u.More {
 			break
 		}
-		emit(n)
-		ackEmit(u.Event)
 	}
 	ctxErr := ctx.Err()
 	if ctxErr != nil && !errors.Is(ctxErr, context.Canceled) {
