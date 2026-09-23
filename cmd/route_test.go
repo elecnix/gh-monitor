@@ -3,7 +3,6 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -48,12 +47,66 @@ func (s *holdingSubdaemonSource) Watch(ctx context.Context, t backend.Target, op
 	return ch, nil
 }
 
-// TestMonitor_SubdaemonServesCLIWatches is the end-to-end acceptance test for
-// issue #114. Before it, a configured sub-daemon served no watch the CLI
-// could send: a continuous watch carries a ResumeID and was sent to the hub,
-// and a --once read never dialled the daemon. Both now reach the sub-daemon,
-// and neither the hub nor the built-in backend polls GitHub.
-func TestMonitor_SubdaemonServesCLIWatches(t *testing.T) {
+// backlogPR is an open PR with one of each backlog item a first poll must
+// report: an unresolved review thread, a general comment and a failing check.
+func backlogPR() *monitor.PullRequest {
+	line := 3
+	pr := &monitor.PullRequest{
+		State:     "OPEN",
+		Mergeable: "MERGEABLE",
+		Commits: monitor.CommitNodes{Nodes: []monitor.Commit{{Commit: monitor.CommitDetails{
+			Oid: "aaaaaaa",
+			CheckSuites: monitor.SuiteNodes{Nodes: []monitor.CheckSuite{{
+				Status: "COMPLETED", Conclusion: "FAILURE", App: monitor.AppInfo{Name: "ci"},
+				CheckRuns: monitor.RunNodes{Nodes: []monitor.CheckRun{{Name: "build", Status: "COMPLETED", Conclusion: "FAILURE"}}},
+			}}},
+		}}}},
+	}
+	thread := monitor.ReviewThread{ID: "t1", Path: "main.go", Line: &line}
+	thread.Comments.Nodes = []monitor.Comment{{ID: "tc1", Body: "please rename this"}}
+	thread.Comments.Nodes[0].Author.Login = "reviewer"
+	pr.ReviewThreads.Nodes = []monitor.ReviewThread{thread}
+	pr.Comments.Nodes = []monitor.Comment{{ID: "c1", Body: "posted before the watch"}}
+	pr.Comments.Nodes[0].Author.Login = "reviewer"
+	return pr
+}
+
+// statusOnlySubdaemon answers a watch the way a webhook-fed sub-daemon does:
+// one first-poll update with no per-item events, because it has no record of
+// what was posted before it started. A continuous watch then gets one later
+// change and stays open until the client leaves.
+type statusOnlySubdaemon struct {
+	watches atomic.Int64
+	opts    chan backend.WatchOptions
+}
+
+func (s *statusOnlySubdaemon) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	s.watches.Add(1)
+	select {
+	case s.opts <- opts:
+	default:
+	}
+	ch := make(chan backend.Update, 2)
+	ch <- backend.Update{Target: t, Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now()}
+	if opts.Once {
+		close(ch)
+		return ch, nil
+	}
+	ch <- backend.Update{Target: t, Event: backend.Event{Type: backend.EventReviewApproved}, At: time.Now()}
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
+// TestMonitor_SubdaemonWatchStartsWithBacklog is the acceptance test for
+// issues #114 and #119. A configured sub-daemon serves a continuous CLI
+// watch, ResumeID and all (#114). A sub-daemon that answers with a status-only first poll left
+// the client with no backlog: no thread, no comment, no failing check (#119).
+// The daemon now fetches the backlog through the hub once, then hands a
+// continuous watch to the sub-daemon for the changes after it.
+func TestMonitor_SubdaemonWatchStartsWithBacklog(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
@@ -67,14 +120,14 @@ func TestMonitor_SubdaemonServesCLIWatches(t *testing.T) {
 			serveCtx, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 
-			sub := &holdingSubdaemonSource{resumeIDs: make(chan string, 1)}
-			brokerSock := shortSocket(t, "ghmon-cli-broker-*.d")
+			sub := &statusOnlySubdaemon{opts: make(chan backend.WatchOptions, 1)}
+			brokerSock := shortSocket(t, "ghmon-backlog-broker-*.d")
 			startFakeSubdaemon(t, serveCtx, brokerSock, []backend.Kind{backend.KindPR}, sub)
 
 			var hubFetches atomic.Int64
 			h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
 				hubFetches.Add(1)
-				return nil, errors.New("hub must not poll while the sub-daemon serves pr")
+				return backlogPR(), nil
 			}, nil, time.Hour, nil)
 			t.Cleanup(h.Stop)
 
@@ -85,7 +138,7 @@ func TestMonitor_SubdaemonServesCLIWatches(t *testing.T) {
 			reg.Probe(serveCtx)
 			require.NotNil(t, reg.Provider(backend.KindPR))
 
-			sock := shortSocket(t, "ghmon-cli-*.d")
+			sock := shortSocket(t, "ghmon-backlog-*.d")
 			l, err := ipc.Listen(sock)
 			require.NoError(t, err)
 			bindTestServerOnWithRoutes(t, serveCtx, h, l, reg)
@@ -102,12 +155,28 @@ func TestMonitor_SubdaemonServesCLIWatches(t *testing.T) {
 			root.SetArgs(tc.args)
 			require.NoError(t, root.Execute())
 
-			assert.Equal(t, int64(1), sub.watches.Load(), "the sub-daemon must serve the watch")
-			assert.Equal(t, int64(0), hubFetches.Load(), "the hub must not poll a kind the sub-daemon serves")
-			assert.Contains(t, stdout.String(), "first-poll")
-			if tc.name == "continuous" {
-				assert.NotEmpty(t, <-sub.resumeIDs, "a continuous watch keeps its ResumeID on the routed path")
+			types := notificationTypes(t, stdout.String())
+			assert.Contains(t, types, "new-unresolved-threads")
+			assert.Contains(t, types, "new-general-comments")
+			assert.Contains(t, types, "new-failing-checks")
+			first := 0
+			for _, typ := range types {
+				if typ == "first-poll" {
+					first++
+				}
 			}
+			assert.Equal(t, 1, first, "one watch reports one first poll; got %v", types)
+			assert.Equal(t, int64(1), hubFetches.Load(), "the backlog costs one hub fetch, and nothing after it")
+
+			if tc.name == "once" {
+				assert.Equal(t, int64(0), sub.watches.Load(), "a --once read is the backlog, which only the hub can fetch")
+				return
+			}
+			assert.Equal(t, int64(1), sub.watches.Load(), "the sub-daemon serves the rest of the watch")
+			assert.Contains(t, types, "review-approved", "a change after the backlog comes from the sub-daemon")
+			opts := <-sub.opts
+			assert.NotEmpty(t, opts.ResumeID, "a continuous watch keeps its ResumeID on the routed path")
+			assert.Contains(t, opts.Baseline, "posted before the watch", "the sub-daemon is seeded with the hub's snapshot")
 		})
 	}
 }
