@@ -378,12 +378,18 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// choice: it registers after the daemon would and wins for the kinds it
 	// declares, so attaching the daemon is skipped entirely — including its
 	// autostart. Otherwise the shared poller is mandatory for every continuous
-	// watch. A one-shot read skips it too: the built-in backend answers --once
-	// with a single in-process fetch (hub.Once), and spawning a daemon per
-	// read would buy nothing.
-	if !opts.Once && opts.Backend.endpoint() == "" {
-		if err := attachDaemon(ctx, reg, target, runOpts.Interval); err != nil {
-			return err
+	// watch. A one-shot read never spawns a daemon: the built-in backend
+	// answers --once with a single in-process fetch (hub.Once), so a daemon
+	// per read would buy nothing. It does use a daemon that is already
+	// running, because that daemon may route the kind to a sub-daemon that
+	// answers without spending the GraphQL budget (issue #114).
+	if opts.Backend.endpoint() == "" {
+		if !opts.Once {
+			if err := attachDaemon(ctx, reg, target, runOpts.Interval); err != nil {
+				return err
+			}
+		} else {
+			attachRunningDaemon(ctx, reg)
 		}
 	}
 	source, sourceName, err := reg.SourceFor(target)
@@ -769,4 +775,26 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 		return fmt.Errorf("register the shared poller: %w", err)
 	}
 	return nil
+}
+
+// attachRunningDaemon registers the shared poller for a --once read when a
+// daemon is already listening, and does nothing otherwise. It never spawns a
+// daemon, and a daemon it cannot talk to is not an error: the built-in
+// backend answers the read in-process instead.
+func attachRunningDaemon(ctx context.Context, reg *backend.Registry) {
+	socket := daemonSocketPath()
+	probe, err := ipc.Dial(socket)
+	if err != nil {
+		return
+	}
+	_ = probe.Close()
+	transport, err := remote.ParseEndpoint("unix:" + socket)
+	if err != nil {
+		return
+	}
+	provider, err := remote.Connect(ctx, transport)
+	if err != nil {
+		return
+	}
+	_ = reg.Use(provider)
 }

@@ -115,10 +115,10 @@ daemon launch and supervise those processes as children. They no longer take
 over the socket: each child is pointed at its own private socket next to the
 daemon's ($GH_MONITOR_SOCK is set for it), gh-monitor discovers which target
 kinds each live child serves from its protocol hello, and watches for those
-kinds are routed to the child while every other kind — and every resumable
-watch — is served by the polling hub on the public socket. A child that dies
-is restarted by the supervisor; meanwhile its kinds fall back to hub polling,
-so a target is degraded-but-covered instead of unmonitored.
+kinds are routed to the child, continuous watches included, while every other
+kind is served by the polling hub on the public socket. A child that dies is
+restarted by the supervisor. Until then its kinds fall back to hub polling,
+and each affected watch gets a notice saying so.
 
 Set $GH_MONITOR_BROKER_ENDPOINT to also subscribe to a GitHub-webhook fan-out
 broker: matching events wake the affected PR's fetch immediately instead of
@@ -189,8 +189,8 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// concedes the socket to them (the v1.19.0–v1.22.0 behaviour, which left
 	// every non-sub-daemon target kind unservable). Each child is pointed at
 	// its own private socket next to the daemon socket, and watches for the
-	// kinds a live child serves are routed to it; everything else — and every
-	// resumable watch — is served by the polling hub below. The config path
+	// kinds a live child serves are routed to it. The polling hub below
+	// serves everything else. The config path
 	// resolves per-project first: <cwd>/.gh-monitor.conf if it exists, then
 	// the operator's <user config dir>/gh-monitor/daemons.conf.
 	esc, _ := os.Getwd()
@@ -564,8 +564,8 @@ func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 	// for everything else.
 	var src backend.Source = hubSource{hub: srv.hub}
 	if srv.routes != nil {
-		// Sub-daemon kinds go to their owning sub-daemon; everything else —
-		// and every resumable watch — stays on the hub.
+		// Sub-daemon kinds go to their owning sub-daemon, and the hub serves
+		// everything else (issue #114 routes resumable watches too).
 		src = mux.RoutingSource{Reg: srv.routes, Fallback: hubSource{hub: srv.hub}}
 	}
 	cfg := remote.ServerConfig{
