@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,21 +141,15 @@ func TestRegistryRunRecoversWhenSubdaemonComesUp(t *testing.T) {
 }
 
 // TestRoutingSourceRoutesByKind pins the core of issue #88: watches for a
-// kind a live sub-daemon serves go to the sub-daemon; everything else —
-// including kinds it does not advertise and resumable watches, whose history
-// lives in the hub — goes to the fallback.
+// kind a live sub-daemon serves go to the sub-daemon; kinds it does not
+// advertise go to the fallback.
 func TestRoutingSourceRoutesByKind(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	sock := shortSock(t, "route.sock")
-	brokerSeen := make(chan backend.Target, 4)
 	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{
 		updates: []backend.Update{{At: time.Now()}},
 	})
-	// The fake backend's source must also record: wrap via a second registry
-	// probe is not enough — assert the update came back, which proves the
-	// watch was served by the sub-daemon.
-	_ = brokerSeen
 
 	reg := NewRegistry(os.Stderr)
 	tr, _ := remote.ParseEndpoint("unix:" + sock)
@@ -165,12 +160,14 @@ func TestRoutingSourceRoutesByKind(t *testing.T) {
 	rs := RoutingSource{Reg: reg, Fallback: fallback}
 
 	// pr → sub-daemon: its update comes back through the returned channel.
-	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{})
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, backend.WatchOptions{Once: true})
 	if err != nil {
 		t.Fatalf("routed watch: %v", err)
 	}
 	if _, ok := <-ch; !ok {
 		t.Fatal("the sub-daemon's update never arrived — the watch was not routed to it")
+	}
+	for range ch {
 	}
 	if len(fallback.calls) != 0 {
 		t.Fatalf("pr watch must not hit the fallback, but it was called with %v", fallback.calls)
@@ -183,14 +180,168 @@ func TestRoutingSourceRoutesByKind(t *testing.T) {
 	if len(fallback.calls) != 1 || fallback.calls[0].Kind != backend.KindRun {
 		t.Fatalf("a run watch must go to the fallback; calls: %v", fallback.calls)
 	}
+}
 
-	// A resumable pr watch → fallback too: resume state lives in the hub.
-	resume := backend.WatchOptions{ResumeID: "abc"}
-	if _, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}, resume); err != nil {
-		t.Fatalf("resume watch: %v", err)
+// optsSource hands each watch's options to the test, emits one update, and
+// holds the stream open until ctx is cancelled — a continuous sub-daemon.
+type optsSource struct{ seen chan backend.WatchOptions }
+
+func (s optsSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	s.seen <- opts
+	ch := make(chan backend.Update, 1)
+	ch <- backend.Update{Target: t, At: time.Now()}
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
+// TestRoutingSourceRoutesResumableWatch pins issue #114: every continuous
+// watch carries a ResumeID, so routing only ID-less watches meant a
+// sub-daemon never served one. A watch with a ResumeID goes to the
+// sub-daemon, and the ID travels with it.
+func TestRoutingSourceRoutesResumableWatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sock := shortSock(t, "resume.sock")
+	sub := optsSource{seen: make(chan backend.WatchOptions, 1)}
+	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, sub)
+
+	reg := NewRegistry(os.Stderr)
+	tr, _ := remote.ParseEndpoint("unix:" + sock)
+	reg.Track("broker", tr)
+	reg.Probe(ctx)
+
+	fallback := &recordingSource{}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1},
+		backend.WatchOptions{ResumeID: "abc"})
+	if err != nil {
+		t.Fatalf("routed watch: %v", err)
 	}
-	if len(fallback.calls) != 2 || fallback.calls[1].Kind != backend.KindPR {
-		t.Fatalf("a resumable watch must go to the fallback; calls: %v", fallback.calls)
+	select {
+	case opts := <-sub.seen:
+		if opts.ResumeID != "abc" {
+			t.Fatalf("sub-daemon got ResumeID %q, want abc", opts.ResumeID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a watch with a ResumeID never reached the sub-daemon")
+	}
+	if _, ok := <-ch; !ok {
+		t.Fatal("the sub-daemon's update never arrived")
+	}
+	if len(fallback.calls) != 0 {
+		t.Fatalf("a resumable pr watch must not hit the fallback; calls: %v", fallback.calls)
+	}
+}
+
+// TestRoutingSourceReportsDialFailure pins the second half of issue #114: a
+// watch whose sub-daemon dial fails falls back to the hub and says why,
+// instead of silently spending the GraphQL budget the sub-daemon would have
+// saved.
+func TestRoutingSourceReportsDialFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sock := shortSock(t, "gone.sock")
+	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{})
+
+	reg := NewRegistry(os.Stderr)
+	tr, _ := remote.ParseEndpoint("unix:" + sock)
+	reg.Track("broker", tr)
+	reg.Probe(ctx)
+	// The sub-daemon dies between the probe and the watch.
+	if err := os.Remove(sock); err != nil {
+		t.Fatal(err)
+	}
+
+	fallback := &recordingSource{updates: []backend.Update{{At: time.Now()}}}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 4},
+		backend.WatchOptions{ResumeID: "abc"})
+	if err != nil {
+		t.Fatalf("a failed dial must fall back, not error: %v", err)
+	}
+	first, ok := <-ch
+	if !ok {
+		t.Fatal("the fallback stream closed before saying why it served the watch")
+	}
+	if first.Event.Type != backend.EventDegraded || !strings.Contains(first.Event.Notice, "fakebroker") {
+		t.Fatalf("first update must be a notice naming the sub-daemon, got %+v", first.Event)
+	}
+	if _, ok := <-ch; !ok {
+		t.Fatal("the fallback's own update must follow the notice")
+	}
+	if len(fallback.calls) != 1 {
+		t.Fatalf("the hub must serve the watch; calls: %v", fallback.calls)
+	}
+}
+
+// TestRoutingSourceFailsOverWhenStreamEnds covers a sub-daemon that ends a
+// continuous watch before its target is done (it restarted, or it rejected
+// the target). The watch moves to the hub and says so, rather than going
+// quiet while the client waits for events that will never come.
+func TestRoutingSourceFailsOverWhenStreamEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sock := shortSock(t, "ends.sock")
+	// recordingSource closes at once: the stream ends with no terminal update.
+	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{})
+
+	reg := NewRegistry(os.Stderr)
+	tr, _ := remote.ParseEndpoint("unix:" + sock)
+	reg.Track("broker", tr)
+	reg.Probe(ctx)
+
+	fallback := &recordingSource{hold: true}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 5},
+		backend.WatchOptions{ResumeID: "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case u, ok := <-ch:
+		if !ok {
+			t.Fatal("the watch ended with the sub-daemon's stream instead of failing over")
+		}
+		if u.Event.Type != backend.EventDegraded || !strings.Contains(u.Event.Notice, "fakebroker") {
+			t.Fatalf("failover must be announced, got %+v", u.Event)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no failover notice")
+	}
+	if len(fallback.calls) != 1 {
+		t.Fatalf("the hub must take over the watch; calls: %v", fallback.calls)
+	}
+}
+
+// TestRoutingSourceNoFailoverAfterTerminal: a stream that ends because the
+// target reached a terminal state is finished, not broken.
+func TestRoutingSourceNoFailoverAfterTerminal(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	sock := shortSock(t, "term.sock")
+	startFakeBackend(t, ctx, sock, []backend.Kind{backend.KindPR}, &recordingSource{
+		updates: []backend.Update{{At: time.Now(), Terminal: true}},
+	})
+
+	reg := NewRegistry(os.Stderr)
+	tr, _ := remote.ParseEndpoint("unix:" + sock)
+	reg.Track("broker", tr)
+	reg.Probe(ctx)
+
+	fallback := &recordingSource{}
+	rs := RoutingSource{Reg: reg, Fallback: fallback}
+	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 6},
+		backend.WatchOptions{ResumeID: "abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range ch {
+	}
+	if len(fallback.calls) != 0 {
+		t.Fatalf("a terminal stream must not fail over; calls: %v", fallback.calls)
 	}
 }
 

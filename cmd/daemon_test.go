@@ -28,10 +28,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// init guards against the daemon accidentally respecting a real user socket
-// when tests run on a developer machine.
+// init keeps tests away from a real user's daemon socket on a developer
+// machine. Unsetting the variable is not enough: the default path is the real
+// daemon's, and a --once read attaches to any daemon already listening there
+// (issue #114). Tests that want a daemon set their own with t.Setenv.
 func init() {
-	_ = os.Unsetenv("GH_MONITOR_SOCK")
+	dir, err := os.MkdirTemp("", "ghmon-nodaemon-*")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("GH_MONITOR_SOCK", filepath.Join(dir, "never-bound.sock"))
 }
 
 // closedPR builds a CLOSED PR whose single check suite is COMPLETED/SUCCESS —
@@ -96,21 +102,6 @@ func bindTestServer(t *testing.T, ctx context.Context, h *hub.Hub, socket string
 // shape a handoff successor has after adopting its predecessor's socket.
 func bindTestServerOn(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener) *daemonServer {
 	return bindTestServerOnWithRoutes(t, ctx, h, l, nil)
-}
-
-// recordingDaemonSource is a backend.Source that emits its updates once and
-// closes — the watch payload a fake sub-daemon serves.
-type recordingDaemonSource struct {
-	updates []backend.Update
-}
-
-func (s *recordingDaemonSource) Watch(ctx context.Context, _ backend.Target, _ backend.WatchOptions) (<-chan backend.Update, error) {
-	ch := make(chan backend.Update, len(s.updates))
-	for _, u := range s.updates {
-		ch <- u
-	}
-	close(ch)
-	return ch, nil
 }
 
 // startFakeSubdaemon serves the remote protocol on sockPath as a sub-daemon
@@ -530,15 +521,16 @@ func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	brokerSock := shortSocket(t, "ghmon-route-broker-*.d")
 
 	// The fake sub-daemon: a pr-only backend/remote server on its private
-	// socket, streaming one update per watch.
-	want := backend.Update{At: time.Now()}
-	startFakeSubdaemon(t, serveCtx, brokerSock, []backend.Kind{backend.KindPR}, &recordingDaemonSource{updates: []backend.Update{want}})
+	// socket that sends a first-poll update and holds the watch open. A
+	// stream that ended at once would move the watch to the hub (issue #114).
+	sub := &holdingSubdaemonSource{resumeIDs: make(chan string, 1)}
+	startFakeSubdaemon(t, serveCtx, brokerSock, []backend.Kind{backend.KindPR}, sub)
 
 	// The hub under the daemon's routing layer: a fetch that fails the test
 	// if it is ever consulted — a pr watch must go to the sub-daemon.
-	hubCalled := false
+	var hubCalled atomic.Bool
 	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
-		hubCalled = true
+		hubCalled.Store(true)
 		return nil, errors.New("hub must not be consulted while the sub-daemon serves pr")
 	}, nil, time.Hour, nil)
 	t.Cleanup(h.Stop)
@@ -569,13 +561,13 @@ func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	require.NoError(t, err)
 	select {
 	case got := <-ch:
-		if !got.At.Equal(want.At) {
-			t.Fatalf("update At = %v, want the sub-daemon's %v", got.At, want.At)
+		if got.Event.Type != backend.EventFirstPoll {
+			t.Fatalf("got %q, want the sub-daemon's first-poll", got.Event.Type)
 		}
 	case <-ctx.Done():
 		t.Fatal("the sub-daemon's update never reached the client through the daemon socket")
 	}
-	assert.False(t, hubCalled, "the hub must not poll for a kind the sub-daemon serves")
+	assert.False(t, hubCalled.Load(), "the hub must not poll for a kind the sub-daemon serves")
 }
 
 // TestDaemon_NoConfigFallsBackToPolling verifies that with no sub-daemon config
