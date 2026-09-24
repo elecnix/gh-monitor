@@ -108,6 +108,15 @@ func Fetch(api func(host string) ghcli.API) hub.FetchFunc {
 	}
 }
 
+// RESTFallback returns the function the daemon's hub reads a PR with over
+// REST while the GraphQL budget is spent (issue #123).
+func RESTFallback(api func(host string) ghcli.API) hub.RESTFallbackFunc {
+	return func(ctx context.Context, id resolver.Identity, prev any) (any, error) {
+		last, _ := prev.(*monitor.PullRequest)
+		return service(api, id.Host).FetchPRViaREST(id.Owner, id.Repo, id.Number, last)
+	}
+}
+
 // Ruleset returns the ruleset function the daemon's hub calls once per PR
 // poller to read the branch ruleset and determine required status checks.
 func Ruleset(api func(host string) ghcli.API) hub.RulesetFunc {
@@ -134,7 +143,8 @@ func (p *Provider) watch(ctx context.Context, t backend.Target, opts backend.Wat
 		return nil, fmt.Errorf("watching requires the shared-poller daemon; start one with 'gh monitor daemon'")
 	}
 	h := hub.New(Fetch(p.API), Ruleset(p.API), 0, nil,
-		hub.WithFailedRunLogFetcher(FailedRunLogs(p.API)))
+		hub.WithFailedRunLogFetcher(FailedRunLogs(p.API)),
+		hub.WithRESTFallback(RESTFallback(p.API)))
 	return h.Once(ctx, t, opts), nil
 }
 
