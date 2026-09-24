@@ -106,7 +106,13 @@ type BudgetState struct {
 // guard must not guess.
 func (g *BudgetGuard) Stretch(now time.Time) BudgetState {
 	st := BudgetState{}
-	if g == nil || (g.svc == nil && g.observed == nil) {
+	if g == nil {
+		return st
+	}
+	g.mu.Lock()
+	blind := g.svc == nil && g.observed == nil
+	g.mu.Unlock()
+	if blind {
 		return st
 	}
 	remaining, limit, ok := g.GraphQLRemaining(now)

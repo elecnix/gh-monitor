@@ -204,3 +204,33 @@ func TestBudgetGuard_NoRateLimitCallWhileHeadersAreFresh(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 3000, remaining)
 }
+
+// TestBudgetGuard_NilServiceAnswersNothing: a guard built without a service
+// has no header store either, and its readers answer ok=false without
+// panicking.
+func TestBudgetGuard_NilServiceAnswersNothing(t *testing.T) {
+	g := NewBudgetGuard(nil, 60*time.Second)
+	now := time.Now()
+	_, _, ok := g.GraphQLRemaining(now)
+	assert.False(t, ok)
+	_, exhausted := g.GraphQLExhausted(now)
+	assert.False(t, exhausted)
+	assert.Equal(t, BudgetState{}, g.Stretch(now))
+}
+
+// TestBudgetGuard_UseObservedWhileStretching runs UseObserved beside Stretch,
+// so `go test -race` catches an unguarded read of the store.
+func TestBudgetGuard_UseObservedWhileStretching(t *testing.T) {
+	g := NewBudgetGuard(nil, 60*time.Second)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			g.UseObserved(ghcli.NewRateLimitStore(), "github.com")
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		g.Stretch(time.Now())
+	}
+	<-done
+}
