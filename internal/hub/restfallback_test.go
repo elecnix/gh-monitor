@@ -270,3 +270,89 @@ func TestOnce_RESTFallbackAnswersWhileGraphQLExhausted(t *testing.T) {
 	_, ok := noticeContaining(got, "reading PR state over REST because GraphQL is exhausted")
 	assert.True(t, ok)
 }
+
+// TestPoller_RESTModeDeclaresItsWindow: REST mode is a blind window for
+// comments, review threads, reviews and annotations, so both mode notices
+// carry it like the #99 recovery notice. degraded_from is the last successful
+// GraphQL read, not the moment the poller found GraphQL refused. The exit
+// notice adds degraded_to.
+func TestPoller_RESTModeDeclaresItsWindow(t *testing.T) {
+	var graphqlCalls int64
+	var firstGraphQL time.Time
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		if atomic.AddInt64(&graphqlCalls, 1) == 1 {
+			firstGraphQL = time.Now()
+			return commentedPR(), nil
+		}
+		return nil, graphqlRateLimited()
+	}, nil, time.Hour, nil, WithRESTFallback(func(ctx context.Context, _ resolver.Identity, _ any) (any, error) {
+		return prFixture(nil), nil
+	}))
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	collectUpdates(ch, 300*time.Millisecond)
+
+	// Let the discovery moment differ from the last GraphQL read.
+	time.Sleep(1100 * time.Millisecond)
+	id := monitor.IdentityOf(testHubTarget())
+	require.NoError(t, h.RefreshPR(id))
+	entry, ok := noticeContaining(collectUpdates(ch, 300*time.Millisecond), "reading PR state over REST")
+	require.True(t, ok)
+	require.NotEmpty(t, entry.Event.DegradedFrom, "the entry notice gives the window start")
+	from, err := time.Parse(time.RFC3339, entry.Event.DegradedFrom)
+	require.NoError(t, err)
+	assert.WithinDuration(t, firstGraphQL, from, time.Second, "the window starts at the last GraphQL read")
+	assert.Contains(t, entry.Event.Notice, "ends the watch without", "a terminal event read over REST has no catch-up read")
+
+	swapFetcher(h, func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return commentedPR(), nil
+	})
+	require.NoError(t, h.RefreshPR(id))
+	exit, ok := noticeContaining(collectUpdates(ch, 300*time.Millisecond), "over GraphQL again")
+	require.True(t, ok)
+	assert.Equal(t, entry.Event.DegradedFrom, exit.Event.DegradedFrom)
+	require.NotEmpty(t, exit.Event.DegradedTo, "the exit notice closes the window")
+	assert.Contains(t, exit.Event.Notice, exit.Event.DegradedFrom)
+	assert.Contains(t, exit.Event.Notice, "backfill")
+}
+
+// TestPoller_SkipsGraphQLForEnterpriseHostWhileHeadersSayExhausted: a GitHub
+// Enterprise client records header readings under its own host, so the
+// poller must ask the guard about the target's host, not github.com.
+func TestPoller_SkipsGraphQLForEnterpriseHostWhileHeadersSayExhausted(t *testing.T) {
+	now := time.Now()
+	store := ghcli.NewRateLimitStore()
+	hdr := http.Header{}
+	hdr.Set("X-RateLimit-Resource", "graphql")
+	hdr.Set("X-RateLimit-Limit", "5000")
+	hdr.Set("X-RateLimit-Remaining", "0")
+	hdr.Set("X-RateLimit-Reset", strconv.FormatInt(now.Add(25*time.Minute).Unix(), 10))
+	store.Observe("ghe.example.com", hdr, now)
+
+	budget := monitor.NewBudgetGuard(&monitor.Service{API: &rateLimitAPIStub{remaining: 5000, limit: 5000}}, 60*time.Second)
+	budget.UseObserved(store, "github.com")
+
+	var graphqlCalls int64
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		atomic.AddInt64(&graphqlCalls, 1)
+		return nil, graphqlRateLimited()
+	}, nil, time.Hour, budget, WithRESTFallback(func(ctx context.Context, _ resolver.Identity, _ any) (any, error) {
+		return prFixture(nil), nil
+	}))
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	target := testHubTarget()
+	target.Host = "ghe.example.com"
+	ch, cancelSub := h.SubscribePR(ctx, target, testHubOpts())
+	t.Cleanup(cancelSub)
+
+	got := collectUpdates(ch, 500*time.Millisecond)
+	require.True(t, hasType(got, monitor.EventFirstPoll))
+	assert.Zero(t, atomic.LoadInt64(&graphqlCalls), "the enterprise host's readings say GraphQL is spent")
+}

@@ -163,8 +163,10 @@ func TestBudgetGuard_HeadersOverrideRateLimitEndpoint(t *testing.T) {
 	assert.Equal(t, 5000, limit)
 	assert.True(t, g.Stretch(now).Low)
 
-	resetAt, exhausted := g.GraphQLExhausted(now)
+	resetAt, exhausted := g.GraphQLExhausted("", now)
 	assert.True(t, exhausted)
+	_, exhausted = g.GraphQLExhausted("ghe.example.com", now)
+	assert.False(t, exhausted, "another host has its own budget")
 	assert.Equal(t, now.Add(20*time.Minute).Unix(), resetAt.Unix())
 }
 
@@ -182,7 +184,7 @@ func TestBudgetGuard_StaleHeadersFallBackToRateLimitEndpoint(t *testing.T) {
 	remaining, _, ok := g.GraphQLRemaining(now)
 	require.True(t, ok)
 	assert.Equal(t, 4800, remaining)
-	_, exhausted := g.GraphQLExhausted(now)
+	_, exhausted := g.GraphQLExhausted("", now)
 	assert.False(t, exhausted)
 }
 
@@ -213,7 +215,7 @@ func TestBudgetGuard_NilServiceAnswersNothing(t *testing.T) {
 	now := time.Now()
 	_, _, ok := g.GraphQLRemaining(now)
 	assert.False(t, ok)
-	_, exhausted := g.GraphQLExhausted(now)
+	_, exhausted := g.GraphQLExhausted("", now)
 	assert.False(t, exhausted)
 	assert.Equal(t, BudgetState{}, g.Stretch(now))
 }

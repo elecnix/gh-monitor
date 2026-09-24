@@ -156,27 +156,33 @@ func (g *BudgetGuard) UseObserved(store *ghcli.RateLimitStore, host string) {
 	g.host = host
 }
 
-// currentReading returns the latest GraphQL header reading when it still
-// describes the current window: its reset time is in the future. After the
-// reset the budget has refilled and the reading is out of date.
-func (g *BudgetGuard) currentReading(now time.Time) (ghcli.RateLimitReading, bool) {
-	r, ok := g.observed.Latest(g.host, "graphql")
+// currentReading returns the latest GraphQL header reading for host (the
+// guard's own host when empty) while it still describes the current window:
+// its reset time is in the future. After the reset the budget has refilled
+// and the reading is out of date.
+func (g *BudgetGuard) currentReading(host string, now time.Time) (ghcli.RateLimitReading, bool) {
+	if host == "" {
+		host = g.host
+	}
+	r, ok := g.observed.Latest(host, "graphql")
 	if !ok || r.Reset.IsZero() || !now.Before(r.Reset) {
 		return ghcli.RateLimitReading{}, false
 	}
 	return r, true
 }
 
-// GraphQLExhausted reports whether the latest GraphQL response said the
-// budget is spent, and when it resets. Only header readings count: a guess
-// from /rate_limit could send a watcher to REST for nothing.
-func (g *BudgetGuard) GraphQLExhausted(now time.Time) (resetAt time.Time, exhausted bool) {
+// GraphQLExhausted reports whether the latest GraphQL response from host (the
+// guard's own host when empty) said the budget is spent, and when it resets.
+// Each host has its own budget, and a GitHub Enterprise client records its
+// readings under its own host. Only header readings count: a guess from
+// /rate_limit could send a watcher to REST for nothing.
+func (g *BudgetGuard) GraphQLExhausted(host string, now time.Time) (resetAt time.Time, exhausted bool) {
 	if g == nil {
 		return time.Time{}, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	r, ok := g.currentReading(now)
+	r, ok := g.currentReading(host, now)
 	if !ok || r.Remaining > 0 {
 		return time.Time{}, false
 	}
@@ -190,7 +196,7 @@ func (g *BudgetGuard) GraphQLExhausted(now time.Time) (resetAt time.Time, exhaus
 func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if r, ok := g.currentReading(now); ok {
+	if r, ok := g.currentReading("", now); ok {
 		return r.Remaining, r.Limit, true
 	}
 	if g.svc == nil {

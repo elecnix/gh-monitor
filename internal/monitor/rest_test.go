@@ -56,6 +56,16 @@ func restPRAPI(t *testing.T, pull map[string]any, served map[string]int) *fakeAP
 						},
 					},
 				})
+			case "repos/o/r/commits/bbbbbbb/check-suites":
+				return assign(result, map[string]any{
+					"total_count": 2,
+					"check_suites": []map[string]any{
+						{"id": 11, "status": "completed", "conclusion": "failure",
+							"app": map[string]any{"name": "GitHub Actions", "slug": "github-actions"}},
+						{"id": 12, "status": "in_progress", "conclusion": nil,
+							"app": map[string]any{"name": "Other CI", "slug": "other-ci"}},
+					},
+				})
 			case "repos/o/r/commits/bbbbbbb/status":
 				return assign(result, map[string]any{
 					"state": "failure",
@@ -133,4 +143,111 @@ func TestIsRateLimitError(t *testing.T) {
 	assert.False(t, IsRateLimitError(&ghcli.APIError{StatusCode: 404, Message: "Not Found"}))
 	assert.False(t, IsRateLimitError(fmt.Errorf("exit status 1")))
 	assert.False(t, IsRateLimitError(nil))
+}
+
+// checksAPI serves an open PR whose head is ccccccc, with the given check
+// suites and check runs. runsTotal is the total_count the check-runs endpoint
+// reports; runs are served 100 per page from the runs slice.
+func checksAPI(t *testing.T, suites []map[string]any, runs []map[string]any, runsTotal int) *fakeAPI {
+	t.Helper()
+	return &fakeAPI{restFunc: func(method, path string, _ map[string]string, _ interface{}, result interface{}) error {
+		base, query, _ := strings.Cut(path, "?")
+		page := 1
+		for _, kv := range strings.Split(query, "&") {
+			if v, ok := strings.CutPrefix(kv, "page="); ok {
+				_, _ = fmt.Sscanf(v, "%d", &page)
+			}
+		}
+		switch base {
+		case "repos/o/r/pulls/7":
+			return assign(result, map[string]any{"state": "open", "merged": false, "mergeable": true,
+				"mergeable_state": "clean", "head": map[string]any{"sha": "ccccccc"}})
+		case "repos/o/r/commits/ccccccc/check-suites":
+			if page > 1 {
+				return assign(result, map[string]any{"total_count": len(suites), "check_suites": []any{}})
+			}
+			return assign(result, map[string]any{"total_count": len(suites), "check_suites": suites})
+		case "repos/o/r/commits/ccccccc/check-runs":
+			lo, hi := (page-1)*100, page*100
+			if lo > len(runs) {
+				lo = len(runs)
+			}
+			if hi > len(runs) {
+				hi = len(runs)
+			}
+			return assign(result, map[string]any{"total_count": runsTotal, "check_runs": runs[lo:hi]})
+		case "repos/o/r/commits/ccccccc/status":
+			return assign(result, map[string]any{"state": "success", "statuses": []any{}})
+		}
+		return fmt.Errorf("unexpected REST path %s", path)
+	}}
+}
+
+func knownHead() *PullRequest {
+	return &PullRequest{State: "OPEN", Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{Oid: "ccccccc", MessageHeadline: "h"}}}}}
+}
+
+func suite(id int64, app, slug, status string, conclusion any) map[string]any {
+	return map[string]any{"id": id, "status": status, "conclusion": conclusion,
+		"app": map[string]any{"name": app, "slug": slug}}
+}
+
+func actionsRun(name string, suiteID int64) map[string]any {
+	return map[string]any{"name": name, "status": "completed", "conclusion": "success",
+		"app":         map[string]any{"name": "GitHub Actions", "slug": "github-actions"},
+		"check_suite": map[string]any{"id": suiteID}}
+}
+
+// TestFetchPRViaREST_RunlessSuitesKeepCIFromReadingGreen reproduces the
+// review of #124, measured on the PR's own head: two third-party suites are
+// queued and have no check runs, beside green GitHub Actions suites. The
+// check-runs endpoint cannot list them, so a REST read built only from runs
+// reported CI green and Diff emitted a false ci-all-green.
+func TestFetchPRViaREST_RunlessSuitesKeepCIFromReadingGreen(t *testing.T) {
+	api := checksAPI(t, []map[string]any{
+		suite(1, "sonatype-lift", "sonatype-lift", "queued", nil),
+		suite(2, "Claude", "claude", "queued", nil),
+		suite(3, "GitHub Actions", "github-actions", "completed", "success"),
+		suite(4, "GitHub Actions", "github-actions", "completed", "success"),
+	}, []map[string]any{actionsRun("test", 3), actionsRun("lint", 3), actionsRun("build", 4)}, 3)
+
+	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err)
+	curr := Snapshot(pr, SnapshotOptions{Tier: TierStatus})
+	assert.ElementsMatch(t, []string{"sonatype-lift", "Claude"}, curr.PendingChecks)
+
+	prev := &PRStatus{State: "OPEN", PendingChecks: []string{"sonatype-lift", "Claude"}, LastCommit: curr.LastCommit}
+	for _, ev := range Diff(prev, curr) {
+		assert.NotEqual(t, EventCIAllGreen, ev.Type, "queued suites without runs are not green")
+	}
+}
+
+// TestFetchPRViaREST_FailingRunlessSuiteFails: a non-container suite that
+// concluded failure without check runs is a failing check, as over GraphQL.
+func TestFetchPRViaREST_FailingRunlessSuiteFails(t *testing.T) {
+	api := checksAPI(t, []map[string]any{
+		suite(1, "Lint App", "lint-app", "completed", "failure"),
+		suite(3, "GitHub Actions", "github-actions", "completed", "success"),
+	}, []map[string]any{actionsRun("test", 3)}, 1)
+
+	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Lint App"}, Snapshot(pr, SnapshotOptions{}).FailingChecks)
+}
+
+// TestFetchPRViaREST_TruncatedRunsMarkTheSnapshot: when the read stops at its
+// page cap with runs still unread, the snapshot says it is truncated, so
+// ciAllGreen refuses to report green on it.
+func TestFetchPRViaREST_TruncatedRunsMarkTheSnapshot(t *testing.T) {
+	runs := make([]map[string]any, 0, 600)
+	for i := 0; i < 600; i++ {
+		runs = append(runs, actionsRun(fmt.Sprintf("job-%d", i), 3))
+	}
+	api := checksAPI(t, []map[string]any{suite(3, "GitHub Actions", "github-actions", "completed", "success")}, runs, 600)
+
+	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err)
+	st := Snapshot(pr, SnapshotOptions{})
+	assert.True(t, st.TruncatedSuites, "500 of 600 runs read is an incomplete payload")
+	assert.False(t, ciAllGreen(st))
 }

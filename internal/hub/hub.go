@@ -423,14 +423,14 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			// and say so before the events.
 			resetAt := time.Time{}
 			if h.budget != nil {
-				resetAt, _ = h.budget.GraphQLExhausted(time.Now())
+				resetAt, _ = h.budget.GraphQLExhausted(identity.Host, time.Now())
 			}
 			if restRaw, restErr := h.restFallback(ctx, identity, nil); restErr == nil && restRaw != nil {
 				raw, err = restRaw, nil
 				snapOpts.Tier = monitor.TierStatus
 				out <- backend.Update{
 					Target: monitor.TargetOf(identity),
-					Event:  restModeNotice(labelFor(keyOf(identity), identity), resetAt),
+					Event:  restModeNotice(labelFor(keyOf(identity), identity), resetAt, time.Time{}),
 					At:     time.Now(),
 				}
 			}
@@ -969,6 +969,8 @@ type poller struct {
 	blindFrom   time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
 	lastSuccess time.Time         // when the last successful fetch completed; the honest lower bound for a blind window that opens later
 	restNotice  *monitor.Event    // the mode notice while the poller reads PR state over REST (issue #123); nil in GraphQL mode
+	lastGraphQL time.Time         // when the last successful GraphQL fetch completed; the start of a REST-mode window
+	restFrom    time.Time         // the start of the current REST-mode window: lastGraphQL when REST mode began, zero when unknown
 	subs        map[*sub]struct{}
 
 	wake  chan struct{}
@@ -1174,7 +1176,7 @@ func (p *poller) fetchOnce() {
 	// until a reset time, a GraphQL call can only fail. Read over REST
 	// without making it.
 	if p.canUseREST() {
-		if resetAt, exhausted := p.budget.GraphQLExhausted(time.Now()); exhausted {
+		if resetAt, exhausted := p.budget.GraphQLExhausted(p.identity.Host, time.Now()); exhausted {
 			p.fetchViaREST(ctx, resetAt)
 			return
 		}
@@ -1201,7 +1203,7 @@ func (p *poller) fetchOnce() {
 			curr, err = fetch(ctx, p.identity, tier-1)
 		}
 		if err != nil && monitor.IsRateLimitError(err) && p.canUseREST() {
-			resetAt, _ := p.budget.GraphQLExhausted(time.Now())
+			resetAt, _ := p.budget.GraphQLExhausted(p.identity.Host, time.Now())
 			p.fetchViaREST(ctx, resetAt)
 			return
 		}
@@ -1232,6 +1234,9 @@ func (p *poller) fetchOnce() {
 		}
 	}
 	p.leaveRESTMode(tier)
+	p.mu.Lock()
+	p.lastGraphQL = time.Now()
+	p.mu.Unlock()
 	p.deliver(curr)
 }
 
@@ -1287,10 +1292,14 @@ func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
 	}
 
 	if !p.inRESTMode() {
-		ev := restModeNotice(p.label(), resetAt)
+		p.mu.Lock()
+		from := p.lastGraphQL
+		p.mu.Unlock()
+		ev := restModeNotice(p.label(), resetAt, from)
 		p.setTier(monitor.TierStatus)
 		p.mu.Lock()
 		p.restNotice = &ev
+		p.restFrom = from
 		p.mu.Unlock()
 		fmt.Fprintf(os.Stderr, "gh-monitor: %s: GraphQL rate limited, reading PR state over REST\n", p.label())
 		p.broadcast(ev)
@@ -1300,8 +1309,15 @@ func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
 
 // restModeNotice is the degraded notice that starts REST mode for the PR at
 // label. It lists what REST cannot read and, when the headers gave one, the
-// time the GraphQL budget resets.
-func restModeNotice(label string, resetAt time.Time) monitor.Event {
+// time the GraphQL budget resets. from is the last successful GraphQL read,
+// which starts the window where those surfaces go unwatched (issue #99): the
+// moment the poller found GraphQL refused comes later. A zero from leaves
+// degraded_from empty, since the start is unknown.
+//
+// The notice also says that a merge or close read over REST ends the watch.
+// GraphQL still refuses at that point, so no catch-up read of comments and
+// reviews can run, and a caller that needs them backfills from degraded_from.
+func restModeNotice(label string, resetAt, from time.Time) monitor.Event {
 	shed := monitor.TierStatus.ShedSurfaces()
 	ev := monitor.Event{
 		Type:             monitor.EventDegraded,
@@ -1313,31 +1329,51 @@ func restModeNotice(label string, resetAt time.Time) monitor.Event {
 		until = " until " + resetAt.Local().Format("15:04 MST")
 		ev.DegradedResetAt = resetAt.UTC().Format(time.RFC3339)
 	}
-	ev.Notice = fmt.Sprintf("⚠️ reading PR state over REST because GraphQL is exhausted%s on %s: state, merge, head commit and check outcomes remain watched; %s are not watched until GraphQL answers again",
-		until, label, strings.Join(shed, ", "))
+	since := ""
+	if !from.IsZero() {
+		ev.DegradedFrom = from.UTC().Format(time.RFC3339)
+		since = " since " + ev.DegradedFrom
+	}
+	ev.Notice = fmt.Sprintf("⚠️ reading PR state over REST because GraphQL is exhausted%s on %s: state, merge, head commit and check outcomes remain watched, and %s are not watched%s until GraphQL answers again. A merge or close read over REST ends the watch without a GraphQL catch-up read, so backfill those surfaces from REST if completeness matters",
+		until, label, strings.Join(shed, ", "), since)
 	return ev
 }
 
 // leaveRESTMode ends REST mode after a successful GraphQL fetch at tier: the
 // subscribers go back to that tier and hear that GraphQL answers again. It
 // does nothing in GraphQL mode.
+//
+// The notice declares the REST-mode window like the #99 recovery notice. This
+// fetch reports comments, threads and reviews still present, late, but a
+// change that started and ended inside the window, or anything past the
+// query's last 25 comments or threads, was not observed.
 func (p *poller) leaveRESTMode(tier monitor.QueryTier) {
 	p.mu.Lock()
 	wasREST := p.restNotice != nil
+	from := p.restFrom
 	p.restNotice = nil
+	p.restFrom = time.Time{}
 	p.mu.Unlock()
 	if !wasREST {
 		return
 	}
 	p.setTier(tier)
+	ev := monitor.Event{Type: monitor.EventDegraded}
 	msg := fmt.Sprintf("✅ reading PR state over GraphQL again on %s", p.label())
-	if shed := tier.ShedSurfaces(); len(shed) > 0 {
-		msg += fmt.Sprintf("; the GraphQL budget is still low, so %s stay unwatched until it recovers", strings.Join(shed, ", "))
-	} else {
-		msg += ": resuming full monitoring"
+	if !from.IsZero() {
+		ev.DegradedFrom = from.UTC().Format(time.RFC3339)
+		ev.DegradedTo = time.Now().UTC().Format(time.RFC3339)
+		msg += fmt.Sprintf(". Comments, review threads, reviews and annotations between %s and %s are read late. Changes that began and ended in that window, and anything past the last 25 comments or threads, were not observed, so backfill from REST if completeness matters",
+			ev.DegradedFrom, ev.DegradedTo)
 	}
+	if shed := tier.ShedSurfaces(); len(shed) > 0 {
+		msg += fmt.Sprintf(". The GraphQL budget is still low, so %s stay unwatched until it recovers", strings.Join(shed, ", "))
+	} else {
+		msg += ". Resuming full monitoring"
+	}
+	ev.Notice = msg
 	fmt.Fprintf(os.Stderr, "gh-monitor: %s: GraphQL answers again, leaving REST mode\n", p.label())
-	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
+	p.broadcast(ev)
 }
 
 // setTier records tier as the poller's tier and every PR subscriber's

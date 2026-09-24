@@ -59,6 +59,21 @@ type restCheckRun struct {
 	} `json:"check_suite"`
 }
 
+type restCheckSuites struct {
+	TotalCount  int              `json:"total_count"`
+	CheckSuites []restCheckSuite `json:"check_suites"`
+}
+
+type restCheckSuite struct {
+	ID         int64   `json:"id"`
+	Status     string  `json:"status"`
+	Conclusion *string `json:"conclusion"`
+	App        struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	} `json:"app"`
+}
+
 type restCombinedStatus struct {
 	Statuses []struct {
 		State       string `json:"state"`
@@ -80,9 +95,10 @@ type restCommit struct {
 	} `json:"author"`
 }
 
-// maxCheckRunPages bounds the check-runs pages one REST read fetches. At 100
-// runs a page this covers more runs than the GraphQL query's 50 suites.
-const maxCheckRunPages = 5
+// maxCheckPages bounds the pages of check suites, and of check runs, one REST
+// read fetches. At 100 a page this covers more than the GraphQL query's 50
+// suites of 50 runs each.
+const maxCheckPages = 5
 
 // FetchPRViaREST reads a PR's state, mergeability, head commit and check
 // outcomes over REST, for when the GraphQL budget is spent (issue #123). The
@@ -165,58 +181,101 @@ func (s *Service) FetchPRViaREST(owner, repo string, number int, prev *PullReque
 	return pr, nil
 }
 
-// restCheckSuites reads the head commit's check runs and groups them into
-// suites by check suite ID, in the order GitHub lists them. Enum values are
-// upper-cased to match GraphQL. A suite is COMPLETED when every run in it is,
-// and otherwise takes the status of its first unfinished run, so the pending
-// classifier reports it as it does for a GraphQL payload.
+// restCheckSuites reads the head commit's check suites and check runs, and
+// attaches each run to its suite. Enum values are upper-cased to match
+// GraphQL.
+//
+// The suites come from the check-suites endpoint, because the check-runs
+// endpoint cannot list a suite that has no runs. GraphQL returns such a suite,
+// and the classifiers count a runless third-party suite as a check: a queued
+// one is pending and a failed one is failing. Without it a REST read reported
+// CI green while those suites were still queued (review of #124).
+//
+// When the page cap stops either read before its total_count, the result's
+// TotalCount is set above the number of suites read, so the snapshot reports
+// TruncatedSuites and ciAllGreen refuses to call the payload green.
 func (s *Service) restCheckSuites(owner, repo, sha string) (SuiteNodes, error) {
-	var runs []restCheckRun
-	for page := 1; page <= maxCheckRunPages; page++ {
+	var out SuiteNodes
+	index := map[int64]int{}
+	addSuite := func(id int64, suite CheckSuite) int {
+		if i, ok := index[id]; ok {
+			return i
+		}
+		index[id] = len(out.Nodes)
+		out.Nodes = append(out.Nodes, suite)
+		return len(out.Nodes) - 1
+	}
+
+	suitesTotal, suitesRead := 0, 0
+	for page := 1; page <= maxCheckPages; page++ {
+		var resp restCheckSuites
+		path := fmt.Sprintf("repos/%s/%s/commits/%s/check-suites?per_page=100&page=%d", owner, repo, sha, page)
+		if err := s.API.REST("GET", path, nil, nil, &resp); err != nil {
+			return SuiteNodes{}, fmt.Errorf("read check suites over REST: %w", err)
+		}
+		suitesTotal = resp.TotalCount
+		for _, cs := range resp.CheckSuites {
+			suite := CheckSuite{
+				Status: strings.ToUpper(cs.Status),
+				App:    AppInfo{Name: cs.App.Name, Slug: cs.App.Slug},
+			}
+			if cs.Conclusion != nil {
+				suite.Conclusion = strings.ToUpper(*cs.Conclusion)
+			}
+			addSuite(cs.ID, suite)
+		}
+		suitesRead += len(resp.CheckSuites)
+		if len(resp.CheckSuites) == 0 || suitesRead >= resp.TotalCount {
+			break
+		}
+	}
+
+	runsTotal, runsRead := 0, 0
+	for page := 1; page <= maxCheckPages; page++ {
 		var resp restCheckRuns
 		path := fmt.Sprintf("repos/%s/%s/commits/%s/check-runs?per_page=100&page=%d", owner, repo, sha, page)
 		if err := s.API.REST("GET", path, nil, nil, &resp); err != nil {
 			return SuiteNodes{}, fmt.Errorf("read check runs over REST: %w", err)
 		}
-		runs = append(runs, resp.CheckRuns...)
-		if len(resp.CheckRuns) == 0 || len(runs) >= resp.TotalCount {
+		runsTotal = resp.TotalCount
+		for _, r := range resp.CheckRuns {
+			// A run whose suite was past the suites page cap still counts:
+			// its suite is built from the run's app, and marked unfinished
+			// when the run is.
+			i := addSuite(r.CheckSuite.ID, CheckSuite{
+				Status: "COMPLETED",
+				App:    AppInfo{Name: r.App.Name, Slug: r.App.Slug},
+			})
+			run := CheckRun{
+				Name:        r.Name,
+				Status:      strings.ToUpper(r.Status),
+				StartedAt:   r.StartedAt,
+				CompletedAt: r.CompletedAt,
+				DetailsURL:  r.DetailsURL,
+				Permalink:   r.HTMLURL,
+			}
+			if r.Conclusion != nil {
+				run.Conclusion = strings.ToUpper(*r.Conclusion)
+			}
+			out.Nodes[i].CheckRuns.Nodes = append(out.Nodes[i].CheckRuns.Nodes, run)
+		}
+		runsRead += len(resp.CheckRuns)
+		if len(resp.CheckRuns) == 0 || runsRead >= resp.TotalCount {
 			break
 		}
 	}
 
-	var out SuiteNodes
-	index := map[int64]int{}
-	for _, r := range runs {
-		i, ok := index[r.CheckSuite.ID]
-		if !ok {
-			i = len(out.Nodes)
-			index[r.CheckSuite.ID] = i
-			out.Nodes = append(out.Nodes, CheckSuite{
-				Status: "COMPLETED",
-				App:    AppInfo{Name: r.App.Name, Slug: r.App.Slug},
-			})
-		}
-		suite := &out.Nodes[i]
-		run := CheckRun{
-			Name:        r.Name,
-			Status:      strings.ToUpper(r.Status),
-			StartedAt:   r.StartedAt,
-			CompletedAt: r.CompletedAt,
-			DetailsURL:  r.DetailsURL,
-			Permalink:   r.HTMLURL,
-		}
-		if r.Conclusion != nil {
-			run.Conclusion = strings.ToUpper(*r.Conclusion)
-		}
-		if run.Status != "COMPLETED" && suite.Status == "COMPLETED" {
-			suite.Status = run.Status
-		}
-		suite.CheckRuns.Nodes = append(suite.CheckRuns.Nodes, run)
-	}
 	for i := range out.Nodes {
 		out.Nodes[i].CheckRuns.TotalCount = len(out.Nodes[i].CheckRuns.Nodes)
 	}
 	out.TotalCount = len(out.Nodes)
+	if suitesTotal > out.TotalCount {
+		out.TotalCount = suitesTotal
+	}
+	if runsRead < runsTotal && out.TotalCount <= len(out.Nodes) {
+		// The unread runs may belong to suites this read never saw.
+		out.TotalCount = len(out.Nodes) + 1
+	}
 	return out, nil
 }
 
