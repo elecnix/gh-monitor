@@ -59,6 +59,12 @@ type RulesetFunc func(owner, repo string) (*monitor.RulesetChecks, error)
 // log snippet.
 type FailedRunLogFetcher func(owner, repo string, runID int) (string, error)
 
+// RESTFallbackFunc reads a pull request over REST when its GraphQL budget is
+// spent (issue #123). prev is the poller's last payload for the PR, or nil. It
+// returns a payload of the same type the FetchFunc returns for a PR, filled
+// the way a monitor.TierStatus fetch is.
+type RESTFallbackFunc func(ctx context.Context, id resolver.Identity, prev any) (any, error)
+
 // Option configures optional Hub behaviour.
 type Option func(*Hub)
 
@@ -66,6 +72,13 @@ type Option func(*Hub)
 // by run-target subscribers. See FailedRunLogFetcher.
 func WithFailedRunLogFetcher(fn FailedRunLogFetcher) Option {
 	return func(h *Hub) { h.failedLogs = fn }
+}
+
+// WithRESTFallback lets PR pollers read state, mergeability, head commit and
+// check outcomes over REST while GraphQL is rate limited. Without it, an
+// exhausted GraphQL budget leaves a PR watch degraded until the reset.
+func WithRESTFallback(fn RESTFallbackFunc) Option {
+	return func(h *Hub) { h.restFallback = fn }
 }
 
 // WithIdleCeiling overrides the idle-backoff ceiling every poller uses —
@@ -97,6 +110,9 @@ type Hub struct {
 	failedLogs FailedRunLogFetcher
 	interval   time.Duration
 	budget     *monitor.BudgetGuard
+	// restFallback reads a PR over REST while GraphQL is rate limited; nil
+	// disables REST mode.
+	restFallback RESTFallbackFunc
 	// idleCeiling is the configured idle-backoff ceiling (idlePollCeiling,
 	// issue #90); 0 means monitor.MaxIdleInterval.
 	idleCeiling            time.Duration
@@ -270,15 +286,25 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 
 	// Use the poller's cached ruleset (fetched once on first run).
 	p.mu.Lock()
-	if p.ruleset != nil && p.ruleset.Error == "" {
-		sub.snapOpts.RulesetChecks = p.ruleset
-	}
 	// Start at the poller's current tier. A poller restored from a handoff
 	// may already be at TierFull, in which case applyTier never fires for
 	// this sub — and distilling its snapshots at the zero tier would silently
 	// shed comments and reviews exactly as if the budget had run out.
-	sub.snapOpts.Tier = p.tier
+	sub.setSnapOpts(func(o *monitor.SnapshotOptions) {
+		if p.ruleset != nil && p.ruleset.Error == "" {
+			o.RulesetChecks = p.ruleset
+		}
+		o.Tier = p.tier
+	})
 	p.subs[sub] = struct{}{}
+	// A watcher that joins while the poller reads over REST gets the mode
+	// notice too, since the switch happened before it subscribed.
+	if p.restNotice != nil {
+		select {
+		case sub.notifCh <- backend.Update{Target: monitor.TargetOf(p.identity), Event: *p.restNotice, At: time.Now()}:
+		default:
+		}
+	}
 	if p.latest != nil {
 		select {
 		case sub.snapshotCh <- p.latest:
@@ -392,6 +418,23 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		h.mu.Unlock()
 
 		raw, err := fetch(ctx, identity, monitor.TierFull)
+		if err != nil && monitor.IsRateLimitError(err) && keyOf(identity).kind == backend.KindPR && h.restFallback != nil {
+			// GraphQL is rate limited: answer from REST, as a poller would,
+			// and say so before the events.
+			resetAt := time.Time{}
+			if h.budget != nil {
+				resetAt, _ = h.budget.GraphQLExhausted(time.Now())
+			}
+			if restRaw, restErr := h.restFallback(ctx, identity, nil); restErr == nil && restRaw != nil {
+				raw, err = restRaw, nil
+				snapOpts.Tier = monitor.TierStatus
+				out <- backend.Update{
+					Target: monitor.TargetOf(identity),
+					Event:  restModeNotice(labelFor(keyOf(identity), identity), resetAt),
+					At:     time.Now(),
+				}
+			}
+		}
 		if err != nil {
 			// A one-shot read has no next poll to recover on, so a fetch
 			// error is the answer: report it as degraded and stop. The
@@ -925,6 +968,7 @@ type poller struct {
 	errBackoff  time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
 	blindFrom   time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
 	lastSuccess time.Time         // when the last successful fetch completed; the honest lower bound for a blind window that opens later
+	restNotice  *monitor.Event    // the mode notice while the poller reads PR state over REST (issue #123); nil in GraphQL mode
 	subs        map[*sub]struct{}
 
 	wake  chan struct{}
@@ -976,7 +1020,7 @@ func (p *poller) run() {
 			p.ruleset = rs
 			// Update all existing subscribers with the ruleset.
 			for s := range p.subs {
-				s.snapOpts.RulesetChecks = rs
+				s.setSnapOpts(func(o *monitor.SnapshotOptions) { o.RulesetChecks = rs })
 			}
 			p.mu.Unlock()
 		}
@@ -986,7 +1030,9 @@ func (p *poller) run() {
 	// a first poll that already runs shed must say so loudly — a watcher that
 	// never learns annotations were dropped would read their absence as
 	// all-clear.
+	p.mu.Lock()
 	p.tier = monitor.TierFull
+	p.mu.Unlock()
 	p.fetchOnce()
 	delay := p.nextDelay()
 	timer := time.NewTimer(delay)
@@ -1113,13 +1159,6 @@ func (p *poller) fetchOnce() {
 	fetch := p.hub.fetch
 	p.hub.mu.Unlock()
 
-	// Select the tier from the advisory GraphQL budget (TierFull when no
-	// guard is wired) and say loudly when the watched surfaces change.
-	tier := p.selectTier()
-	if tier != p.tier {
-		p.applyTier(tier)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// Stop the fetch if the poller is stopped.
@@ -1131,13 +1170,40 @@ func (p *poller) fetchOnce() {
 		}
 	}()
 
+	// While the headers of the last GraphQL response say the budget is spent
+	// until a reset time, a GraphQL call can only fail. Read over REST
+	// without making it.
+	if p.canUseREST() {
+		if resetAt, exhausted := p.budget.GraphQLExhausted(time.Now()); exhausted {
+			p.fetchViaREST(ctx, resetAt)
+			return
+		}
+	}
+
+	// Select the tier from the advisory GraphQL budget (TierFull when no
+	// guard is wired) and say loudly when the watched surfaces change. In
+	// REST mode the tier stays at TierStatus until GraphQL answers again.
+	tier := p.selectTier()
+	p.mu.Lock()
+	changed := tier != p.tier && p.restNotice == nil
+	p.mu.Unlock()
+	if changed {
+		p.applyTier(tier)
+	}
+
 	curr, err := fetch(ctx, p.identity, tier)
 	if err != nil {
 		// A per-query resource-limit error can be beaten by a cheaper query:
 		// retry once one tier down. A rate-limit 403 cannot (every query
-		// costs points), so it falls through to the degraded broadcast.
+		// costs points), so a PR watch reads over REST instead, and other
+		// kinds fall through to the degraded broadcast.
 		if monitor.IsQueryCostError(err) && tier > monitor.TierStatus {
 			curr, err = fetch(ctx, p.identity, tier-1)
+		}
+		if err != nil && monitor.IsRateLimitError(err) && p.canUseREST() {
+			resetAt, _ := p.budget.GraphQLExhausted(time.Now())
+			p.fetchViaREST(ctx, resetAt)
+			return
 		}
 		if err != nil || curr == nil {
 			// Degrade loudly, once per episode: a fetch error must reach
@@ -1161,21 +1227,135 @@ func (p *poller) fetchOnce() {
 				p.blindFrom = p.lastSuccess
 			}
 			p.mu.Unlock()
-			msg := fmt.Sprintf("%v", err)
-			if p.enterDegraded("graphql", msg) {
-				p.broadcast(monitor.Event{
-					Type:             monitor.EventDegraded,
-					DegradedSurface:  "graphql",
-					DegradedMessage:  msg,
-					DegradedSurfaces: p.hub.blindSurfaces(p.key),
-				})
-			}
-			p.mu.Lock()
-			p.errBackoff = monitor.NextErrBackoff(p.errBackoff, p.interval)
-			p.mu.Unlock()
+			p.reportFailure("graphql", err)
 			return
 		}
 	}
+	p.leaveRESTMode(tier)
+	p.deliver(curr)
+}
+
+// reportFailure broadcasts a failed fetch of the given API surface as a
+// degraded episode and backs off the cadence.
+func (p *poller) reportFailure(surface string, err error) {
+	msg := fmt.Sprintf("%v", err)
+	if p.enterDegraded(surface, msg) {
+		p.broadcast(monitor.Event{
+			Type:             monitor.EventDegraded,
+			DegradedSurface:  surface,
+			DegradedMessage:  msg,
+			DegradedSurfaces: p.hub.blindSurfaces(p.key),
+		})
+	}
+	p.mu.Lock()
+	p.errBackoff = monitor.NextErrBackoff(p.errBackoff, p.interval)
+	p.mu.Unlock()
+}
+
+// canUseREST reports whether this poller can read its target over REST when
+// GraphQL is rate limited: a PR target, with a fallback wired.
+func (p *poller) canUseREST() bool {
+	return p.key.kind == backend.KindPR && p.hub.restFallback != nil
+}
+
+func (p *poller) inRESTMode() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.restNotice != nil
+}
+
+// fetchViaREST reads the PR over REST and delivers the result like a
+// TierStatus GraphQL fetch: comments, review threads, reviews and annotations
+// keep their last-known values and read as shed. The first REST read after
+// GraphQL mode says so, with the reset time when the headers gave one.
+func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
+	p.mu.Lock()
+	prev := p.latest
+	p.mu.Unlock()
+	curr, err := p.hub.restFallback(ctx, p.identity, prev)
+	if err != nil || curr == nil {
+		if err == nil {
+			err = fmt.Errorf("REST read returned no pull request")
+		}
+		p.mu.Lock()
+		if p.blindFrom.IsZero() {
+			p.blindFrom = p.lastSuccess
+		}
+		p.mu.Unlock()
+		p.reportFailure("rest", fmt.Errorf("GraphQL is rate limited and the REST read failed: %w", err))
+		return
+	}
+
+	if !p.inRESTMode() {
+		ev := restModeNotice(p.label(), resetAt)
+		p.setTier(monitor.TierStatus)
+		p.mu.Lock()
+		p.restNotice = &ev
+		p.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "gh-monitor: %s: GraphQL rate limited, reading PR state over REST\n", p.label())
+		p.broadcast(ev)
+	}
+	p.deliver(curr)
+}
+
+// restModeNotice is the degraded notice that starts REST mode for the PR at
+// label. It lists what REST cannot read and, when the headers gave one, the
+// time the GraphQL budget resets.
+func restModeNotice(label string, resetAt time.Time) monitor.Event {
+	shed := monitor.TierStatus.ShedSurfaces()
+	ev := monitor.Event{
+		Type:             monitor.EventDegraded,
+		DegradedSurface:  "graphql",
+		DegradedSurfaces: shed,
+	}
+	until := ""
+	if !resetAt.IsZero() {
+		until = " until " + resetAt.Local().Format("15:04 MST")
+		ev.DegradedResetAt = resetAt.UTC().Format(time.RFC3339)
+	}
+	ev.Notice = fmt.Sprintf("⚠️ reading PR state over REST because GraphQL is exhausted%s on %s: state, merge, head commit and check outcomes remain watched; %s are not watched until GraphQL answers again",
+		until, label, strings.Join(shed, ", "))
+	return ev
+}
+
+// leaveRESTMode ends REST mode after a successful GraphQL fetch at tier: the
+// subscribers go back to that tier and hear that GraphQL answers again. It
+// does nothing in GraphQL mode.
+func (p *poller) leaveRESTMode(tier monitor.QueryTier) {
+	p.mu.Lock()
+	wasREST := p.restNotice != nil
+	p.restNotice = nil
+	p.mu.Unlock()
+	if !wasREST {
+		return
+	}
+	p.setTier(tier)
+	msg := fmt.Sprintf("✅ reading PR state over GraphQL again on %s", p.label())
+	if shed := tier.ShedSurfaces(); len(shed) > 0 {
+		msg += fmt.Sprintf("; the GraphQL budget is still low, so %s stay unwatched until it recovers", strings.Join(shed, ", "))
+	} else {
+		msg += ": resuming full monitoring"
+	}
+	fmt.Fprintf(os.Stderr, "gh-monitor: %s: GraphQL answers again, leaving REST mode\n", p.label())
+	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
+}
+
+// setTier records tier as the poller's tier and every PR subscriber's
+// snapshot tier, without a notice.
+func (p *poller) setTier(tier monitor.QueryTier) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.tier = tier
+	if p.key.kind == backend.KindPR {
+		for s := range p.subs {
+			s.setSnapOpts(func(o *monitor.SnapshotOptions) { o.Tier = tier })
+		}
+	}
+}
+
+// deliver ends any degraded episode, then records curr as the latest payload
+// and sends it to every subscriber.
+func (p *poller) deliver(curr any) {
 	// A successful fetch ends every degraded episode this poller has in
 	// flight: announce the recovery before the fresh snapshot, so a
 	// consumer never reads the outage as ongoing past this point.
@@ -1304,14 +1484,7 @@ func (p *poller) selectTier() monitor.QueryTier {
 // runRef — the shed is logged, not notified. A watcher that quietly shed
 // surfaces would turn a missing signal into an apparent all-clear.
 func (p *poller) applyTier(tier monitor.QueryTier) {
-	p.mu.Lock()
-	p.tier = tier
-	if p.key.kind == backend.KindPR {
-		for s := range p.subs {
-			s.snapOpts.Tier = tier
-		}
-	}
-	p.mu.Unlock()
+	p.setTier(tier)
 
 	if p.key.kind == backend.KindRef || p.key.kind == backend.KindCommit {
 		if tier == monitor.TierNoAnnotations {
@@ -1382,8 +1555,12 @@ func (p *poller) broadcast(ev monitor.Event) {
 // label renders the identity for notifications, in the same shape the
 // renderer's degradedLabel uses for each kind.
 func (p *poller) label() string {
-	id := p.identity
-	switch p.key.kind {
+	return labelFor(p.key, p.identity)
+}
+
+// labelFor renders an identity of the given key's kind for notifications.
+func labelFor(k pollerKey, id resolver.Identity) string {
+	switch k.kind {
 	case backend.KindRef:
 		return fmt.Sprintf("%s/%s@%s", id.Owner, id.Repo, id.Ref)
 	case backend.KindCommit:
@@ -1411,9 +1588,10 @@ func (p *poller) label() string {
 // snapshot inbox, a channel for loop-level notices (degraded / tier-shed),
 // and an output channel of updates.
 type sub struct {
-	// mu guards handle — the one state mutated after creation (by loop's
-	// Consume, and by ExportState's baseline read and takeResume's restore on
-	// the handoff path).
+	// mu guards handle and snapOpts, the state mutated after creation: loop's
+	// Consume, ExportState's baseline read and takeResume's restore on the
+	// handoff path change handle, and the poller changes snapOpts when the
+	// ruleset or the tier changes (see setSnapOpts).
 	mu         sync.Mutex
 	distill    func(raw any, snapOpts monitor.SnapshotOptions) backend.Status
 	handle     consumerHandle
@@ -1434,6 +1612,14 @@ type sub struct {
 // and emits notifications until done is closed or the target reaches a
 // terminal state (merged/closed PR, closed issue, completed run), at which
 // point it closes the output channel so daemon clients get a clean EOF.
+// setSnapOpts changes the consumer's snapshot options under its lock, since
+// loop reads them from another goroutine.
+func (s *sub) setSnapOpts(change func(*monitor.SnapshotOptions)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	change(&s.snapOpts)
+}
+
 func (s *sub) loop() {
 	for {
 		select {
@@ -1456,7 +1642,10 @@ func (s *sub) loop() {
 					inner(u)
 				}
 			}
-			curr := s.distill(raw, s.snapOpts)
+			s.mu.Lock()
+			snapOpts := s.snapOpts
+			s.mu.Unlock()
+			curr := s.distill(raw, snapOpts)
 			// One poll's diff goes out as one batch, so a --until watch
 			// can print the rest of the batch that fired it (issue #116).
 			add, flush := backend.Batch(emit)

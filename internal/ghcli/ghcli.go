@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
 )
@@ -16,6 +17,26 @@ import (
 // the authenticated context and host configuration provided by the user.
 type Client struct {
 	Host string
+
+	// Limits records the X-RateLimit-* headers of every REST and GraphQL
+	// response this client receives. Nil records into Observed.
+	Limits *RateLimitStore
+}
+
+// api runs one `gh api` call with --include, records the rate-limit headers
+// of the response, and returns the body without the headers. A failed call
+// still carries headers (a 403 rate-limit response does), so they are
+// recorded before the error is returned.
+func (c *Client) api(args []string, stdin []byte) ([]byte, string, error) {
+	args = append(args, "--include")
+	stdout, stderr, err := runGh(args, stdin)
+	headers, body := splitIncluded(stdout)
+	store := c.Limits
+	if store == nil {
+		store = Observed
+	}
+	store.Observe(c.Host, headers, time.Now())
+	return body, stderr, err
 }
 
 // API defines the subset of GitHub API interactions required by the command logic.
@@ -173,7 +194,7 @@ func (c *Client) REST(method, path string, params map[string]string, body interf
 		args = append(args, "--input", "-")
 	}
 
-	stdout, stderr, err := runGh(args, stdinData)
+	stdout, stderr, err := c.api(args, stdinData)
 	if err != nil {
 		return wrapError(err, stdout, stderr)
 	}
@@ -224,7 +245,7 @@ func (c *Client) GraphQL(query string, variables map[string]interface{}, result 
 	}
 	args = append(args, "--input", "-")
 
-	stdout, stderr, err := runGh(args, data)
+	stdout, stderr, err := c.api(args, data)
 	if err != nil {
 		return wrapError(err, stdout, stderr)
 	}
@@ -354,7 +375,8 @@ func RunGh(args []string, stdin []byte) ([]byte, string, error) {
 }
 
 // runGh executes the `gh` CLI command with provided arguments and optional stdin data.
-func runGh(args []string, stdin []byte) ([]byte, string, error) {
+// It is a variable so tests can replace the gh process.
+var runGh = func(args []string, stdin []byte) ([]byte, string, error) {
 	cmd := exec.Command("gh", args...)
 	// DEBUG LOG
 	// fmt.Fprintf(os.Stderr, "running gh %s\n", strings.Join(args, " "))

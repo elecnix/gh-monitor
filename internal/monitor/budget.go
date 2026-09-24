@@ -12,9 +12,15 @@ import (
 // BudgetGuard provides advisory awareness of the shared GitHub GraphQL
 // budget. GitHub resets the GraphQL quota hourly; when many watchers consume
 // it continuously, it exhausts before the reset and stays exhausted because
-// consumption is continuous. The guard reads GET /rate_limit (REST, cheap)
-// and lets a caller stretch its cadence as the GraphQL budget runs low, so
-// the watcher contributes less instead of failing wholesale at the boundary.
+// consumption is continuous. The guard lets a caller stretch its cadence as
+// the GraphQL budget runs low, so the watcher contributes less instead of
+// failing wholesale at the boundary.
+//
+// The guard reads the X-RateLimit-* headers of the latest real GraphQL
+// response (see ghcli.RateLimitStore). GET /rate_limit is the last resort,
+// used only while no reading covers the current window: that endpoint has
+// reported used 0 while the headers of a real call in the same minute read
+// 5000 of 5000 (issue #123).
 //
 // Advisory by design: /rate_limit cannot see secondary rate limits (GitHub
 // throttles request rate and concurrency separately from the published
@@ -41,6 +47,11 @@ type BudgetGuard struct {
 	// maxIdleInterval, matching the idle-backoff ceiling).
 	maxStretch time.Duration
 
+	// observed supplies the header readings, for host. Nil means the guard
+	// only has /rate_limit.
+	observed *ghcli.RateLimitStore
+	host     string
+
 	mu        sync.Mutex
 	lastCheck time.Time
 	cached    *RateLimitResponse
@@ -57,6 +68,10 @@ func NewBudgetGuard(svc *Service, base time.Duration) *BudgetGuard {
 		base:              base,
 		thresholdFraction: 0.10,
 		maxStretch:        maxIdleInterval,
+	}
+	if svc != nil {
+		g.observed = ghcli.Observed
+		g.host = "github.com"
 	}
 	if g.base <= 0 {
 		g.base = defaultInterval
@@ -91,7 +106,7 @@ type BudgetState struct {
 // guard must not guess.
 func (g *BudgetGuard) Stretch(now time.Time) BudgetState {
 	st := BudgetState{}
-	if g == nil || g.svc == nil {
+	if g == nil || (g.svc == nil && g.observed == nil) {
 		return st
 	}
 	remaining, limit, ok := g.GraphQLRemaining(now)
@@ -126,12 +141,55 @@ func (g *BudgetGuard) Stretch(now time.Time) BudgetState {
 	return st
 }
 
-// GraphQLRemaining returns the last-known GraphQL remaining/limit, refreshing
-// from GET /rate_limit at most once per checkEvery. ok=false when the
-// rate-limit endpoint cannot be read (e.g. REST also degraded).
+// UseObserved makes the guard read response headers from store, for host,
+// in place of the process-wide ghcli.Observed.
+func (g *BudgetGuard) UseObserved(store *ghcli.RateLimitStore, host string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.observed = store
+	g.host = host
+}
+
+// currentReading returns the latest GraphQL header reading when it still
+// describes the current window: its reset time is in the future. After the
+// reset the budget has refilled and the reading is out of date.
+func (g *BudgetGuard) currentReading(now time.Time) (ghcli.RateLimitReading, bool) {
+	r, ok := g.observed.Latest(g.host, "graphql")
+	if !ok || r.Reset.IsZero() || !now.Before(r.Reset) {
+		return ghcli.RateLimitReading{}, false
+	}
+	return r, true
+}
+
+// GraphQLExhausted reports whether the latest GraphQL response said the
+// budget is spent, and when it resets. Only header readings count: a guess
+// from /rate_limit could send a watcher to REST for nothing.
+func (g *BudgetGuard) GraphQLExhausted(now time.Time) (resetAt time.Time, exhausted bool) {
+	if g == nil {
+		return time.Time{}, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	r, ok := g.currentReading(now)
+	if !ok || r.Remaining > 0 {
+		return time.Time{}, false
+	}
+	return r.Reset, true
+}
+
+// GraphQLRemaining returns the last-known GraphQL remaining/limit. A header
+// reading for the current window answers first. Otherwise the guard reads
+// GET /rate_limit, at most once per checkEvery. ok=false when neither source
+// has an answer (e.g. REST also degraded).
 func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if r, ok := g.currentReading(now); ok {
+		return r.Remaining, r.Limit, true
+	}
+	if g.svc == nil {
+		return 0, 0, false
+	}
 	if g.lastCheck.IsZero() || now.Sub(g.lastCheck) >= g.checkEvery {
 		rl, err := g.svc.FetchRateLimit()
 		if err == nil && rl != nil {
