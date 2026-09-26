@@ -215,6 +215,15 @@ gh monitor --once -R owner/repo 42
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
 
+#### Watches end when their launcher exits
+
+A monitor that outlives the process that started it polls a finished pull request forever, and a pile of such monitors shares one API budget with the sessions that are still alive ([#129](https://github.com/elecnix/gh-monitor/issues/129)). Two safeguards close that gap, both on by default:
+
+- **The orphan guard.** A continuous watch polls `os.Getppid()` every 5 seconds against the parent pid it captured at start. When the launcher exits, the OS reparents the watch (to `init`, `launchd`, or the user service manager), the pid changes, and the watch ends the way a Ctrl-C ends it: exit 0, no error, no notification. This reads one integer per tick and never touches the network. Set `GH_MONITOR_ORPHAN_GUARD=0` to opt out, the same convention as `GH_MONITOR_REEXEC`.
+- **A dead output consumer ends the watch.** A watch whose stdout is a pipe with no reader gets `EPIPE` on its next notification; the watch treats that failed write as its exit and returns an error (exit 1) instead of streaming into the void. A caller that keeps reading is unaffected.
+
+`--timeout <seconds>` remains the way to bound a watch's lifetime explicitly; the orphan guard covers the case where no bound was passed and the launcher disappeared.
+
 #### Reducing notification noise with `--events`
 
 By default `gh monitor` emits a notification for every event kind: every CI transition, every comment, every review, every new commit, plus the merge-blocking ones. An orchestrator or automation caller that only wants to act on a subset can pass `--events` (alias `--only-events`) with a comma-separated allowlist; events whose kind is not in the list are suppressed before they reach stdout.

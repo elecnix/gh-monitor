@@ -201,6 +201,22 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The orphan guard (issue #129): when the process that launched this
+	// watch exits, the OS reparents this one, and the changed parent pid ends
+	// the watch — the same contract as Ctrl-C, exit 0. A monitor whose owner
+	// is gone has nothing left to report, and a pile of such monitors shares
+	// one API budget with the sessions that are still alive. Disabled watches
+	// (GH_MONITOR_ORPHAN_GUARD=0) get a nil guard whose Done never fires.
+	guard := maybeStartGuardFn()
+	defer guard.Stop()
+	go func() {
+		select {
+		case <-guard.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -332,7 +348,8 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		runOpts.AnnotationLevels = levels
 	}
 
-	write := func(n monitor.Notification) {
+	write := func(n monitor.Notification) error {
+		var err error
 		if opts.Text {
 			out := cmd.OutOrStdout()
 			_, _ = fmt.Fprintln(out, monitor.LinkifyText(n))
@@ -341,18 +358,30 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 					_, _ = fmt.Fprintf(out, "  %s\n", line)
 				}
 			}
-			return
+			return nil
 		}
-		if err := encodeJSON(cmd, n); err != nil {
+		if err = encodeJSON(cmd, n); err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: %v\n", err)
 		}
+		return err
 	}
 
 	// --events applies here, at the one boundary every notification crosses,
-	// whatever produced it — the shared daemon or an external backend.
+	// whatever produced it — the shared daemon or an external backend. A
+	// failed write means the consumer of the watch's output is gone (a closed
+	// pipe reports EPIPE to its writer): the watch ends there, so a monitor
+	// whose reader has exited stops polling instead of streaming into the
+	// void (issue #129).
+	writeFailed := false
 	emit := func(n monitor.Notification) {
+		if writeFailed {
+			return
+		}
 		if eventFilter == nil || eventFilter.Allows(n.Type) {
-			write(n)
+			if write(n) != nil {
+				writeFailed = true
+				cancel()
+			}
 		}
 	}
 	// Eyes-on-notify fires through the same boundary: a kind the filter
@@ -512,9 +541,16 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// DIRECTLY, bypassing the --events emit() suppression, so the caller
 		// always learns which event triggered the exit even if that kind is
 		// not in the --events allowlist. Cursor persist and the event log ran
-		// above, so cursor and log stay correct on the early exit too.
+		// above, so cursor and log stay correct on the early exit too. The
+		// write failure path is the same as emit()'s: a gone consumer ends
+		// the watch here as well.
 		if untilFilter != nil && untilFilter.Allows(n.Type) {
-			write(n)
+			if !writeFailed {
+				if write(n) != nil {
+					writeFailed = true
+					cancel()
+				}
+			}
 			untilMet = true
 		} else {
 			emit(n)
@@ -531,6 +567,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	if ctxErr != nil && !errors.Is(ctxErr, context.Canceled) {
 		return ctxErr
 	}
+	// A write failure is its own ending: the consumer of the output is gone,
+	// which is neither the condition being met nor the user cancelling. It
+	// surfaces as an error (exit 1) so a --until caller never reads a
+	// consumer-side failure as its condition having fired.
+	if writeFailed {
+		return errOutputConsumerGone
+	}
 	// The sentinel only covers a watch that ended on its own — timeout or a
 	// closed stream. A Ctrl-C (context.Canceled) is the user cancelling, not
 	// the condition failing, so it exits 0 as before.
@@ -546,6 +589,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 // caller can tell "condition met" (0) from "gave up" (2) without parsing
 // output; a Ctrl-C (context.Canceled) is neither and exits 0 as before.
 var errUntilNotMet = errors.New("--until condition not met before the watch ended")
+
+// errOutputConsumerGone is the sentinel runMonitor returns when a write to
+// the watch's output failed (a closed pipe reports EPIPE to its writer). The
+// consumer is gone; the watch ends and reports an error (exit 1) rather than
+// success, so a --until caller never mistakes its own death for the
+// condition having fired (issue #129).
+var errOutputConsumerGone = errors.New("output consumer is gone; the watch ended")
 
 // daemonSocketPath returns the daemon socket path. It honours $GH_MONITOR_SOCK
 // for tests.
@@ -603,6 +653,18 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The orphan guard, the same as a target watch: a repo-wide readiness
+	// watch is equally resident and equally wasteful once its owner is gone.
+	guard := maybeStartGuardFn()
+	defer guard.Stop()
+	go func() {
+		select {
+		case <-guard.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -624,6 +686,8 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
 	}
 
+	// A failed write means the consumer of the readiness output is gone; the
+	// cancelled context ends the watch at the loop's next check (issue #129).
 	emit := func(n monitor.Notification) {
 		if opts.Text {
 			out := cmd.OutOrStdout()
@@ -632,6 +696,7 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 		if err := encodeJSON(cmd, n); err != nil {
 			fmt.Fprintf(os.Stderr, "gh-monitor: %v\n", err)
+			cancel()
 		}
 	}
 
