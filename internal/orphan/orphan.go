@@ -82,6 +82,11 @@ func Start(interval time.Duration) *Guard {
 // racing the first for the done channel.
 func (g *Guard) Start() *Guard {
 	g.startOnce.Do(func() {
+		if g.ppidFn == nil {
+			// A guard without a poller has nothing to watch; disable it the
+			// same way a zero baseline does.
+			return
+		}
 		baseline := g.ppidFn()
 		g.ppid.Store(int64(baseline))
 		// A baseline of 0 is not a usable parent pid: the poll condition
@@ -116,6 +121,11 @@ func (g *Guard) Start() *Guard {
 // process exiting is the release. Tests call it so they leave no goroutine
 // ticking. Like Done, it tolerates a nil guard, so a caller's defer needs no
 // conditional.
+//
+// Stop never closes Done. A closed Done means the launcher exited — the one
+// signal this package reports — so a caller selecting on Done can never
+// mistake a Stop for a reparenting. (Tests use Stop only to release the
+// goroutine of a guard whose Done nobody selects on afterwards.)
 func (g *Guard) Stop() {
 	if g == nil {
 		return

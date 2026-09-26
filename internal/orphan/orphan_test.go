@@ -135,3 +135,16 @@ func TestZeroPPIDBaselineDisablesTheGuard(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestNilPPIDFnDisablesTheGuard pins the nil-poller contract from review:
+// New with a nil ppidFn must yield a disabled guard (Done never fires), not
+// a panic on the first poll.
+func TestNilPPIDFnDisablesTheGuard(t *testing.T) {
+	g := New(20*time.Millisecond, nil).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+		t.Fatal("a nil ppidFn must not produce a firing guard")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
