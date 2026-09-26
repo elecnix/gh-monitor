@@ -95,8 +95,12 @@ func (g *Guard) Start() *Guard {
 
 // Stop releases the poll goroutine. A production guard never calls it: its
 // process exiting is the release. Tests call it so they leave no goroutine
-// ticking.
+// ticking. Like Done, it tolerates a nil guard, so a caller's defer needs no
+// conditional.
 func (g *Guard) Stop() {
+	if g == nil {
+		return
+	}
 	g.stopOnce.Do(func() { close(g.stopc) })
 }
 

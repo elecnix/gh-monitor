@@ -90,3 +90,11 @@ func assertEqual(t *testing.T, want, got string) {
 		t.Fatalf("want %q, got %q", want, got)
 	}
 }
+
+// TestNilGuardStopToleratesNil pins the deferred-call contract: a caller that
+// wires `defer guard.Stop()` around a maybe-nil guard must not panic in the
+// disabled case.
+func TestNilGuardStopToleratesNil(t *testing.T) {
+	var g *Guard
+	g.Stop()
+}
