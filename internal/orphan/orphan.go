@@ -48,10 +48,11 @@ type Guard struct {
 	// done closes when the launcher is gone.
 	done chan struct{}
 	// stopc and stopOnce back Stop, which tests use to release the poll
-	// goroutine. A production guard lives exactly as long as its process and
-	// never calls Stop.
-	stopOnce sync.Once
-	stopc    chan struct{}
+	// goroutine. startOnce makes Start single-use. A production guard lives
+	// exactly as long as its process and never calls Stop.
+	stopOnce  sync.Once
+	startOnce sync.Once
+	stopc     chan struct{}
 }
 
 // New builds a guard that polls ppidFn at interval. It does not poll until
@@ -72,25 +73,38 @@ func Start(interval time.Duration) *Guard {
 }
 
 // Start captures the parent pid and launches the poll loop. The first read
-// is the baseline every later poll compares against.
+// is the baseline every later poll compares against. A guard is single-use:
+// a second Start on the same guard is a no-op, not a second poll loop
+// racing the first for the done channel.
 func (g *Guard) Start() *Guard {
-	baseline := g.ppidFn()
-	g.ppid = baseline
-	go func(ppid int) {
-		ticker := time.NewTicker(g.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-g.stopc:
-				return
-			case <-ticker.C:
-				if cur := g.ppidFn(); cur != ppid && cur != 0 {
-					close(g.done)
+	g.startOnce.Do(func() {
+		baseline := g.ppidFn()
+		g.ppid = baseline
+		// A baseline of 0 is not a usable parent pid: the poll condition
+		// (a different, non-zero parent) can then never be true, so the
+		// guard would hold every watch forever. A failed read disables the
+		// guard for this process — fail-safe in the direction of the
+		// launcher still being present, never in the direction of a
+		// permanently unwatchable process.
+		if baseline == 0 {
+			return
+		}
+		go func(ppid int) {
+			ticker := time.NewTicker(g.interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-g.stopc:
 					return
+				case <-ticker.C:
+					if cur := g.ppidFn(); cur != ppid && cur != 0 {
+						close(g.done)
+						return
+					}
 				}
 			}
-		}
-	}(baseline)
+		}(baseline)
+	})
 	return g
 }
 

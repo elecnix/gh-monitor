@@ -102,3 +102,36 @@ func TestNilGuardStopToleratesNil(t *testing.T) {
 	var g *Guard
 	g.Stop()
 }
+
+// TestStartIsSingleUse pins the single-use contract from review: a second
+// Start on the same guard must not spawn a second poll loop that races the
+// first for the done channel (a double close panics). One Start wins; a
+// later reparenting is still detected by the surviving loop.
+func TestStartIsSingleUse(t *testing.T) {
+	var current atomic.Int64
+	current.Store(4242)
+	g := New(20*time.Millisecond, func() int { return int(current.Load()) })
+	g.Start()
+	g.Start() // must be a no-op, not a panic waiting to happen
+	defer g.Stop()
+	current.Store(4243)
+	select {
+	case <-g.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not fire after the parent pid changed")
+	}
+}
+
+// TestZeroPPIDBaselineDisablesTheGuard pins the zero-baseline contract from
+// review: a baseline read of 0 is not a usable parent pid (the poll
+// condition could then never be true), so the guard disables itself rather
+// than holding the watch forever.
+func TestZeroPPIDBaselineDisablesTheGuard(t *testing.T) {
+	g := New(20*time.Millisecond, func() int { return 0 }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+		t.Fatal("a zero baseline must not produce a firing guard")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
