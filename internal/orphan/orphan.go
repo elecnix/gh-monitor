@@ -19,9 +19,10 @@
 package orphan
 
 import (
+	"fmt"
 	"os"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,8 +39,11 @@ const DefaultInterval = 5 * time.Second
 
 // Guard watches for the launcher's exit and reports it through Done.
 type Guard struct {
-	// ppid is the parent pid captured when polling started.
-	ppid int
+	// ppid is the parent pid captured when polling started. It is written
+	// once in Start and read by String, potentially from any goroutine, so
+	// it is an atomic: the field has no other writer, and an atomic is the
+	// cheapest thing that makes every read safe.
+	ppid atomic.Int64
 	// ppidFn returns the current parent pid. Tests inject their own so a
 	// reparenting needs no real process.
 	ppidFn func() int
@@ -79,7 +83,7 @@ func Start(interval time.Duration) *Guard {
 func (g *Guard) Start() *Guard {
 	g.startOnce.Do(func() {
 		baseline := g.ppidFn()
-		g.ppid = baseline
+		g.ppid.Store(int64(baseline))
 		// A baseline of 0 is not a usable parent pid: the poll condition
 		// (a different, non-zero parent) can then never be true, so the
 		// guard would hold every watch forever. A failed read disables the
@@ -150,5 +154,5 @@ func (g *Guard) String() string {
 	if g == nil {
 		return "guard disabled"
 	}
-	return "ppid " + strconv.Itoa(g.ppid)
+	return "ppid " + fmt.Sprintf("%d", g.ppid.Load())
 }
