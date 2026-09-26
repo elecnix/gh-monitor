@@ -567,6 +567,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	if ctxErr != nil && !errors.Is(ctxErr, context.Canceled) {
 		return ctxErr
 	}
+	// A met --until condition wins over every failure ending: the member DID
+	// fire and was written (or its write failed after the batch that carried
+	// it), so the caller gets exit 0. A consumer that died mid-batch is a
+	// loss for the next watch, not a reason to re-answer this one.
+	if untilFilter != nil && untilMet {
+		return nil
+	}
 	// A write failure is its own ending: the consumer of the output is gone,
 	// which is neither the condition being met nor the user cancelling. It
 	// surfaces as an error (exit 1) so a --until caller never reads a

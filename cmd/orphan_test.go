@@ -184,8 +184,9 @@ func (s *endlessSource) Watch(ctx context.Context, t backend.Target, _ backend.W
 		default:
 		}
 	}
-	if s.every == 0 {
-		s.every = 20 * time.Millisecond
+	every := s.every
+	if every == 0 {
+		every = 20 * time.Millisecond
 	}
 	ch := make(chan backend.Update, 4)
 	go func() {
@@ -199,7 +200,7 @@ func (s *endlessSource) Watch(ctx context.Context, t backend.Target, _ backend.W
 				return
 			}
 			select {
-			case <-time.After(s.every):
+			case <-time.After(every):
 			case <-ctx.Done():
 				return
 			}
@@ -215,3 +216,45 @@ type brokenWriter struct{ err error }
 func (w *brokenWriter) Write(p []byte) (int, error) { return 0, w.err }
 
 var _ io.Writer = (*brokenWriter)(nil)
+
+// TestMonitorUntilMetBeatsWriteFailure pins the precedence the review
+// flagged: when a --until member fires and the write of the triggering event
+// fails, the watch reports the condition MET (exit 0, nil), not the write
+// failure. The member did fire; a dead consumer must not re-answer it.
+func TestMonitorUntilMetBeatsWriteFailure(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	endpoint := serveTestBackend(t, remote.ServerConfig{
+		Name:  "relay",
+		Kinds: []backend.Kind{backend.KindPR},
+		Source: &staticSource{
+			updates: []backend.Update{
+				{
+					Event: backend.Event{Type: backend.EventMerged},
+					At:    at,
+				},
+			},
+		},
+	})
+	t.Setenv(backendEndpointEnv, endpoint)
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	apiClientFactory = func(string) ghcli.API { return &commandFakeAPI{} }
+
+	root := newRootCommand()
+	root.SetOut(&brokenWriter{err: syscall.EPIPE})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--until", "merged"})
+
+	done := make(chan error, 1)
+	go func() { done <- root.Execute() }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "the condition fired; a failed write of the triggering event must not change the answer")
+	case <-time.After(10 * time.Second):
+		t.Fatal("watch did not end")
+	}
+}

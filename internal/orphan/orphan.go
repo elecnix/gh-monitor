@@ -74,8 +74,9 @@ func Start(interval time.Duration) *Guard {
 // Start captures the parent pid and launches the poll loop. The first read
 // is the baseline every later poll compares against.
 func (g *Guard) Start() *Guard {
-	g.ppid = g.ppidFn()
-	go func() {
+	baseline := g.ppidFn()
+	g.ppid = baseline
+	go func(ppid int) {
 		ticker := time.NewTicker(g.interval)
 		defer ticker.Stop()
 		for {
@@ -83,13 +84,13 @@ func (g *Guard) Start() *Guard {
 			case <-g.stopc:
 				return
 			case <-ticker.C:
-				if cur := g.ppidFn(); cur != g.ppid && cur != 0 {
+				if cur := g.ppidFn(); cur != ppid && cur != 0 {
 					close(g.done)
 					return
 				}
 			}
 		}
-	}()
+	}(baseline)
 	return g
 }
 

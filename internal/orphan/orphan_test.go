@@ -1,6 +1,7 @@
 package orphan
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -11,8 +12,11 @@ import (
 // signature of a launcher that exited while its child kept running.
 func TestGuardExitsWhenPPIDChanges(t *testing.T) {
 	// A guard wired to a stable poller never fires, however long it polls.
-	current := 4242
-	g := New(20*time.Millisecond, func() int { return current }).Start()
+	// The atomic is what lets the test reparent the fake launcher while the
+	// poll goroutine reads the same variable.
+	var current atomic.Int64
+	current.Store(4242)
+	g := New(20*time.Millisecond, func() int { return int(current.Load()) }).Start()
 	defer g.Stop()
 	select {
 	case <-g.Done():
@@ -22,7 +26,7 @@ func TestGuardExitsWhenPPIDChanges(t *testing.T) {
 
 	// Simulate reparenting: a launcher that exited leaves the child with a
 	// parent pid it did not start with.
-	current = 4243
+	current.Store(4243)
 	select {
 	case <-g.Done():
 		// The expected path: the changed parent stops the watch.
