@@ -50,4 +50,4 @@ jobs:
           $SUDO apt-get update
           $SUDO apt-get install -y gh
       # No actions/checkout needed — the action reads the body via the API.
-      - uses: elecnix/gh-pr-body-action@v1
+      - uses: elecnix/gh-pr-body-action@08c74dc0736abe295e90d6363abd55cf7ea63ef3 # v1
