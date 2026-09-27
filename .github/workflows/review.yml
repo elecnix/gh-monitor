@@ -1,6 +1,6 @@
 name: review
 on:
-  pull_request:
+  pull_request_target:
 permissions:
   contents: read
   pull-requests: write
@@ -10,10 +10,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   review:
+    # Forks are not reviewed: this job holds the model key. See docs/security.md.
+    if: github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
     steps:
       - name: Review this pull request with Cite
-        uses: elecnix/cite@1c0537ba7f8df4dc5db0651f609f6b8834167150  # v0.11.2
+        uses: elecnix/cite@dd49586e9858a8af211a1535909b95ea5e79b7f5  # v0.11.4
         with:
           # Ollama Cloud is the default provider. Set the CITE_PROVIDER
           # repository variable to "openrouter" to switch this repository
