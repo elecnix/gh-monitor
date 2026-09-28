@@ -224,6 +224,12 @@ A monitor that outlives the process that started it polls a finished pull reques
 
 `--timeout <seconds>` remains the way to bound a watch's lifetime explicitly; the orphan guard covers the case where no bound was passed and the launcher disappeared.
 
+#### The timeout is a hard deadline
+
+The daemon's relays enforce `--timeout` on their side of the wire, and the client enforces it too ([#127](https://github.com/elecnix/gh-monitor/issues/127)): a backend that stops answering the deadline — the observed case is a sub-daemon whose broker connection dropped and that then held its watch open — cannot keep a bounded watch running past the deadline. When the client's deadline fires while the stream is still open, the watch stops, and its last NDJSON line is a `timeout` notice: the deadline that passed and, when the watch was degraded at the time, that degraded state with a pointer to read the target over REST. A stream that closed before the deadline is not a timeout and carries no such line.
+
+`timeout` is a loop-level kind like `first-poll` and `all-clear`: it can be named in `--events`, but not in `--until` — `--timeout` is a maximum watch time, never a completion condition, and a `--until timeout` member is rejected at parse time.
+
 #### Reducing notification noise with `--events`
 
 By default `gh monitor` emits a notification for every event kind: every CI transition, every comment, every review, every new commit, plus the merge-blocking ones. An orchestrator or automation caller that only wants to act on a subset can pass `--events` (alias `--only-events`) with a comma-separated allowlist; events whose kind is not in the list are suppressed before they reach stdout.
@@ -236,7 +242,7 @@ gh monitor -R owner/repo 42 --events conflict,new-failing-checks,merged,closed
 gh monitor --run-id 30433642 -R owner/repo --events run-completed
 ```
 
-The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`, `degraded`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `timeout`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`, `degraded`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
 
 #### Exiting when a condition fires with `--until`
 
@@ -250,7 +256,7 @@ gh monitor -R owner/repo 42 --until ci-all-green,new-failing-checks --timeout 18
 gh monitor -R owner/repo 42 --until merged
 ```
 
-The exit code carries the answer: **0** means the condition was met (the triggering event was reported, then the watch exited), and **2** means the watch ended without the condition firing — the `--timeout` safeguard expired or the target stream closed. `--timeout` stays a maximum watch time, never a completion condition. A Ctrl-C is still just a cancel and exits 0. With `--once`, the single snapshot is the whole watch: exit 0 if a set member is present in that snapshot, else 2.
+The exit code carries the answer: **0** means the condition was met (the triggering event was reported, then the watch exited), and **2** means the watch ended without the condition firing — the `--timeout` deadline passed or the target stream closed. A deadline that passed while the watch was still open ends with a `timeout` line saying so (see [The timeout is a hard deadline](#the-timeout-is-a-hard-deadline)). `--timeout` stays a maximum watch time, never a completion condition. A Ctrl-C is still just a cancel and exits 0. With `--once`, the single snapshot is the whole watch: exit 0 if a set member is present in that snapshot, else 2.
 
 The flag is applied at the consumer layer, so it behaves identically whichever transport serves the watch — the shared-poller daemon, an out-of-process backend, or the in-process `--once` path. An already-green PR emits `ci-all-green` on its first poll, so `--until ci-all-green` on a green PR exits almost immediately.
 

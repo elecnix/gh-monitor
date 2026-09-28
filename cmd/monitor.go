@@ -331,6 +331,14 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// backend, or the in-process --once path.
 	var untilFilter *monitor.EventFilter
 	if strings.TrimSpace(opts.Until) != "" {
+		// --timeout stays a maximum watch time, never a completion condition
+		// (README, and issue #127's fix): a "timeout" member would be a
+		// second way to say "end when the deadline passes", so it is
+		// rejected here with its own message rather than the generic
+		// unknown-kind one.
+		if strings.Contains(strings.ToLower(opts.Until), "timeout") {
+			return fmt.Errorf("--timeout is a maximum watch time, never a completion condition; %q is not a --until member", opts.Until)
+		}
 		filter, err := monitor.ParseEventFilter(opts.Until)
 		if err != nil {
 			return err
@@ -495,6 +503,32 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// errUntilNotMet sentinel (exit code 2).
 	untilMet := false
 
+	// The client keeps its own copy of the --timeout deadline (issue #127):
+	// the daemon-side relays honour it too, but a backend whose watch
+	// machinery stopped answering the deadline — the observed case is a
+	// sub-daemon whose broker connection dropped and that then held the
+	// stream open — leaves nothing between the dead backend and the caller.
+	// The deadline is a hard one: the timer's fire ends the stream no matter
+	// what state the connection is in, and the post-loop code says the watch
+	// ended on the timeout, with the last degraded state attached.
+	deadline := time.Time{}
+	if opts.Timeout > 0 {
+		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+	}
+	deadlineTimer := time.NewTimer(time.Hour)
+	deadlineTimer.Stop()
+	if opts.Timeout > 0 {
+		deadlineTimer.Reset(time.Until(deadline))
+	}
+	defer deadlineTimer.Stop()
+	timedOut := false
+
+	// lastDegraded remembers the latest degraded update the stream
+	// delivered, so the timeout line can say what state the watch was in
+	// when the deadline passed (issue #127). A recovered watch (✅ notice)
+	// clears it.
+	var lastDegraded *backend.Update
+
 	// Eyes-on-notify (pref reactOnNotify, default on): every comment a
 	// delivered notification is about gets a 👀 reaction, so humans on the PR
 	// can see the notification was received.
@@ -509,14 +543,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 	}
 
-	for u := range updates {
+	// handleUpdate runs the loop body for one delivered update: cursor
+	// persist, event log, render, the --until / write-failure paths, and the
+	// end-of-batch stop. It reports whether the watch should continue.
+	handleUpdate := func(u backend.Update) bool {
 		if !dedup.Allow(u) {
 			// A dropped redelivery can still be the update that closes the
 			// batch a --until member fired in.
 			if untilMet && !u.More {
-				break
+				return false
 			}
-			continue
+			return true
 		}
 		// A named instance persists cursor state from what each update carries,
 		// whatever backend delivered it — the shared daemon, an external broker
@@ -534,6 +571,14 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 				evlogFailed = true
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 					"gh-monitor: event log write failed (%v); logging disabled for this watch\n", err)
+			}
+		}
+		if u.Event.Type == backend.EventDegraded {
+			u := u
+			if u.Event.Notice != "" && strings.Contains(u.Event.Notice, "✅") {
+				lastDegraded = nil
+			} else {
+				lastDegraded = &u
 			}
 		}
 		n := monitor.Render(u, runOpts.Prefs, runOpts.Interval)
@@ -559,7 +604,31 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// The watch exits at the end of the batch the member fired in, not
 		// on the member itself: the rest of that poll's batch was already
 		// fetched, and on a first poll it is the PR's backlog (issue #116).
-		if untilMet && !u.More {
+		return !untilMet || u.More
+	}
+
+	for {
+		var open bool
+		var u backend.Update
+		if opts.Timeout > 0 {
+			// A hard deadline (issue #127): the select's timer case wins over
+			// a stream that stays open, so --timeout ends the watch whatever
+			// state the backend connection is in.
+			select {
+			case <-deadlineTimer.C:
+				timedOut = true
+			case u, open = <-updates:
+			}
+		} else {
+			u, open = <-updates
+		}
+		if !open {
+			break
+		}
+		if !handleUpdate(u) {
+			break
+		}
+		if timedOut {
 			break
 		}
 	}
@@ -573,6 +642,14 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// loss for the next watch, not a reason to re-answer this one.
 	if untilFilter != nil && untilMet {
 		return nil
+	}
+	// The client-side deadline (issue #127): say the watch ended on the
+	// timeout, with the last degraded state attached. It is emitted through
+	// the plain write (not emit), so an --events allowlist cannot mute it —
+	// the caller that bounded the watch must learn why it ended.
+	if timedOut {
+		writeTimeoutNotice(cmd, deadline, opts.Timeout, target, lastDegraded, write)
+		return errUntilNotMetIfRequested(untilFilter)
 	}
 	// A write failure is its own ending: the consumer of the output is gone,
 	// which is neither the condition being met nor the user cancelling. It
@@ -588,6 +665,47 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return errUntilNotMet
 	}
 	return nil
+}
+
+// errUntilNotMetIfRequested maps a timed-out watch to the --until contract:
+// exit 2 when the caller asked for a condition, plain success otherwise.
+func errUntilNotMetIfRequested(untilFilter *monitor.EventFilter) error {
+	if untilFilter != nil {
+		return errUntilNotMet
+	}
+	return nil
+}
+
+// writeTimeoutNotice renders and writes the timeout line: the deadline that
+// passed, and the last degraded state the watch was in, so a caller that
+// bounded the watch knows it stopped on the clock — and can fall back to a
+// REST read when the watch was degraded at the time. It goes through write()
+// (never the --events filter or the until path), and a failed write is
+// tolerated: the deadline was reached either way.
+func writeTimeoutNotice(cmd *cobra.Command, deadline time.Time, timeoutSecs int, t backend.Target, last *backend.Update, write func(monitor.Notification) error) {
+	label := t.String()
+	var b strings.Builder
+	fmt.Fprintf(&b, "⏰ --timeout %ds reached on %s; the watch ended on its deadline", timeoutSecs, label)
+	if last != nil && last.Event.Type == backend.EventDegraded {
+		detail := last.Event.Notice
+		if detail == "" {
+			detail = last.Event.DegradedMessage
+		}
+		if detail != "" {
+			fmt.Fprintf(&b, " — degraded at the time: %s", detail)
+		}
+		if !last.At.IsZero() {
+			fmt.Fprintf(&b, " (since %s)", last.At.UTC().Format(time.RFC3339))
+		}
+		fmt.Fprintf(&b, "; read the target over REST if you need its current state")
+	}
+	_ = write(monitor.Notification{
+		Type:      "timeout",
+		PRLabel:   label,
+		Message:   b.String(),
+		Timestamp: deadline,
+	})
+	_ = cmd // cmd is unused today; the writer carries the output stream
 }
 
 // errUntilNotMet is the sentinel runMonitor returns when a --until watch ends
