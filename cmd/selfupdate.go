@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/orphan"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/spf13/cobra"
@@ -43,6 +44,11 @@ var spawnUpgradedDaemonFn = spawnUpgradedDaemon
 // maybeReexecFn relaunches a resident command from a runtime copy of the
 // binary (issue #73). Package variable so tests run in place.
 var maybeReexecFn = reexec.MaybeReexec
+
+// maybeStartGuardFn starts the orphan guard for a resident watch (issue
+// #129). Package variable so tests inject a guard whose parent-pid poller is
+// under their control.
+var maybeStartGuardFn = orphan.MaybeStart
 
 // startUpgradeWatcher launches the background check that hands the daemon off
 // to an upgraded binary. It only runs when the daemon was launched through
