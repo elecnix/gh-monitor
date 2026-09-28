@@ -53,6 +53,10 @@ func validEventKinds() map[string]bool {
 	} {
 		out[string(e)] = true
 	}
+	// The client's own timeout line (issue #127) is a loop-level kind like
+	// first-poll and all-clear: the renderer never receives it as a backend
+	// event, but --events may name it so a bounded caller can route it.
+	out["timeout"] = true
 	return out
 }
 

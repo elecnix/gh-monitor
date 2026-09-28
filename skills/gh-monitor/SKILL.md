@@ -83,7 +83,7 @@ gh monitor --text -R owner/repo <pr>     # Human-readable
 gh monitor --once -R owner/repo <pr>     # One-shot, then exit
 ```
 
-Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever), `--ignored-bots <a,b>`.
+Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever; a hard deadline — see the `timeout` event below), `--ignored-bots <a,b>`.
 
 **Eyes-on-notify (default on):** every comment a delivered notification is about gets a 👀 reaction — the thread's first comment, general PR comments, and issue comments — so humans on the PR can see the notification was received. It is evidence of delivery, not of action. Turn it off with `gh monitor prefs set '{"reactOnNotify": false}'`. A failed reaction costs one stderr line; the watch continues.
 
@@ -102,6 +102,7 @@ Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever), `
 | `new-commit`               | New commit pushed                                                                                                                                                                                                                                                                                                                                                                     |
 | `merged`                   | PR merged                                                                                                                                                                                                                                                                                                                                                                             |
 | `closed`                   | PR closed                                                                                                                                                                                                                                                                                                                                                                             |
+| `timeout`                  | The watch's `--timeout` deadline passed while the backend kept the stream open (issue #127): the watch ended on the clock, and the line says whether it was degraded at the time — fall back to a REST read when it was. Never a stream that closed early, and never a `--until` member                                                                                               |
 | `degraded`                 | API surface unreadable (one per episode: degrade, error change, recovery). Recovery declares the blind window (`degraded_from`/`degraded_to`): events missed during it are never replayed, so backfill from REST if completeness matters. Names what the failed read stopped delivering — e.g. check outcomes and head commit on a failed PR query, which the tier system never sheds |
 
 **Claude Code integration:** Wrap in a persistent `Monitor` tool — each NDJSON line becomes a session notification:
