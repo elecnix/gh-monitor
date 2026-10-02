@@ -309,15 +309,22 @@ func Validate(p Preferences) error {
 // is used as the config base (for tests); otherwise XDG_CONFIG_HOME is used,
 // falling back to $HOME/.config.
 func ConfigPath(baseDir string) (string, error) {
-	dir, err := configDir(baseDir)
+	dir, err := ConfigDir(baseDir)
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, "preferences.json"), nil
 }
 
-// configDir returns the gh-monitor config directory.
-func configDir(baseDir string) (string, error) {
+// ConfigDir returns the gh-monitor config directory — the directory holding
+// preferences.json and every other piece of on-disk gh-monitor state (cursor
+// stores, the event log). It is the single derivation: callers that need the
+// directory itself ask for it here rather than deriving it from ConfigPath
+// with their own filepath.Dir / TrimSuffix, which keeps a rename of
+// preferences.json from silently splitting state across two directories.
+// When baseDir is non-empty it is used as the config base (for tests);
+// otherwise XDG_CONFIG_HOME is used, falling back to $HOME/.config.
+func ConfigDir(baseDir string) (string, error) {
 	base := baseDir
 	if base == "" {
 		base = os.Getenv("XDG_CONFIG_HOME")
@@ -416,7 +423,7 @@ func Load(baseDir string) (Preferences, error) {
 // missing (0755). The file is written to a temp file in the same dir and then
 // renamed into place (0644).
 func Save(baseDir string, p Preferences) error {
-	dir, err := configDir(baseDir)
+	dir, err := ConfigDir(baseDir)
 	if err != nil {
 		return err
 	}

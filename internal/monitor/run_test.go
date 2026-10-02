@@ -14,27 +14,18 @@ import (
 // hub-level behaviour (internal/hub). What remains here are the exported
 // cadence and cursor primitives both paths share.
 
-func TestIdleInterval(t *testing.T) {
-	base := 60 * time.Second
-	assert.Equal(t, base, IdleInterval(base, 0))
-	assert.Equal(t, base, IdleInterval(base, 3))              // growth starts after 3
-	assert.Equal(t, 2*base, IdleInterval(base, 4))            // base * 2^1
-	assert.Equal(t, maxIdleInterval, IdleInterval(base, 100)) // capped
-}
-
 func TestIdleIntervalCapped(t *testing.T) {
 	base := 60 * time.Second
 	assert.Equal(t, base, IdleIntervalCapped(base, 0, maxIdleInterval))
-	assert.Equal(t, maxIdleInterval, IdleIntervalCapped(base, 100, maxIdleInterval), "capped")
-	// A larger cap keeps growing past what the default IdleInterval allows —
-	// this is the mechanism the daemon's broker transport (internal/hub)
-	// relies on to poll less while the broker is healthy.
+	assert.Equal(t, base, IdleIntervalCapped(base, 3, maxIdleInterval))              // growth starts after 3
+	assert.Equal(t, 2*base, IdleIntervalCapped(base, 4, maxIdleInterval))            // base * 2^1
+	assert.Equal(t, maxIdleInterval, IdleIntervalCapped(base, 100, maxIdleInterval)) // capped
+	// A larger cap keeps growing past the package ceiling — this is the
+	// mechanism the daemon's broker transport (internal/hub) relies on to
+	// poll less while the broker is healthy.
 	assert.Equal(t, 30*time.Minute, IdleIntervalCapped(base, 100, 30*time.Minute))
 	// cap<=0 means "no ceiling"; growth is unbounded (still >= base).
 	assert.Greater(t, IdleIntervalCapped(base, 40, 0), maxIdleInterval)
-	// IdleInterval is unchanged: it is IdleIntervalCapped with the fixed
-	// package ceiling.
-	assert.Equal(t, IdleIntervalCapped(base, 12, maxIdleInterval), IdleInterval(base, 12))
 }
 
 // TestIdleIntervalCapped_MeasuresPollReductionOverAWindow is the "prove it

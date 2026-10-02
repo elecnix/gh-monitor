@@ -21,7 +21,7 @@ func rateLimitAPI(graphqlRemaining, graphqlLimit int) *fakeAPI {
 			if path != "rate_limit" {
 				return errors.New("unexpected REST path: " + path)
 			}
-			rl := RateLimitResponse{}
+			rl := rateLimitResponse{}
 			rl.Resources.GraphQL.Remaining = graphqlRemaining
 			rl.Resources.GraphQL.Limit = graphqlLimit
 			rl.Resources.Core.Remaining = 4900
@@ -83,7 +83,7 @@ func TestBudgetGuard_TransitionTracking(t *testing.T) {
 	// Recovery: swap the served budget back to healthy and advance past the
 	// refresh window.
 	api.restFunc = func(method, path string, params map[string]string, body interface{}, result interface{}) error {
-		rl := RateLimitResponse{}
+		rl := rateLimitResponse{}
 		rl.Resources.GraphQL.Remaining = 4900
 		rl.Resources.GraphQL.Limit = 5000
 		return assign(result, rl)
@@ -101,7 +101,7 @@ func TestBudgetGuard_RefreshRateLimited(t *testing.T) {
 	api := &fakeAPI{
 		restFunc: func(method, path string, params map[string]string, body interface{}, result interface{}) error {
 			calls++
-			rl := RateLimitResponse{}
+			rl := rateLimitResponse{}
 			rl.Resources.GraphQL.Remaining = 300
 			rl.Resources.GraphQL.Limit = 5000
 			return assign(result, rl)
