@@ -35,15 +35,23 @@ import (
 // surfaces (annotations, reviews, comments) as the shared GraphQL budget runs
 // low, keeping status + check outcomes alive.
 //
-// The concrete payload type depends on the identity's target kind, matching
-// what the monitor.Service fetch for that kind returns:
+// The concrete type depends on the identity's target kind. Most kinds cross
+// this boundary as the wire payload, because their distillation reads the
+// subscriber's snapshot options and so has to happen once per subscriber
+// here rather than once at the fetch:
 //
 //	pr     *monitor.PullRequest
 //	ref    *monitor.RefQueryResponse
 //	commit *monitor.CommitQueryResponse
 //	issue  *monitor.IssueQueryResponse
-//	run    *monitor.WorkflowRun
 //	repo   *monitor.RepoQueryResponse
+//
+// A kind whose distillation reads no snapshot options crosses as the
+// distilled status instead: the fetch is the only holder of the wire
+// payload, so it performs the distillation itself and the hub never learns
+// the payload's type (issue #140). `run` is the first such kind:
+//
+//	run    *monitor.RunStatus
 type FetchFunc func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (any, error)
 
 // RulesetFunc returns the required status checks for a repository. It is called
@@ -735,10 +743,11 @@ func newStatusForKind(kind backend.Kind) backend.Status {
 	}
 }
 
-// rawForKind returns a zero-valued raw payload of the kind a fetch for this
-// identity returns, so a handoff-carried snapshot (JSON) can be decoded into
-// the concrete type the poller's traits expect.
-func rawForKind(kind backend.Kind) any {
+// zeroFetched returns a zero value of whatever a fetch for this kind
+// produces: for most kinds the wire payload the hub still receives, for a
+// kind that distils at the source (run) the status itself. A handoff-carried
+// snapshot (JSON) decodes into it.
+func zeroFetched(kind backend.Kind) any {
 	switch kind {
 	case backend.KindRef:
 		return &monitor.RefQueryResponse{}
@@ -746,11 +755,14 @@ func rawForKind(kind backend.Kind) any {
 		return &monitor.CommitQueryResponse{}
 	case backend.KindIssue:
 		return &monitor.IssueQueryResponse{}
-	case backend.KindRun:
-		return &monitor.WorkflowRun{}
 	case backend.KindRepo:
 		return &monitor.RepoQueryResponse{}
-	default:
+	case backend.KindRun:
+		// The run fetch already distilled: what crosses the boundary is the
+		// status, so the same zero value newStatusForKind names serves both
+		// tables (issue #140).
+		return newStatusForKind(kind)
+	default: // backend.KindPR
 		return &monitor.PullRequest{}
 	}
 }
@@ -785,7 +797,10 @@ func traitsFor(kind backend.Kind) kindTraits {
 		}
 	case backend.KindRun:
 		return kindTraits{
-			distill: plainDistill(distillRun),
+			// A run's distillation reads no snapshot options, so the fetch
+			// already did it (issue #140). There is nothing here to derive
+			// per subscriber.
+			distill:     snapDistill(alreadyDistilled),
 			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
 				c := monitor.NewRunConsumer(ro)
 				// The failed-run log snippet is fetched through the gh CLI,
@@ -794,7 +809,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 				c.FailedLogDetail = h.failedRunLogDetail(ro.Identity)
 				return newHandle(c, "")
 			},
-			fingerprint: fingerprintRunResp,
+			fingerprint: fingerprintRunStatus,
 		}
 	case backend.KindRepo:
 		return kindTraits{
@@ -847,8 +862,12 @@ func distillIssue(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
 		monitor.SnapshotOptions{IgnoredBots: snapOpts.IgnoredBots})
 }
 
-func distillRun(raw any) backend.Status {
-	return monitor.SnapshotRun(raw.(*monitor.WorkflowRun))
+// alreadyDistilled is the distillation for a kind whose fetch ships the
+// distilled status rather than a wire payload (issue #140): the status is
+// what arrived, and a kind in that position reads no snapshot options, so
+// there is nothing to re-derive per subscriber.
+func alreadyDistilled(fetched any, _ monitor.SnapshotOptions) backend.Status {
+	return fetched.(backend.Status)
 }
 
 func distillPR(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
@@ -911,8 +930,11 @@ func fingerprintIssueResp(raw any) string {
 		monitor.SnapshotOptions{}))
 }
 
-func fingerprintRunResp(raw any) string {
-	return monitor.FingerprintRun(monitor.SnapshotRun(raw.(*monitor.WorkflowRun)))
+// fingerprintRunStatus fingerprints the status the run fetch already
+// distilled — no re-derivation from a payload the hub never receives
+// (issue #140).
+func fingerprintRunStatus(fetched any) string {
+	return monitor.FingerprintRun(fetched.(*monitor.RunStatus))
 }
 
 func fingerprintRepoResp(raw any) string {
@@ -970,7 +992,7 @@ type poller struct {
 	started bool
 
 	mu          sync.Mutex
-	latest      any               // raw payload of the last successful fetch
+	latest      any               // what the last successful fetch produced: a wire payload, or a status for a kind that distils at the source
 	noChange    int               // consecutive fingerprint-unchanged fetches; drives idle backoff
 	tier        monitor.QueryTier // last fetched tier; drives shed notices
 	degraded    map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
@@ -1398,8 +1420,8 @@ func (p *poller) setTier(tier monitor.QueryTier) {
 	}
 }
 
-// deliver ends any degraded episode, then records curr as the latest payload
-// and sends it to every subscriber.
+// deliver ends any degraded episode, then records curr — what the fetch
+// produced — as the latest observation and sends it to every subscriber.
 func (p *poller) deliver(curr any) {
 	// A successful fetch ends every degraded episode this poller has in
 	// flight: announce the recovery before the fresh snapshot, so a
