@@ -135,16 +135,16 @@ still controls it.
 Every field is advisory. Ignore what you cannot honour rather than failing —
 except `Once`, which changes what the caller is asking for.
 
-| Field              | Meaning                                                                                                                                     |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Since`            | An opaque cursor from an earlier `Update`. Empty means start from now.                                                                      |
-| `Kinds`            | The event types the caller cares about. Empty means all. Delivering more is fine; the caller filters again.                                 |
-| `Interval`         | The caller's preferred cadence. Meaningful to a poller, meaningless otherwise.                                                              |
-| `Timeout`          | Stop after this long. Zero means run until terminal or cancelled.                                                                           |
-| `Once`             | Deliver the current actionable state, then close — do not keep watching. If you cannot tell the two apart, emit what is true now and close. |
-| `IgnoredAuthors`   | Drop activity by these logins before reporting it.                                                                                          |
-| `AnnotationLevels` | Which check-annotation severities to report. Empty means your default; `["none"]` means report none.                                        |
-| `RepeatUnresolved` | Re-report still-open items on every observation, not only when they first appear.                                                           |
+| Field              | Meaning                                                                                                                                                                                                                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Since`            | An opaque cursor from an earlier `Update`. Empty means start from now.                                                                                                                                                                                                                 |
+| `Kinds`            | The event types the caller cares about. Empty means all. Delivering more is fine; the caller filters again.                                                                                                                                                                            |
+| `Interval`         | The caller's preferred cadence. Meaningful to a poller, meaningless otherwise. The shared-poller daemon cannot honour it — one poller serves every watcher on a target, so its cadence is the daemon's own — and says so on the caller's stderr when it drops the value.               |
+| `Timeout`          | Stop after this long. Zero means run until terminal or cancelled. Enforced at every relay boundary on the path, not just by the source: a source that shares polling outlives any single watch, and a source that stops answering must not be able to hold a client past its deadline. |
+| `Once`             | Deliver the current actionable state, then close — do not keep watching. If you cannot tell the two apart, emit what is true now and close.                                                                                                                                            |
+| `IgnoredAuthors`   | Drop activity by these logins before reporting it.                                                                                                                                                                                                                                     |
+| `AnnotationLevels` | Which check-annotation severities to report. Empty means your default; `["none"]` means report none.                                                                                                                                                                                   |
+| `RepeatUnresolved` | Re-report still-open items on every observation, not only when they first appear.                                                                                                                                                                                                      |
 
 ### Say so when you go blind
 
