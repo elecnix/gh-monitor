@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -454,7 +453,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 					Type:             backend.EventDegraded,
 					DegradedSurface:  "graphql",
 					DegradedMessage:  err.Error(),
-					DegradedSurfaces: h.blindSurfaces(keyOf(identity)),
+					DegradedSurfaces: blindSurfaces(keyOf(identity).kind),
 				},
 				At: time.Now(),
 			}
@@ -986,14 +985,17 @@ type poller struct {
 	latest      any               // what the last successful fetch produced: a wire payload, or a status for a kind that distils at the source
 	noChange    int               // consecutive fingerprint-unchanged fetches; drives idle backoff
 	tier        monitor.QueryTier // last fetched tier; drives shed notices
-	degraded    map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
 	errBackoff  time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
-	blindFrom   time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
-	lastSuccess time.Time         // when the last successful fetch completed; the honest lower bound for a blind window that opens later
 	restNotice  *monitor.Event    // the mode notice while the poller reads PR state over REST (issue #123); nil in GraphQL mode
 	lastGraphQL time.Time         // when the last successful GraphQL fetch completed; the start of a REST-mode window
 	restFrom    time.Time         // the start of the current REST-mode window: lastGraphQL when REST mode began, zero when unknown
 	subs        map[*sub]struct{}
+
+	// degradation owns what this poller can currently promise its
+	// subscribers: the degraded episodes in flight and the blind window they
+	// leave behind. The poller asks it for a notice and broadcasts whatever
+	// comes back; it never builds one itself.
+	degradation *degradation
 
 	wake  chan struct{}
 	stopc chan struct{}
@@ -1003,15 +1005,16 @@ type poller struct {
 func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 	key := keyOf(id)
 	return &poller{
-		hub:      h,
-		identity: id,
-		key:      key,
-		traits:   traitsFor(key.kind),
-		interval: interval,
-		budget:   h.budget,
-		subs:     make(map[*sub]struct{}),
-		wake:     make(chan struct{}, 1),
-		stopc:    make(chan struct{}),
+		hub:         h,
+		identity:    id,
+		key:         key,
+		traits:      traitsFor(key.kind),
+		interval:    interval,
+		budget:      h.budget,
+		degradation: newDegradation(key.kind),
+		subs:        make(map[*sub]struct{}),
+		wake:        make(chan struct{}, 1),
+		stopc:       make(chan struct{}),
 	}
 }
 
@@ -1232,25 +1235,10 @@ func (p *poller) fetchOnce() {
 		if err != nil || curr == nil {
 			// Degrade loudly, once per episode: a fetch error must reach
 			// subscribers, never vanish — a silently blind watcher reads as
-			// "all clear". Consecutive identical failures are one episode,
-			// one broadcast (issue #66); a changed error re-notifies, and the
-			// recovery notice goes out on the next successful fetch. The
-			// previous snapshot is retained; no inference replaces it.
-			// Record when the blind window opened: the last successful
-			// observation before the first failure of the episode (issue #99).
-			// time.Now() here would stamp the discovery of the blindness, not
-			// its start — events between the last success and this failure
-			// would fall outside the declared window and the recovery notice
-			// would claim they were observed. When no success has ever been
-			// recorded (first fetch failed, or a handoff resumed with no
-			// observation yet) the window's start is honestly unknowable, so
-			// blindFrom stays zero and the recovery declares no interval at
-			// all rather than a precise-looking lie.
-			p.mu.Lock()
-			if p.blindFrom.IsZero() {
-				p.blindFrom = p.lastSuccess
-			}
-			p.mu.Unlock()
+			// "all clear". The degradation ledger owns the episode dedup, the
+			// blind-window bookkeeping and the notice text; this call site
+			// only names the surface that failed. The previous snapshot is
+			// retained; no inference replaces it.
 			p.reportFailure("graphql", err)
 			return
 		}
@@ -1262,17 +1250,13 @@ func (p *poller) fetchOnce() {
 	p.deliver(curr)
 }
 
-// reportFailure broadcasts a failed fetch of the given API surface as a
-// degraded episode and backs off the cadence.
+// reportFailure hands a failed fetch of the given API surface to the poller's
+// degradation ledger and backs off the cadence. The ledger answers whether
+// this failure is new information; a repeat of the last broadcast for the same
+// surface returns nothing and stays silent.
 func (p *poller) reportFailure(surface string, err error) {
-	msg := fmt.Sprintf("%v", err)
-	if p.enterDegraded(surface, msg) {
-		p.broadcast(monitor.Event{
-			Type:             monitor.EventDegraded,
-			DegradedSurface:  surface,
-			DegradedMessage:  msg,
-			DegradedSurfaces: p.hub.blindSurfaces(p.key),
-		})
+	if ev, announce := p.degradation.fail(surface, err); announce {
+		p.broadcast(ev)
 	}
 	p.mu.Lock()
 	p.errBackoff = monitor.NextErrBackoff(p.errBackoff, p.interval)
@@ -1304,11 +1288,6 @@ func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
 		if err == nil {
 			err = fmt.Errorf("REST read returned no pull request")
 		}
-		p.mu.Lock()
-		if p.blindFrom.IsZero() {
-			p.blindFrom = p.lastSuccess
-		}
-		p.mu.Unlock()
 		p.reportFailure("rest", fmt.Errorf("GraphQL is rate limited and the REST read failed: %w", err))
 		return
 	}
@@ -1416,25 +1395,10 @@ func (p *poller) setTier(tier monitor.QueryTier) {
 func (p *poller) deliver(curr any) {
 	// A successful fetch ends every degraded episode this poller has in
 	// flight: announce the recovery before the fresh snapshot, so a
-	// consumer never reads the outage as ongoing past this point.
-	for _, surface := range p.recoverDegraded() {
-		// Declare the gap (issue #99): the cursor contract never replays — a
-		// cursor advances only on successful fetches — so events missed
-		// during the blind window stay missed, and the recovery notice must
-		// say so instead of reading as an all-clear. From marks the last
-		// successful observation before the failure; To marks recovery.
-		now := time.Now()
-		ev := monitor.Event{
-			Type:   monitor.EventDegraded,
-			Notice: fmt.Sprintf("✅ API recovered (%s) on %s", surface, p.label()),
-		}
-		if blindFrom, ok := p.clearBlindWindow(); !blindFrom.IsZero() && ok {
-			ev.DegradedFrom = blindFrom.UTC().Format(time.RFC3339)
-			ev.DegradedTo = now.UTC().Format(time.RFC3339)
-			ev.Notice = fmt.Sprintf(
-				"✅ API recovered (%s) on %s — events between %s and %s were not observed and will not be replayed; backfill from REST if completeness matters",
-				surface, p.label(), ev.DegradedFrom, ev.DegradedTo)
-		}
+	// consumer never reads the outage as ongoing past this point. The ledger
+	// renders each recovery notice, gap declaration included — absence is not
+	// success, so it must never read as an all-clear (issues #99, #102).
+	for _, ev := range p.degradation.success(p.label(), time.Now()) {
 		p.broadcast(ev)
 	}
 	p.mu.Lock()
@@ -1454,7 +1418,6 @@ func (p *poller) deliver(curr any) {
 		p.noChange++
 	}
 	p.latest = curr
-	p.lastSuccess = time.Now()
 	for s := range p.subs {
 		select {
 		case s.snapshotCh <- curr:
@@ -1462,54 +1425,6 @@ func (p *poller) deliver(curr any) {
 		}
 	}
 	p.mu.Unlock()
-}
-
-// enterDegraded records a degraded observation of the given API surface and
-// reports whether it is new information: the surface just degraded, or it is
-// degraded with a different message than the last broadcast. Consecutive
-// identical failed fetches are one episode, one broadcast (issue #66) — the
-// same transition-noticing semantics the in-process loops use.
-func (p *poller) enterDegraded(surface, msg string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.degraded[surface] == msg {
-		return false
-	}
-	if p.degraded == nil {
-		p.degraded = make(map[string]string)
-	}
-	p.degraded[surface] = msg
-	return true
-}
-
-// recoverDegraded returns the sorted surfaces currently in a degraded episode
-// and clears them — the caller has just fetched successfully again.
-// Deterministic order keeps multi-surface recoveries stable for log diffing.
-func (p *poller) recoverDegraded() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.degraded) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(p.degraded))
-	for s := range p.degraded {
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	p.degraded = nil
-	return out
-}
-
-// clearBlindWindow returns and clears the blind-window start recorded by the
-// degraded episode that just recovered. ok is true when a window was open;
-// a false/zero return means the recovery carries no gap declaration (no
-// degraded episode preceded this success).
-func (p *poller) clearBlindWindow() (blindFrom time.Time, ok bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	blindFrom = p.blindFrom
-	p.blindFrom = time.Time{}
-	return blindFrom, !blindFrom.IsZero()
 }
 
 // selectTier returns the fetch tier for the next poll: TierFull when no
@@ -1563,32 +1478,7 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
 }
 
-// blindSurfaces names the watched-surface guarantees a failed fetch of this
-// target's kind stops delivering (issue #98). Surfaces on one query are
-// coupled: a PR's check outcomes, head commit, and mergeability ride the
-// same GraphQL query as its comments and reviews, so a failed PR query
-// suppresses check outcomes even though the tier system never sheds them.
-// Naming only the failed API ("graphql") would let a caller keep trusting
-// CI signals the degraded query can no longer deliver. Ref and commit
-// watches carry check outcomes only; issue/run/repo fetches name what their
-// own query carries, and a backend transport break names nothing because a
-// backend's surfaces are its own to describe.
-func (h *Hub) blindSurfaces(k pollerKey) []string {
-	switch k.kind {
-	case backend.KindPR:
-		return []string{"check outcomes", "head commit", "mergeability"}
-	case backend.KindRef, backend.KindCommit:
-		return []string{"check outcomes"}
-	case backend.KindIssue:
-		return []string{"issue state", "comments"}
-	case backend.KindRun:
-		return []string{"run status"}
-	case backend.KindRepo:
-		return []string{"new PRs and issues"}
-	default:
-		return nil
-	}
-}
+
 
 // broadcast fans a loop-level event out to every subscriber. Sends are
 // non-blocking: a consumer that has not drained its previous notice drops the
