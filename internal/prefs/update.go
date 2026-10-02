@@ -5,7 +5,47 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
+
+// validPrefKeys is every top-level key UpdateFile accepts, in the order the
+// unknown-key error lists them. The switch in UpdateFile is the real
+// validation; this slice exists so the error message and DaemonReadKeys cannot
+// name a key the switch would reject.
+var validPrefKeys = []string{
+	"templates", "ignoredBots", "retriggerComments", "selfUpdate",
+	"pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy",
+	"reactOnNotify", "eventLog",
+}
+
+// daemonReadKeys are the settings only the resident daemon reads: they take
+// effect when a daemon starts, not when the file is written. `prefs set` uses
+// them to hint that `gh monitor reload` is required, so the list lives here —
+// beside the switch that validates the same keys — rather than being spelled
+// out in the command that reads it. TestDaemonReadKeysAreSettable is the guard
+// against the two drifting apart.
+var daemonReadKeys = []string{
+	"selfUpdate", "pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy",
+}
+
+// DaemonReadKeys returns the settings that only take effect once a resident
+// daemon starts, so a write to them is pending until `gh monitor reload`. The
+// returned slice is a copy and is safe to sort or append to.
+func DaemonReadKeys() []string {
+	out := make([]string, len(daemonReadKeys))
+	copy(out, daemonReadKeys)
+	return out
+}
+
+// IsDaemonReadKey reports whether key is only read at daemon start.
+func IsDaemonReadKey(key string) bool {
+	for _, k := range daemonReadKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
 
 // UpdateFile applies a JSON override document (matching the stored preferences
 // shape) to the preferences file, validates the result, saves it, and returns
@@ -179,7 +219,7 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				stored.EventLog = &cfg
 			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, reactOnNotify, eventLog)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: %s)", key, strings.Join(validPrefKeys, ", "))
 		}
 	}
 
@@ -293,7 +333,7 @@ func mergeStored(stored storedPreferences) Preferences {
 // saveStored writes the stored shape to the canonical config path (never the
 // legacy path), creating the config dir if missing. The write is atomic.
 func saveStored(baseDir string, stored storedPreferences) error {
-	dir, err := configDir(baseDir)
+	dir, err := ConfigDir(baseDir)
 	if err != nil {
 		return err
 	}

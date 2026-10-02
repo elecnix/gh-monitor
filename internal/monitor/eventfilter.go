@@ -53,28 +53,15 @@ func validEventKinds() map[string]bool {
 	return out
 }
 
-// NewEventFilter builds an allowlist from the given event-kind strings. With
-// no arguments it returns a non-nil filter that suppresses everything (the
-// "mute all" case); pass nil to RunOptions.EventFilter (or leave it unset) to
-// emit everything. The kinds are normalised (trimmed, lower-cased) but NOT
-// validated against the known set — use ParseEventFilter for caller-facing
-// input that must reject typos.
-func NewEventFilter(kinds ...string) *EventFilter {
-	f := &EventFilter{allowed: make(map[string]bool, len(kinds))}
-	for _, k := range kinds {
-		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
-			f.allowed[k] = true
-		}
-	}
-	return f
-}
-
 // ParseEventFilter parses a comma-separated list of event kinds into an
 // EventFilter, rejecting any kind that is not a recognised notification type.
-// Empty/blank entries are dropped, surrounding whitespace is trimmed, and
-// matching is case-insensitive. An empty input string returns a non-nil filter
-// that suppresses everything (callers wanting "emit everything" should pass a
-// nil EventFilter instead, i.e. leave the option unset).
+// This is the only constructor: every caller-facing kind string goes through
+// the validation, so a typo fails loudly instead of silently muting the kind
+// the caller wanted. Empty/blank entries are dropped, surrounding whitespace
+// is trimmed, and matching is case-insensitive. An empty input string returns
+// a non-nil filter that suppresses everything (callers wanting "emit
+// everything" should pass a nil EventFilter instead, i.e. leave the option
+// unset).
 func ParseEventFilter(s string) (*EventFilter, error) {
 	valid := validEventKinds()
 	f := &EventFilter{allowed: make(map[string]bool)}
