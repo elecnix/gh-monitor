@@ -2,18 +2,8 @@ package report
 
 import "time"
 
-// State represents the pull request review state supported by the report command.
-type State string
-
-const (
-	StateApproved         State = "APPROVED"
-	StateChangesRequested State = "CHANGES_REQUESTED"
-	StateCommented        State = "COMMENTED"
-	StateDismissed        State = "DISMISSED"
-	StatePending          State = "PENDING"
-)
-
-// FilterOptions controls shaping of reviews and threads.
+// FilterOptions controls shaping of reviews and threads. It is the shaping
+// half of Options; the rest of that struct decides what is asked for at all.
 type FilterOptions struct {
 	Reviewer             string
 	States               []State
@@ -55,41 +45,4 @@ type ThreadComment struct {
 	ReviewDatabaseID   *int
 	ReplyToDatabaseID  *int
 	ReplyToCommentNode *string
-}
-
-// Report is the serialized output structure for the report command.
-type Report struct {
-	Reviews []ReportReview `json:"reviews"`
-}
-
-// ReportReview aggregates review data and associated thread comments.
-type ReportReview struct {
-	ID          string          `json:"id"`
-	State       State           `json:"state"`
-	Body        *string         `json:"body,omitempty"`
-	SubmittedAt *string         `json:"submitted_at,omitempty"`
-	AuthorLogin string          `json:"author_login"`
-	Comments    []ReportComment `json:"comments,omitempty"`
-}
-
-// ReportComment contains the shaped parent comment for a thread.
-type ReportComment struct {
-	ThreadID       string        `json:"thread_id"`
-	CommentNodeID  *string       `json:"comment_node_id,omitempty"`
-	Path           string        `json:"path"`
-	Line           *int          `json:"line,omitempty"`
-	AuthorLogin    string        `json:"author_login"`
-	Body           string        `json:"body"`
-	CreatedAt      string        `json:"created_at"`
-	IsResolved     bool          `json:"is_resolved"`
-	IsOutdated     bool          `json:"is_outdated"`
-	ThreadComments []ThreadReply `json:"thread_comments"`
-}
-
-// ThreadReply captures a reply within a thread.
-type ThreadReply struct {
-	CommentNodeID *string `json:"comment_node_id,omitempty"`
-	AuthorLogin   string  `json:"author_login"`
-	Body          string  `json:"body"`
-	CreatedAt     string  `json:"created_at"`
 }
