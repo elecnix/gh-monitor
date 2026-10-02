@@ -727,13 +727,13 @@ type PRStatus struct {
 	// truncated, so a consumer can view the full set.
 	AnnotationsURL string `json:"annotations_url,omitempty"`
 	// ShedSurfaces names the surfaces the current tier does not fetch
-	// (e.g. "annotations", "reviews"). The snapshot retains the last-known
-	// values for those surfaces via CarryForwardShed, so a shed surface reads
-	// as "not watched" rather than "cleared" — an APPROVED review must not
-	// read as dismissed, failing checks must not read as CI-green. Empty when
-	// nothing is shed. It is the loud part of degradation: consumers can see
-	// exactly what is no longer being watched.
-	ShedSurfaces []string `json:"shed_surfaces,omitempty"`
+	// (e.g. SurfaceAnnotations, SurfaceReviews). The snapshot retains the
+	// last-known values for those surfaces via CarryForwardShed, so a shed
+	// surface reads as "not watched" rather than "cleared" — an APPROVED
+	// review must not read as dismissed, failing checks must not read as
+	// CI-green. Empty when nothing is shed. It is the loud part of
+	// degradation: consumers can see exactly what is no longer being watched.
+	ShedSurfaces Surfaces `json:"shed_surfaces,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
