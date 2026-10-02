@@ -44,13 +44,22 @@ func issueFixture(state string, commentIDs ...string) *monitor.IssueQueryRespons
 	return &resp
 }
 
-func runFixture(status, conclusion string) *monitor.WorkflowRun {
-	return &monitor.WorkflowRun{
-		ID:         30433642,
-		Status:     status,
-		Conclusion: conclusion,
-		HTMLURL:    "https://github.com/octo/demo/actions/runs/30433642",
-		RunNumber:  42,
+// runFixture is what backend/gh's run fetch now returns: the distilled
+// *monitor.RunStatus, not the REST payload. Terminal states are real ones
+// (see AGENTS.md) — a blank status/conclusion pair does not exist.
+func runFixture(status, conclusion string) *monitor.RunStatus {
+	return &monitor.RunStatus{
+		RunID:        30433642,
+		Name:         "deploy",
+		DisplayTitle: "Deploy to prod",
+		Event:        "workflow_dispatch",
+		Status:       status,
+		Conclusion:   conclusion,
+		HeadBranch:   "main",
+		HeadSHA:      "abcdef1234567890",
+		ShortSHA:     "abcdef1",
+		HTMLURL:      "https://github.com/octo/demo/actions/runs/30433642",
+		RunNumber:    42,
 	}
 }
 
@@ -70,6 +79,8 @@ func targetOf(kind backend.Kind) backend.Target {
 		t.Ref = "main"
 	case backend.KindIssue:
 		t.Number = 5
+	case backend.KindRun:
+		t.RunID = 30433642
 	}
 	return t
 }
@@ -183,7 +194,7 @@ func TestHub_SubscribeIssue(t *testing.T) {
 }
 
 func TestHub_SubscribeRun(t *testing.T) {
-	var resp *monitor.WorkflowRun
+	var resp *monitor.RunStatus
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return resp, nil
 	}, nil, time.Hour, nil)
