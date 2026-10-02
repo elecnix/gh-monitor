@@ -9,29 +9,10 @@ import (
 	"github.com/elecnix/gh-monitor/backend"
 )
 
-// The mutation operations. Each maps to one method on one capability
-// interface; the payload and result are that method's arguments and return
-// value, encoded as JSON.
-const (
-	OpThreadsList      = "threads.list"
-	OpThreadsView      = "threads.view"
-	OpThreadsResolve   = "threads.resolve"
-	OpThreadsUnresolve = "threads.unresolve"
-
-	OpReviewStart         = "review.start"
-	OpReviewAddComment    = "review.addComment"
-	OpReviewUpdateComment = "review.updateComment"
-	OpReviewDeleteComment = "review.deleteComment"
-	OpReviewSubmit        = "review.submit"
-
-	OpCommentsReply = "comments.reply"
-
-	OpDraftStatus = "draft.status"
-	OpDraftSet    = "draft.set"
-	OpDraftList   = "draft.list"
-
-	OpReactionsReact = "reactions.react"
-)
+// The mutation operations are declared with the capabilities themselves, in
+// backend: each maps to one method on one capability interface, and the
+// payload and result are that method's arguments and return value, encoded as
+// JSON. See backend.CapabilityInfo.
 
 // Payloads for the operations whose arguments are more than a Target.
 
@@ -102,74 +83,74 @@ func call[Out any](ctx context.Context, p *Provider, op string, t backend.Target
 
 // ListThreads implements backend.ThreadActor.
 func (p *Provider) ListThreads(ctx context.Context, t backend.Target, opts backend.ThreadListOptions) ([]backend.Thread, error) {
-	return call[[]backend.Thread](ctx, p, OpThreadsList, t, opts)
+	return call[[]backend.Thread](ctx, p, backend.OpThreadsList, t, opts)
 }
 
 // ViewThreads implements backend.ThreadActor.
 func (p *Provider) ViewThreads(ctx context.Context, t backend.Target, ids []string) ([]backend.ThreadWithComments, error) {
-	return call[[]backend.ThreadWithComments](ctx, p, OpThreadsView, t, threadViewPayload{ThreadIDs: ids})
+	return call[[]backend.ThreadWithComments](ctx, p, backend.OpThreadsView, t, threadViewPayload{ThreadIDs: ids})
 }
 
 // ResolveThread implements backend.ThreadActor.
 func (p *Provider) ResolveThread(ctx context.Context, t backend.Target, ref backend.ThreadRef) (backend.ThreadResolution, error) {
-	return call[backend.ThreadResolution](ctx, p, OpThreadsResolve, t, ref)
+	return call[backend.ThreadResolution](ctx, p, backend.OpThreadsResolve, t, ref)
 }
 
 // UnresolveThread implements backend.ThreadActor.
 func (p *Provider) UnresolveThread(ctx context.Context, t backend.Target, ref backend.ThreadRef) (backend.ThreadResolution, error) {
-	return call[backend.ThreadResolution](ctx, p, OpThreadsUnresolve, t, ref)
+	return call[backend.ThreadResolution](ctx, p, backend.OpThreadsUnresolve, t, ref)
 }
 
 // StartReview implements backend.ReviewActor.
 func (p *Provider) StartReview(ctx context.Context, t backend.Target, commitOID string) (*backend.ReviewState, error) {
-	return call[*backend.ReviewState](ctx, p, OpReviewStart, t, reviewStartPayload{CommitOID: commitOID})
+	return call[*backend.ReviewState](ctx, p, backend.OpReviewStart, t, reviewStartPayload{CommitOID: commitOID})
 }
 
 // AddReviewComment implements backend.ReviewActor.
 func (p *Provider) AddReviewComment(ctx context.Context, t backend.Target, in backend.ReviewCommentInput) (*backend.ReviewThread, error) {
-	return call[*backend.ReviewThread](ctx, p, OpReviewAddComment, t, in)
+	return call[*backend.ReviewThread](ctx, p, backend.OpReviewAddComment, t, in)
 }
 
 // UpdateReviewComment implements backend.ReviewActor.
 func (p *Provider) UpdateReviewComment(ctx context.Context, t backend.Target, in backend.ReviewCommentUpdate) error {
-	_, err := call[struct{}](ctx, p, OpReviewUpdateComment, t, in)
+	_, err := call[struct{}](ctx, p, backend.OpReviewUpdateComment, t, in)
 	return err
 }
 
 // DeleteReviewComment implements backend.ReviewActor.
 func (p *Provider) DeleteReviewComment(ctx context.Context, t backend.Target, in backend.ReviewCommentDelete) error {
-	_, err := call[struct{}](ctx, p, OpReviewDeleteComment, t, in)
+	_, err := call[struct{}](ctx, p, backend.OpReviewDeleteComment, t, in)
 	return err
 }
 
 // SubmitReview implements backend.ReviewActor.
 func (p *Provider) SubmitReview(ctx context.Context, t backend.Target, in backend.ReviewSubmitInput) (*backend.ReviewSubmitStatus, error) {
-	return call[*backend.ReviewSubmitStatus](ctx, p, OpReviewSubmit, t, in)
+	return call[*backend.ReviewSubmitStatus](ctx, p, backend.OpReviewSubmit, t, in)
 }
 
 // ReplyToThread implements backend.CommentActor.
 func (p *Provider) ReplyToThread(ctx context.Context, t backend.Target, opts backend.ReplyOptions) (backend.Reply, error) {
-	return call[backend.Reply](ctx, p, OpCommentsReply, t, opts)
+	return call[backend.Reply](ctx, p, backend.OpCommentsReply, t, opts)
 }
 
 // DraftStatus implements backend.DraftActor.
 func (p *Provider) DraftStatus(ctx context.Context, t backend.Target, ref backend.DraftRef) (backend.DraftInfo, error) {
-	return call[backend.DraftInfo](ctx, p, OpDraftStatus, t, ref)
+	return call[backend.DraftInfo](ctx, p, backend.OpDraftStatus, t, ref)
 }
 
 // SetDraft implements backend.DraftActor.
 func (p *Provider) SetDraft(ctx context.Context, t backend.Target, ref backend.DraftRef, draft bool) (backend.DraftResult, error) {
-	return call[backend.DraftResult](ctx, p, OpDraftSet, t, draftSetPayload{Ref: ref, Draft: draft})
+	return call[backend.DraftResult](ctx, p, backend.OpDraftSet, t, draftSetPayload{Ref: ref, Draft: draft})
 }
 
 // ListDrafts implements backend.DraftActor.
 func (p *Provider) ListDrafts(ctx context.Context, t backend.Target) ([]backend.DraftInfo, error) {
-	return call[[]backend.DraftInfo](ctx, p, OpDraftList, t, nil)
+	return call[[]backend.DraftInfo](ctx, p, backend.OpDraftList, t, nil)
 }
 
 // React implements backend.ReactionActor.
 func (p *Provider) React(ctx context.Context, t backend.Target, subjectID, reaction string) error {
-	_, err := call[struct{}](ctx, p, OpReactionsReact, t, reactPayload{SubjectID: subjectID, Reaction: reaction})
+	_, err := call[struct{}](ctx, p, backend.OpReactionsReact, t, reactPayload{SubjectID: subjectID, Reaction: reaction})
 	return err
 }
 
@@ -203,7 +184,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 	}
 
 	switch req.Op {
-	case OpThreadsList:
+	case backend.OpThreadsList:
 		if cfg.Threads == nil {
 			return true, missing(backend.CapThreads)
 		}
@@ -214,7 +195,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Threads.ListThreads(ctx, req.Target, opts)
 		return true, respond(out, aErr)
 
-	case OpThreadsView:
+	case backend.OpThreadsView:
 		if cfg.Threads == nil {
 			return true, missing(backend.CapThreads)
 		}
@@ -225,7 +206,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Threads.ViewThreads(ctx, req.Target, in.ThreadIDs)
 		return true, respond(out, aErr)
 
-	case OpThreadsResolve, OpThreadsUnresolve:
+	case backend.OpThreadsResolve, backend.OpThreadsUnresolve:
 		if cfg.Threads == nil {
 			return true, missing(backend.CapThreads)
 		}
@@ -235,14 +216,14 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		}
 		var out backend.ThreadResolution
 		var aErr error
-		if req.Op == OpThreadsResolve {
+		if req.Op == backend.OpThreadsResolve {
 			out, aErr = cfg.Threads.ResolveThread(ctx, req.Target, ref)
 		} else {
 			out, aErr = cfg.Threads.UnresolveThread(ctx, req.Target, ref)
 		}
 		return true, respond(out, aErr)
 
-	case OpReviewStart:
+	case backend.OpReviewStart:
 		if cfg.Review == nil {
 			return true, missing(backend.CapReview)
 		}
@@ -253,7 +234,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Review.StartReview(ctx, req.Target, in.CommitOID)
 		return true, respond(out, aErr)
 
-	case OpReviewAddComment:
+	case backend.OpReviewAddComment:
 		if cfg.Review == nil {
 			return true, missing(backend.CapReview)
 		}
@@ -264,7 +245,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Review.AddReviewComment(ctx, req.Target, in)
 		return true, respond(out, aErr)
 
-	case OpReviewUpdateComment:
+	case backend.OpReviewUpdateComment:
 		if cfg.Review == nil {
 			return true, missing(backend.CapReview)
 		}
@@ -274,7 +255,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		}
 		return true, respond(struct{}{}, cfg.Review.UpdateReviewComment(ctx, req.Target, in))
 
-	case OpReviewDeleteComment:
+	case backend.OpReviewDeleteComment:
 		if cfg.Review == nil {
 			return true, missing(backend.CapReview)
 		}
@@ -284,7 +265,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		}
 		return true, respond(struct{}{}, cfg.Review.DeleteReviewComment(ctx, req.Target, in))
 
-	case OpReviewSubmit:
+	case backend.OpReviewSubmit:
 		if cfg.Review == nil {
 			return true, missing(backend.CapReview)
 		}
@@ -295,7 +276,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Review.SubmitReview(ctx, req.Target, in)
 		return true, respond(out, aErr)
 
-	case OpCommentsReply:
+	case backend.OpCommentsReply:
 		if cfg.Comments == nil {
 			return true, missing(backend.CapComments)
 		}
@@ -306,7 +287,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Comments.ReplyToThread(ctx, req.Target, in)
 		return true, respond(out, aErr)
 
-	case OpDraftStatus:
+	case backend.OpDraftStatus:
 		if cfg.Draft == nil {
 			return true, missing(backend.CapDraft)
 		}
@@ -317,7 +298,7 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Draft.DraftStatus(ctx, req.Target, ref)
 		return true, respond(out, aErr)
 
-	case OpDraftSet:
+	case backend.OpDraftSet:
 		if cfg.Draft == nil {
 			return true, missing(backend.CapDraft)
 		}
@@ -328,14 +309,14 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 		out, aErr := cfg.Draft.SetDraft(ctx, req.Target, in.Ref, in.Draft)
 		return true, respond(out, aErr)
 
-	case OpDraftList:
+	case backend.OpDraftList:
 		if cfg.Draft == nil {
 			return true, missing(backend.CapDraft)
 		}
 		out, aErr := cfg.Draft.ListDrafts(ctx, req.Target)
 		return true, respond(out, aErr)
 
-	case OpReactionsReact:
+	case backend.OpReactionsReact:
 		if cfg.Reactions == nil {
 			return true, missing(backend.CapReactions)
 		}

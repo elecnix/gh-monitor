@@ -83,6 +83,33 @@ func noticeContaining(us []backend.Update, text string) (backend.Update, bool) {
 	return backend.Update{}, false
 }
 
+// waitForNotice reads until an update carries a notice containing text, the
+// stream closes, or the deadline passes — whichever comes first. Waiting on the
+// notice rather than for a fixed window: when the REST-mode notice appears
+// relative to the first poll depends on when the budget guard sees the exhausted
+// headers, so any fixed window is a race with the scheduler and fails on a
+// loaded runner. It returns what it read and leaves the assertion to the caller,
+// so a stream that ends without the notice still reports the useful message.
+func waitForNotice(t *testing.T, ch <-chan backend.Update, text string) []backend.Update {
+	t.Helper()
+	var got []backend.Update
+	deadline := time.After(asyncDeadline)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return got
+			}
+			got = append(got, u)
+			if strings.Contains(u.Event.Notice, text) {
+				return got
+			}
+		case <-deadline:
+			return got
+		}
+	}
+}
+
 // TestPoller_RESTFallbackReportsMergeWhileGraphQLExhausted reproduces issue
 // #123: GraphQL runs out after the first poll and the PR then merges. Without
 // a REST fallback the watch only reports a degraded update, so --until merged
@@ -206,12 +233,13 @@ func TestPoller_SkipsGraphQLWhileHeadersSayExhausted(t *testing.T) {
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
-	got := updatesUntil(t, ch, 2*time.Second, func(u backend.Update) bool { return u.Event.Type == monitor.EventFirstPoll })
+	restNotice := "reading PR state over REST because GraphQL is exhausted until " + reset.Local().Format("15:04")
+	got := updatesUntil(t, ch, asyncDeadline, func(u backend.Update) bool { return u.Event.Type == monitor.EventFirstPoll })
 	require.True(t, hasType(got, monitor.EventFirstPoll))
-	got = append(got, collectUpdates(ch, 300*time.Millisecond)...)
+	got = append(got, waitForNotice(t, ch, restNotice)...)
 	assert.Zero(t, atomic.LoadInt64(&graphqlCalls), "an exhausted budget must not be spent on a failing GraphQL call")
 
-	notice, ok := noticeContaining(got, "reading PR state over REST because GraphQL is exhausted until "+reset.Local().Format("15:04"))
+	notice, ok := noticeContaining(got, restNotice)
 	require.True(t, ok, "the notice gives the reset time from the headers")
 	assert.Equal(t, reset.UTC().Format(time.RFC3339), notice.Event.DegradedResetAt)
 }

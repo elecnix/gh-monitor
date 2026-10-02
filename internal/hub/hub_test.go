@@ -417,7 +417,7 @@ func TestPoller_DegradedRecoveryEmits(t *testing.T) {
 	// The next poll succeeds: a recovery notice must precede (or accompany)
 	// the fresh snapshot.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -449,9 +449,17 @@ recovered:
 // waitDegraded reads updates until a fetch-error degraded broadcast arrives.
 // Notices (broker health, tier shed, recovery) carry Notice text rather than
 // DegradedMessage, so they do not satisfy the wait.
+// asyncDeadline bounds how long a test waits for the poller to deliver.
+// These are asynchronous round trips through a scheduler, so the bound has to
+// survive a loaded CI runner, not measure it: a 2s budget failed on GitHub's
+// runners while passing locally, which tests the machine rather than the
+// behaviour. The assertions below are unchanged — a poller that never declares
+// its degradation still fails, just with enough room to get there.
+const asyncDeadline = 15 * time.Second
+
 func waitDegraded(t *testing.T, ch <-chan backend.Update, msg string) {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -586,7 +594,7 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -608,7 +616,7 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 // that need the structured degraded fields rather than just the event type.
 func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) backend.Update {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -657,7 +665,7 @@ func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
 
 	// The next poll succeeds: the recovery notice must carry the gap window.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
