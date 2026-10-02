@@ -21,19 +21,6 @@ type Service struct {
 	API ghcli.API
 }
 
-// Options controls data retrieval and shaping for the report.
-type Options struct {
-	Reviewer             string
-	States               []State
-	StatesProvided       bool
-	RequireUnresolved    bool
-	RequireNotOutdated   bool
-	TailReplies          int
-	IncludeCommentNodeID bool
-	Author               string
-	IncludeResolved      bool
-}
-
 // NewService constructs a report service using the provided GraphQL API client.
 func NewService(api ghcli.API) *Service {
 	return &Service{API: api}

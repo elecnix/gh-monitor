@@ -154,6 +154,11 @@ func (p *Provider) React(ctx context.Context, t backend.Target, subjectID, react
 	return err
 }
 
+// ViewReport implements backend.ReportActor.
+func (p *Provider) ViewReport(ctx context.Context, t backend.Target, opts backend.ReportOptions) (*backend.Report, error) {
+	return call[*backend.Report](ctx, p, backend.OpReportView, t, opts)
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -325,6 +330,17 @@ func serveMutation(ctx context.Context, conn interface{ Write([]byte) (int, erro
 			return true, writeJSON(conn, Frame{Error: err.Error()})
 		}
 		return true, respond(struct{}{}, cfg.Reactions.React(ctx, req.Target, in.SubjectID, in.Reaction))
+
+	case backend.OpReportView:
+		if cfg.Report == nil {
+			return true, missing(backend.CapReport)
+		}
+		var in backend.ReportOptions
+		if err := decode(&in); err != nil {
+			return true, writeJSON(conn, Frame{Error: err.Error()})
+		}
+		out, aErr := cfg.Report.ViewReport(ctx, req.Target, in)
+		return true, respond(out, aErr)
 	}
 
 	return false, nil

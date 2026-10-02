@@ -8,6 +8,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/draft"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/reactions"
+	"github.com/elecnix/gh-monitor/internal/report"
 	"github.com/elecnix/gh-monitor/internal/review"
 	"github.com/elecnix/gh-monitor/internal/threads"
 )
@@ -105,4 +106,15 @@ type reactionActor struct{ p *Provider }
 
 func (a reactionActor) React(_ context.Context, t backend.Target, subjectID, reaction string) error {
 	return reactions.React(a.p.api(t.Host), subjectID, reaction)
+}
+
+// reportActor implements backend.ReportActor.
+type reportActor struct{ p *Provider }
+
+func (a reportActor) ViewReport(_ context.Context, t backend.Target, opts backend.ReportOptions) (*backend.Report, error) {
+	out, err := report.NewService(a.p.api(t.Host)).Fetch(monitor.IdentityOf(t), opts)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

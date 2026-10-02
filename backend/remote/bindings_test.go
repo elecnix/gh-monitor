@@ -67,6 +67,10 @@ func (*fakeActors) ListDrafts(context.Context, backend.Target) ([]backend.DraftI
 
 func (*fakeActors) React(context.Context, backend.Target, string, string) error { return nil }
 
+func (*fakeActors) ViewReport(context.Context, backend.Target, backend.ReportOptions) (*backend.Report, error) {
+	return nil, nil
+}
+
 // setServerActor points cfg at one capability and leaves the rest nil, so a
 // test can assert the announced surface is exactly that one capability.
 func setServerActor(t *testing.T, cfg *ServerConfig, c backend.Capability) {
@@ -88,6 +92,8 @@ func setServerActor(t *testing.T, cfg *ServerConfig, c backend.Capability) {
 		cfg.Reactions = &fakeActors{}
 	case backend.CapCoverage:
 		cfg.Coverage = fixedCoverage{}
+	case backend.CapReport:
+		cfg.Report = &fakeActors{}
 	default:
 		t.Fatalf("no ServerConfig field for capability %q", c)
 	}
@@ -167,6 +173,7 @@ func TestServerConfigCapabilitiesFollowsTheDescriptor(t *testing.T) {
 		Draft:     &fakeActors{},
 		Reactions: &fakeActors{},
 		Coverage:  fixedCoverage{},
+		Report:    &fakeActors{},
 	}
 	got, err := full.capabilities()
 	if err != nil {
@@ -194,6 +201,7 @@ func TestProviderRegistersExactlyWhatTheServerAnnounced(t *testing.T) {
 		Reader:    &fakeBackend{},
 		Draft:     &fakeActors{},
 		Reactions: &fakeActors{},
+		Report:    &fakeActors{},
 	})
 	p, err := Connect(ctx, tr)
 	if err != nil {
@@ -205,8 +213,12 @@ func TestProviderRegistersExactlyWhatTheServerAnnounced(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	for _, info := range r.List() {
-		want := []backend.Capability{backend.CapReader, backend.CapDraft, backend.CapReactions}
+	want := []backend.Capability{backend.CapReader, backend.CapDraft, backend.CapReactions, backend.CapReport}
+	listed := r.List()
+	if len(listed) == 0 {
+		t.Fatal("relay registered no backend at all, so its capability set is unproven")
+	}
+	for _, info := range listed {
 		if len(info.Capabilities) != len(want) {
 			t.Errorf("relay registered %v, want exactly %v", info.Capabilities, want)
 			continue
@@ -220,7 +232,7 @@ func TestProviderRegistersExactlyWhatTheServerAnnounced(t *testing.T) {
 	}
 
 	tgt := backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 1}
-	for _, c := range []backend.Capability{backend.CapReader, backend.CapDraft, backend.CapReactions} {
+	for _, c := range []backend.Capability{backend.CapReader, backend.CapDraft, backend.CapReactions, backend.CapReport} {
 		if _, name, err := r.ResolveCapability(c, tgt); err != nil {
 			t.Errorf("ResolveCapability(%s) error = %v", c, err)
 		} else if name != "relay" {
