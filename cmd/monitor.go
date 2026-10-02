@@ -247,11 +247,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		persistFromUpdate func(backend.Update)
 	)
 	if opts.Instance != "" {
-		prefsPath, err := prefs.ConfigPath("")
+		cfgDir, err := prefs.ConfigDir("")
 		if err != nil {
-			return fmt.Errorf("resolve config path: %w", err)
+			return fmt.Errorf("resolve config dir: %w", err)
 		}
-		cfgDir := filepath.Dir(prefsPath)
 		store, err := cursor.NewDiskStore(cfgDir)
 		if err != nil {
 			return fmt.Errorf("create cursor store: %w", err)
