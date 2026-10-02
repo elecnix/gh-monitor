@@ -27,6 +27,8 @@ const (
 	OpDraftList   = "draft.list"
 
 	OpReactionsReact = "reactions.react"
+
+	OpReportView = "report.view"
 )
 
 // CapabilityInfo is the one declarative descriptor for a capability. Every
@@ -160,6 +162,18 @@ var capabilityInfos = []CapabilityInfo{
 		},
 		resolve: func(r *Registry, t Target) (any, string, error) {
 			return resolveActor[ReactionActor](r, t.Kind, CapReactions)
+		},
+	},
+	{
+		Name:      CapReport,
+		Interface: "backend.ReportActor",
+		Summary:   "Produces a pull request's reviews with their thread comments",
+		UsedBy:    "`gh monitor review view`",
+		Mutation:  true,
+		Ops:       []string{OpReportView},
+		register:  func(r *Registry, name string, kinds []Kind, impl any) { r.registerActor(name, CapReport, kinds, impl) },
+		resolve: func(r *Registry, t Target) (any, string, error) {
+			return resolveActor[ReportActor](r, t.Kind, CapReport)
 		},
 	},
 }

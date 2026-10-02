@@ -30,6 +30,7 @@ type ServerConfig struct {
 	Comments  backend.CommentActor
 	Draft     backend.DraftActor
 	Reactions backend.ReactionActor
+	Report    backend.ReportActor
 	// Resumable is announced in the hello: a dropped watch stream may be
 	// re-established by re-sending the request with the same ResumeID.
 	Resumable bool
