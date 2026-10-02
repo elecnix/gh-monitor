@@ -206,7 +206,7 @@ gh monitor --once -R owner/repo 42
 
 **Monitor flags:**
 
-- `--interval <seconds>` - Base polling interval (default: 300, min 10)
+- `--interval <seconds>` - Base polling interval (default: 300, min 10). Sets the cadence of a shared poller **this command starts**; a daemon that is already running keeps its own cadence (see [Shared poller daemon](#shared-poller-daemon))
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
@@ -404,7 +404,7 @@ Cursors are independent — advancing one instance's cursor never affects anothe
 
 ### Shared poller daemon
 
-By default every `gh monitor` process polls GitHub on its own `--interval` cadence. When many agents watch the same target (an orchestrator plus each agent watching the PR it owns), that is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per watched target** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)).
+When many agents watch the same target (an orchestrator plus each agent watching the PR it owns), polling from each process is N independent fetches for the same data. The `daemon` command runs a long-lived process that maintains **one fetch loop per watched target** and fans each fetched snapshot out to every attached `monitor` client, so N processes share a single fetch ([#34](https://github.com/elecnix/gh-monitor/issues/34)). Every watch is served by that daemon, which a `monitor` command starts on demand if none is listening ([#76](https://github.com/elecnix/gh-monitor/issues/76)).
 
 ```sh
 # Start the daemon (runs until SIGTERM/SIGINT)
@@ -414,6 +414,8 @@ gh monitor daemon --interval 60
 gh monitor -R owner/repo 42
 gh monitor -R owner/repo 42 --text
 ```
+
+The poller's cadence belongs to the daemon, not to the watching client: one poller is shared by every watcher on a target, so its rate cannot be per-watch. `gh monitor --interval N` therefore only takes effect when **that same command** starts the daemon — it is passed down as the daemon's own `--interval`. Against a daemon that is already running, the value is not applied and the command says so on stderr; set the running daemon's cadence with the `pollInterval` preference, or restart it with `gh monitor daemon --interval`. The one exception is the repo-wide readiness view (`gh monitor -R owner/repo` with no target), which polls in-process and honours `--interval` directly.
 
 A `monitor` client detects the daemon via its Unix socket and streams from it instead of polling. When no daemon is running, `monitor` **auto-starts** one (a detached background process) and then connects, so you get shared polling without a manual `daemon` step. Each client keeps its **own baseline** snapshot, so consumption by one client never suppresses delivery to another — the core requirement behind [#32](https://github.com/elecnix/gh-monitor/issues/32).
 
