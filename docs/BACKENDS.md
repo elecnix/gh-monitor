@@ -260,6 +260,14 @@ An op for a capability the server did not declare comes back as an `error`
 frame rather than a zero value, so a caller never mistakes "not implemented"
 for "nothing to do".
 
+The `reactions.react` payload is the one whose values matter to you, because
+they are [a closed vocabulary](#the-reaction-vocabulary) rather than free text:
+
+```
+client → {"op":"reactions.react","target":{...},"payload":{"subject_id":"PRRC_1","reaction":"thumbs_up"}}
+server → {"result":{}}
+```
+
 A stream that ends without `done` or `error` is treated as a failure and
 surfaced as a degraded event — the client will not read a dropped connection as
 "nothing is happening".
@@ -321,6 +329,45 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 | `repo-new-pr`, `repo-new-issue`, `readiness`                           | Repository                                                                                                                                                                              |
 | `degraded`                                                             | A surface could not be read — emitted per episode (entering degraded, error change, recovery), not per failed poll. Names what the failed read stopped delivering (`degraded_surfaces`) |
 | `all-clear`                                                            | Everything previously raised is resolved                                                                                                                                                |
+
+## The reaction vocabulary
+
+A reaction crosses the wire as a **name**, not as an API token: `thumbs_up`, not
+`THUMBS_UP`. There is no second spelling to learn and nothing to translate on
+the way in.
+
+| Name          | What the built-in `gh` backend sends GitHub |
+| ------------- | ------------------------------------------- |
+| `confused`    | `CONFUSED`                                  |
+| `eyes`        | `EYES`                                      |
+| `heart`       | `HEART`                                     |
+| `hooray`      | `HOORAY`                                    |
+| `laugh`       | `LAUGH`                                     |
+| `rocket`      | `ROCKET`                                    |
+| `thumbs_down` | `THUMBS_DOWN`                               |
+| `thumbs_up`   | `THUMBS_UP`                                 |
+
+The left column is the whole vocabulary, and it is closed — `gh monitor react`
+rejects anything else before a request is made, so your server never has to
+cope with an unrecognised name (though checking is still worth it). The right
+column is _not_ part of the protocol: it is how the built-in backend happens to
+speak to GitHub's GraphQL API, and a backend of your own maps the names to
+whatever its API calls them.
+
+So read the left column, and translate at your own edge:
+
+```go
+import "github.com/elecnix/gh-monitor/backend"
+
+if !backend.ValidReaction(reaction) {
+	return fmt.Errorf("unsupported reaction %q", reaction)
+}
+```
+
+`backend.ReactionNames()` returns all eight in canonical order, for help text
+and for indexing a translation table of your own. They are exported here
+because `internal/` is not importable from outside this module, so a table kept
+beside the CLI would be a table no third-party backend could read.
 
 ## The shared-poller daemon
 

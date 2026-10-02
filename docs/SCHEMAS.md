@@ -317,7 +317,17 @@ Returned by `react`.
     },
     "reaction": {
       "type": "string",
-      "description": "Reaction type (thumbs_up, thumbs_down, laugh, hooray, confused, heart, rocket, eyes)"
+      "enum": [
+        "confused",
+        "eyes",
+        "heart",
+        "hooray",
+        "laugh",
+        "rocket",
+        "thumbs_down",
+        "thumbs_up"
+      ],
+      "description": "The reaction name, spelled as it is on the wire and at the CLI. These are the whole vocabulary; a backend maps them to its own API's tokens."
     },
     "status": {
       "type": "string",
