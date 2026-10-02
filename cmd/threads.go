@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/backend"
-	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/threads"
 )
@@ -44,7 +43,7 @@ func newThreadsViewCommand(bo *backendOptions) *cobra.Command {
 
 func runThreadsView(cmd *cobra.Command, bo *backendOptions, threadIDs []string) error {
 	// Viewing threads by ID needs no pull request context, only a host.
-	target := backend.Target{Kind: backend.KindPR, Host: os.Getenv("GH_HOST")}
+	target := backend.Target{Kind: backend.KindPR, Host: resolver.SanitizeHost(os.Getenv("GH_HOST"))}
 	actor, err := threadActorFor(cmd, bo, target)
 	if err != nil {
 		return err
@@ -83,35 +82,23 @@ func newThreadsListCommand(bo *backendOptions) *cobra.Command {
 
 	cmd.Flags().BoolVar(&opts.UnresolvedOnly, "unresolved", false, "Filter to unresolved threads only")
 	cmd.Flags().BoolVar(&opts.MineOnly, "mine", false, "Show only threads involving or resolvable by the viewer")
-	cmd.PersistentFlags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.PersistentFlags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addPersistentTargetFlags(cmd, &opts.targetSelector)
 
 	return cmd
 }
 
 type threadsListOptions struct {
-	Repo           string
-	Pull           int
-	Selector       string
+	targetSelector
 	UnresolvedOnly bool
 	MineOnly       bool
 }
 
 func runThreadsList(cmd *cobra.Command, bo *backendOptions, opts *threadsListOptions) error {
-	inferPR(opts.Selector, &opts.Pull)
-	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
+	_, target, err := resolveTarget(&opts.targetSelector)
 	if err != nil {
 		return err
 	}
 
-	inferRepo(&opts.Repo)
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(selector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	actor, err := threadActorFor(cmd, bo, target)
 	if err != nil {
 		return err
@@ -164,16 +151,13 @@ func newThreadsMutationCommand(bo *backendOptions, resolve bool) *cobra.Command 
 	}
 
 	cmd.Flags().StringVar(&opts.ThreadID, "thread-id", "", "GraphQL node ID for the review thread")
-	cmd.PersistentFlags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.PersistentFlags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addPersistentTargetFlags(cmd, &opts.targetSelector)
 
 	return cmd
 }
 
 type threadsMutationOptions struct {
-	Repo     string
-	Pull     int
-	Selector string
+	targetSelector
 	ThreadID string
 }
 
@@ -193,20 +177,11 @@ func runThreadsUnresolve(cmd *cobra.Command, bo *backendOptions, opts *threadsMu
 }
 
 func runThreadsMutation(cmd *cobra.Command, bo *backendOptions, opts *threadsMutationOptions, resolve bool) error {
-	inferPR(opts.Selector, &opts.Pull)
-	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
+	_, target, err := resolveTarget(&opts.targetSelector)
 	if err != nil {
 		return err
 	}
 
-	inferRepo(&opts.Repo)
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(selector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	actor, err := threadActorFor(cmd, bo, target)
 	if err != nil {
 		return err

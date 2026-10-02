@@ -3,14 +3,11 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/backend"
-	"github.com/elecnix/gh-monitor/internal/monitor"
-	"github.com/elecnix/gh-monitor/internal/resolver"
 	reviewsvc "github.com/elecnix/gh-monitor/internal/review"
 )
 
@@ -29,8 +26,7 @@ func newReviewCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.Flags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addTargetFlags(cmd.Flags(), &opts.targetSelector)
 	addBackendFlags(cmd, &opts.Backend)
 
 	cmd.Flags().BoolVar(&opts.Start, "start", false, "Open a pending review")
@@ -52,15 +48,13 @@ func newReviewCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opts.Event, "event", opts.Event, "Review submission event (APPROVE, COMMENT, REQUEST_CHANGES)")
 	cmd.MarkFlagsMutuallyExclusive("body", "body-file")
 
-	cmd.AddCommand(newReviewViewCommand())
+	cmd.AddCommand(newReviewViewCommand(&opts.Backend))
 
 	return cmd
 }
 
 type reviewOptions struct {
-	Repo     string
-	Pull     int
-	Selector string
+	targetSelector
 
 	Start         bool
 	AddComment    bool
@@ -84,8 +78,6 @@ type reviewOptions struct {
 }
 
 func runReview(cmd *cobra.Command, opts *reviewOptions) error {
-	inferRepo(&opts.Repo)
-
 	actions := []bool{opts.Start, opts.AddComment, opts.EditComment, opts.DeleteComment, opts.Submit}
 	enabled := 0
 	for _, flag := range actions {
@@ -103,18 +95,11 @@ func runReview(cmd *cobra.Command, opts *reviewOptions) error {
 	}
 	opts.Body = body
 
-	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
+	_, target, err := resolveTarget(&opts.targetSelector)
 	if err != nil {
 		return err
 	}
 
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(selector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	reg, err := actorRegistry(cmd.Context(), &opts.Backend)
 	if err != nil {
 		return err

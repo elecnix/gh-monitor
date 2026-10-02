@@ -45,6 +45,7 @@ func TestAllCapabilitiesIsCanonical(t *testing.T) {
 		backend.CapSource, backend.CapReader,
 		backend.CapThreads, backend.CapReview,
 		backend.CapComments, backend.CapDraft, backend.CapReactions,
+		backend.CapReport,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("AllCapabilities() = %v, want %v", got, want)
