@@ -221,6 +221,13 @@ type DraftInfo struct {
 // ---------------------------------------------------------------------------
 
 // ReactionActor adds a reaction to any node that accepts one.
+//
+// The reaction argument is one of ReactionNames — the same lower_snake_case
+// name `gh monitor react --type` takes, and the same string that crosses the
+// wire to an out-of-process backend. Use ValidReaction to reject anything
+// else. Mapping a name to your API's own token is your backend's job: the
+// built-in one maps "thumbs_up" to GitHub's GraphQL ReactionContent
+// "THUMBS_UP", and that mapping is not part of this interface.
 type ReactionActor interface {
 	React(ctx context.Context, t Target, subjectID, reaction string) error
 }
