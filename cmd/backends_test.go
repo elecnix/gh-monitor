@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -365,12 +366,27 @@ func TestDraftStaysWithTheBuiltInBackendWhenNotDeclared(t *testing.T) {
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()
 	apiClientFactory = func(string) ghcli.API {
-		return &commandFakeAPI{graphqlFunc: func(_ string, _ map[string]interface{}, result interface{}) error {
-			called = true
-			return assignJSON(result, obj{"repository": obj{"pullRequest": obj{
-				"id": "PR_1", "number": 7, "isDraft": true, "title": "wip",
-			}}})
-		}}
+		return &commandFakeAPI{
+			restFunc: func(method, path string, _ map[string]string, _ interface{}, result interface{}) error {
+				if method != "GET" {
+					return errors.New("unexpected method " + method)
+				}
+				switch path {
+				case "repos/o/r":
+					return assignJSON(result, obj{"full_name": "o/r"})
+				case "repos/o/r/pulls/7":
+					return assignJSON(result, obj{"node_id": "PR_7", "head": obj{"sha": "sha7"}})
+				default:
+					return errors.New("unexpected path " + path)
+				}
+			},
+			graphqlFunc: func(_ string, _ map[string]interface{}, result interface{}) error {
+				called = true
+				return assignJSON(result, obj{"repository": obj{"pullRequest": obj{
+					"id": "PR_1", "number": 7, "isDraft": true, "title": "wip",
+				}}})
+			},
+		}
 	}
 
 	root := newRootCommand()
