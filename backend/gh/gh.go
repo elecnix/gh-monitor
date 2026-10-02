@@ -84,6 +84,11 @@ func service(api func(host string) ghcli.API, host string) *monitor.Service {
 // call goes through the real gh CLI client — at the poller's current query
 // tier for the kinds whose queries have tiers (pr, ref, commit); untiered for
 // the rest. The hub fans each single result out to every subscribed client.
+//
+// For most kinds the result is the wire payload, because the hub must distil
+// it once per subscriber with that subscriber's snapshot options. A run is
+// distilled here instead: monitor.SnapshotRun reads no option, so the hub
+// would only rebuild the same RunStatus and drop the payload (issue #140).
 func Fetch(api func(host string) ghcli.API) hub.FetchFunc {
 	return func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (any, error) {
 		svc := service(api, id.Host)
@@ -95,7 +100,11 @@ func Fetch(api func(host string) ghcli.API) hub.FetchFunc {
 		case "issue":
 			return svc.FetchIssue(id.Owner, id.Repo, id.Number)
 		case "run":
-			return svc.FetchRun(id.Owner, id.Repo, id.RunID)
+			run, err := svc.FetchRun(id.Owner, id.Repo, id.RunID)
+			if err != nil {
+				return nil, err
+			}
+			return monitor.SnapshotRun(run), nil
 		case "repo":
 			return svc.FetchRepo(id.Owner, id.Repo)
 		default:
@@ -163,6 +172,9 @@ func (p *Provider) read(ctx context.Context, t backend.Target) (backend.Status, 
 			monitor.SnapshotOptions{IgnoredBots: p.Base.Prefs.IgnoredBots}), nil
 
 	case backend.KindRun:
+		// The same shape the daemon's Fetch ships (issue #140): a run's
+		// distillation reads no snapshot options, so a one-shot read and a
+		// watched run report the same status.
 		run, err := svc.FetchRun(t.Owner, t.Repo, t.RunID)
 		if err != nil {
 			return nil, err
