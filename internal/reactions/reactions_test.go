@@ -1,8 +1,10 @@
 package reactions
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -65,5 +67,32 @@ func TestValidReactionsMapIsComplete(t *testing.T) {
 	for _, e := range expected {
 		_, ok := ValidReactions[e]
 		assert.True(t, ok, "missing reaction %q", e)
+	}
+}
+
+// TestValidReactionsMatchTheBackendVocabulary is the drift guard for the
+// reaction contract. The names are the protocol: what the CLI accepts, what
+// ReactionActor.React carries, and what an out-of-process backend receives on
+// the wire. backend exports them because internal/ is not importable from
+// outside this module, so the two tables have to stay identical — a name
+// added here alone would be a vocabulary this module accepts and no server can
+// look up.
+func TestValidReactionsMatchTheBackendVocabulary(t *testing.T) {
+	assert.Equal(t, backend.ReactionNames(), ValidReactionNames(),
+		"the internal name table and the exported protocol vocabulary must be the same list")
+	for name := range ValidReactions {
+		assert.True(t, backend.ValidReaction(name),
+			"%q is accepted here but absent from backend.ReactionNames()", name)
+	}
+}
+
+// TestGraphQLEnumIsTheUppercasedWireName pins the only transformation this
+// module applies. If a future name ever needs a different mapping, this test
+// fails on purpose so the exception is written down rather than discovered by a
+// server author reading the wrong table.
+func TestGraphQLEnumIsTheUppercasedWireName(t *testing.T) {
+	for name, enum := range ValidReactions {
+		assert.Equal(t, strings.ToUpper(name), enum,
+			"reaction %q maps to %q, not its uppercased name", name, enum)
 	}
 }
