@@ -39,30 +39,22 @@ type ServerConfig struct {
 	HandleOp func(ctx context.Context, conn io.ReadWriter, req Request) (handled bool, err error)
 }
 
-func (c ServerConfig) capabilities() []backend.Capability {
+// capabilities returns the capabilities this configuration serves, in
+// canonical order so the hello reads the same way on every build.
+func (c ServerConfig) capabilities() ([]backend.Capability, error) {
 	var caps []backend.Capability
-	if c.Source != nil {
-		caps = append(caps, backend.CapSource)
+	for _, name := range backend.AllCapabilities() {
+		b, ok := providerBindings[name]
+		if !ok {
+			// Unreachable while providerBindings covers every capability,
+			// which TestCapabilityBindingsCoverEveryCapability enforces.
+			return nil, fmt.Errorf("serve %q: no remote binding for capability %q", c.Name, name)
+		}
+		if b.server(c) != nil {
+			caps = append(caps, name)
+		}
 	}
-	if c.Reader != nil {
-		caps = append(caps, backend.CapReader)
-	}
-	if c.Threads != nil {
-		caps = append(caps, backend.CapThreads)
-	}
-	if c.Review != nil {
-		caps = append(caps, backend.CapReview)
-	}
-	if c.Comments != nil {
-		caps = append(caps, backend.CapComments)
-	}
-	if c.Draft != nil {
-		caps = append(caps, backend.CapDraft)
-	}
-	if c.Reactions != nil {
-		caps = append(caps, backend.CapReactions)
-	}
-	return caps
+	return caps, nil
 }
 
 // WriteFrame writes one response frame. Exported for in-module protocol
@@ -77,7 +69,10 @@ func WriteFrame(w io.Writer, f Frame) error { return writeJSON(w, f) }
 // This is the whole server side. A Go backend implements backend.Source
 // and/or backend.Reader, accepts connections, and hands each one to Serve.
 func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
-	caps := cfg.capabilities()
+	caps, err := cfg.capabilities()
+	if err != nil {
+		return err
+	}
 	if len(caps) == 0 {
 		return fmt.Errorf("serve %q: no capabilities configured", cfg.Name)
 	}

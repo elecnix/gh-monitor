@@ -9,6 +9,8 @@ and it will take over as much or as little of the job as it implements.
 A backend provides any subset of these. They are independent, and a backend
 registers only what it actually has.
 
+<!-- BEGIN generated: capability-table -->
+
 | Capability  | Interface               | What it does                                           | Used by               |
 | ----------- | ----------------------- | ------------------------------------------------------ | --------------------- |
 | `source`    | `backend.Source`        | Delivers `Update`s describing what changed on a target | continuous watching   |
@@ -18,6 +20,12 @@ registers only what it actually has.
 | `comments`  | `backend.CommentActor`  | Replies to review threads                              | `gh monitor comments` |
 | `draft`     | `backend.DraftActor`    | Reads and changes draft status                         | `gh monitor draft`    |
 | `reactions` | `backend.ReactionActor` | Adds a reaction to a node                              | `gh monitor react`    |
+
+<!-- END generated: capability-table -->
+
+Both capability tables in this document are generated from
+`backend.CapabilityInfo` — the one descriptor every layer reads from — and
+checked by `TestCapabilityDocsAreCurrent`. Edit the descriptor, not the tables.
 
 The split matters because the jobs have different answers. A backend that
 learns about changes as they happen has a much better `Source` than polling can
@@ -234,6 +242,8 @@ client → {"op":"threads.resolve","target":{...},"payload":{"ThreadID":"PRRT_1"
 server → {"result":{"thread_node_id":"PRRT_1","is_resolved":true}}
 ```
 
+<!-- BEGIN generated: ops-table -->
+
 | Capability  | Ops                                                                                                  |
 | ----------- | ---------------------------------------------------------------------------------------------------- |
 | `threads`   | `threads.list`, `threads.view`, `threads.resolve`, `threads.unresolve`                               |
@@ -241,6 +251,8 @@ server → {"result":{"thread_node_id":"PRRT_1","is_resolved":true}}
 | `comments`  | `comments.reply`                                                                                     |
 | `draft`     | `draft.status`, `draft.set`, `draft.list`                                                            |
 | `reactions` | `reactions.react`                                                                                    |
+
+<!-- END generated: ops-table -->
 
 An op for a capability the server did not declare comes back as an `error`
 frame rather than a zero value, so a caller never mistakes "not implemented"

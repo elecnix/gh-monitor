@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -77,7 +78,7 @@ func targetOf(kind backend.Kind) backend.Target {
 func waitClosed(t *testing.T, ch <-chan backend.Update) []string {
 	t.Helper()
 	var out []string
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -224,7 +225,7 @@ func TestHub_SubscribeRepo(t *testing.T) {
 	var first backend.Update
 	select {
 	case first = <-ch:
-	case <-time.After(2 * time.Second):
+	case <-time.After(asyncDeadline):
 		t.Fatal("timed out waiting for the first update")
 	}
 	assert.Equal(t, string(backend.EventFirstPoll), string(first.Event.Type))
@@ -237,7 +238,7 @@ func TestHub_SubscribeRepo(t *testing.T) {
 	var second backend.Update
 	select {
 	case second = <-ch:
-	case <-time.After(2 * time.Second):
+	case <-time.After(asyncDeadline):
 		t.Fatal("timed out waiting for the new-PR update")
 	}
 	assert.Equal(t, string(backend.EventRepoNewPR), string(second.Event.Type))
@@ -315,7 +316,7 @@ func TestHub_Once(t *testing.T) {
 
 		ch := h.Once(ctx, targetOf(backend.KindIssue), testHubOpts())
 		var degraded bool
-		deadline := time.After(2 * time.Second)
+		deadline := time.After(asyncDeadline)
 	loop:
 		for {
 			select {
@@ -368,9 +369,11 @@ func TestHub_OnceDoesNotStartPoller(t *testing.T) {
 func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	// A PR and an issue in the same repository are different identities: each
 	// gets its own poller, and a fetch for one never feeds the other.
-	fetches := 0
+	// The counter is atomic because the fetches happen on poller goroutines
+	// while the assertion below reads it from the test goroutine.
+	var fetches atomic.Int32
 	h := New(func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (any, error) {
-		fetches++
+		fetches.Add(1)
 		if id.Target == "issue" {
 			return issueFixture("OPEN", "c1"), nil
 		}
@@ -395,7 +398,12 @@ func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	n := len(h.pollers)
 	h.mu.Unlock()
 	assert.Equal(t, 2, n, "each kind gets its own poller")
-	assert.GreaterOrEqual(t, fetches, 2, "each poller fetched independently")
+	// Wait for the condition rather than for a stopwatch. A fixed window is a
+	// race with the scheduler: on a loaded runner one poller can be a
+	// scheduling slice behind, which is not what this test is about.
+	assert.Eventually(t, func() bool { return fetches.Load() >= 2 },
+		asyncDeadline, 10*time.Millisecond,
+		"each poller fetched independently (saw %d of 2)", fetches.Load())
 }
 
 func TestPoller_ErrorBackoff(t *testing.T) {
@@ -451,7 +459,7 @@ func TestPoller_ErrorBackoff(t *testing.T) {
 		// (not a DegradedMessage), so wait for any update at all.
 		select {
 		case <-ch:
-		case <-time.After(2 * time.Second):
+		case <-time.After(asyncDeadline):
 			t.Fatal("timed out waiting for the recovery notice")
 		}
 

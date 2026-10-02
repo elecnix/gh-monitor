@@ -271,7 +271,7 @@ func (r *Registry) List() []Info {
 	out := make([]Info, 0, len(byName))
 	for name, a := range byName {
 		info := Info{Name: name}
-		for _, c := range allCapabilities {
+		for _, c := range AllCapabilities() {
 			if a.caps[c] {
 				info.Capabilities = append(info.Capabilities, c)
 			}
