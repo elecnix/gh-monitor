@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,7 +36,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.Commit, "commit", "", "Commit SHA to monitor (CI checks only)")
 	cmd.Flags().IntVar(&opts.Issue, "issue", 0, "Issue number to monitor")
 	cmd.Flags().IntVar(&opts.RunID, "run-id", 0, "GitHub Actions workflow run id to monitor (watches a single run until it completes)")
-	cmd.Flags().IntVarP(&opts.Interval, "interval", "i", 300, "Polling interval in seconds (min 10)")
+	cmd.Flags().IntVarP(&opts.Interval, "interval", "i", 300, "Polling interval in seconds (min 10); sets the cadence of a shared poller this command starts, not of one already running (whose cadence is its pollInterval preference or 'gh monitor daemon --interval')")
 	cmd.Flags().IntVarP(&opts.Timeout, "timeout", "t", 0, "Maximum watch time in seconds (0 = run until merged/closed)")
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
 	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
@@ -423,8 +424,21 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// have no record of the backlog a one-shot read reports (issue #119).
 	if opts.Backend.endpoint() == "" {
 		if !opts.Once {
-			if err := attachDaemon(ctx, reg, target, runOpts.Interval); err != nil {
+			daemonStarted, err := attachDaemon(ctx, reg, target, runOpts.Interval)
+			if err != nil {
 				return err
+			}
+			// --interval reaches the poller only when this invocation is the
+			// one that started the daemon: autostart passes it down as the
+			// daemon's own --interval. A daemon that was already listening
+			// keeps the cadence it was built with, so the client's request is
+			// dropped at hub.Subscribe, which never reads WatchOptions.Interval
+			// (one poller, one cadence, shared by every subscriber). Say so,
+			// once, rather than let the operator believe they got the cadence
+			// they asked for. Only an explicit --interval is a request worth
+			// contradicting: the default is not.
+			if !daemonStarted && cmd.Flags().Changed("interval") {
+				writeIntervalIgnoredNotice(cmd.ErrOrStderr(), runOpts.Interval)
 			}
 		} else {
 			attachRunningDaemon(ctx, reg)
@@ -665,6 +679,18 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		return errUntilNotMet
 	}
 	return nil
+}
+
+// writeIntervalIgnoredNotice reports that the requested --interval did not
+// reach the poller, because a shared-poller daemon that was already listening
+// serves the watch at the cadence it was built with. It names the two knobs
+// that do set that cadence, since the client cannot read the running daemon's
+// effective one: the hello frame carries no cadence, and reporting a number
+// the client guessed would be worse than naming the control.
+func writeIntervalIgnoredNotice(out io.Writer, requested time.Duration) {
+	_, _ = fmt.Fprintf(out,
+		"gh-monitor: --interval %ds was not applied: this watch is served by a shared-poller daemon that was already running, and its poller cadence is the daemon's own (set it with the pollInterval preference or 'gh monitor daemon --interval').\n",
+		int(requested.Seconds()))
 }
 
 // errUntilNotMetIfRequested maps a timed-out watch to the --until contract:
@@ -943,39 +969,44 @@ func splitRepo(repoArg string) (owner, repo string) {
 // lets an explicitly configured external backend still win: it registers
 // after this one, and the later registration takes precedence for the kinds
 // it claims.
-func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Target, interval time.Duration) error {
+func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Target, interval time.Duration) (started bool, err error) {
 	socket := daemonSocketPath()
 
 	if probe, err := ipc.Dial(socket); err == nil {
 		// Only a liveness check — leaving it open would strand a server
 		// goroutine on a request that never comes.
 		_ = probe.Close()
+		// A daemon that was already listening keeps the cadence it was built
+		// with; the caller's interval never reaches it.
 	} else {
 		if !daemonAutostart() {
-			return fmt.Errorf("no shared poller is listening on %s and autostart is disabled (GH_MONITOR_AUTOSTART=0); start one with 'gh monitor daemon'", socket)
+			return false, fmt.Errorf("no shared poller is listening on %s and autostart is disabled (GH_MONITOR_AUTOSTART=0); start one with 'gh monitor daemon'", socket)
 		}
 		if err := autostartDaemon(ctx, socket, interval); err != nil {
-			return fmt.Errorf("could not start the shared poller (%v); start one with 'gh monitor daemon'", err)
+			return false, fmt.Errorf("could not start the shared poller (%v); start one with 'gh monitor daemon'", err)
 		}
+		// The daemon this watch is about to use was started from this
+		// invocation's own interval, so the request was honoured.
+		started = true
 	}
 
 	transport, err := remote.ParseEndpoint("unix:" + socket)
 	if err != nil {
-		return fmt.Errorf("parse daemon endpoint: %w", err)
+		return false, fmt.Errorf("parse daemon endpoint: %w", err)
 	}
 	provider, err := remote.Connect(ctx, transport)
 	if err != nil {
 		// The likeliest cause is a daemon left running from a build before
 		// this protocol: it holds the socket and waits for the client to speak
 		// first, so the handshake times out. Say what to do about it.
-		return fmt.Errorf("the process holding %s does not speak this backend protocol (%v).\n"+
+		return false, fmt.Errorf("the process holding %s does not speak this backend protocol (%v).\n"+
 			"If it is a daemon from an older build, stop it:\n"+
 			"  pkill -f 'gh monitor daemon'", socket, err)
 	}
 	if err := reg.Use(provider); err != nil {
-		return fmt.Errorf("register the shared poller: %w", err)
+		return false, fmt.Errorf("register the shared poller: %w", err)
 	}
-	return nil
+	return started, nil
 }
 
 // attachRunningDaemon registers the shared poller for a --once read when a
