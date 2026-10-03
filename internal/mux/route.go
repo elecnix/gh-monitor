@@ -174,8 +174,13 @@ func (s RoutingSource) fallback(ctx context.Context, t backend.Target, opts back
 		ch = prepend(ctx, noticeUpdate(t, notice), ch)
 	}
 	if opts.Timeout > 0 {
-		// The hub enforces Timeout itself, but a fallback that does not (or a
-		// double relay) is harmless: the outer boundary closes first.
+		// Deadline ownership (see backend.WatchOptions.Timeout): the hub has
+		// no notion of one — a shared poller outlives any single subscriber —
+		// so each relay boundary enforces it as the stream is forwarded. This
+		// is one such boundary; hubSource.Watch is another, and the client loop
+		// is the last. Applying it more than once is harmless: every
+		// implementation closes the channel on expiry, and a reader cannot
+		// tell a relay's EOF from the source's own.
 		ch = relayWithTimeout(ctx, ch, opts.Timeout)
 	}
 	return ch, nil

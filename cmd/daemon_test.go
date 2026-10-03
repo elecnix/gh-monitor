@@ -207,7 +207,8 @@ func TestDaemon_TwoClientsShareOneFetch(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	source, name, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
@@ -246,7 +247,8 @@ func TestDaemon_ClientRendersWithItsOwnTemplates(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	source, _, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
@@ -278,7 +280,7 @@ func TestDaemon_NotUsedWhenSocketAbsent(t *testing.T) {
 		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
 			return nil, nil
 		}))
-	err := attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+	_, err := attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "gh monitor daemon",
 		"the error must name the fix")
@@ -296,7 +298,8 @@ func TestDaemon_ServesEveryTargetKind(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	for _, kind := range []backend.Kind{backend.KindIssue, backend.KindRef, backend.KindCommit, backend.KindRun, backend.KindRepo} {
 		target := backend.Target{Kind: kind, Owner: "o", Repo: "r", Number: 3, Ref: "main", SHA: "abc", RunID: 9}
@@ -331,7 +334,8 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	assert.Equal(t, int64(1), atomic.LoadInt64(&spawned), "autostart spawned the daemon once")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -358,7 +362,8 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when a daemon is already running")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -387,7 +392,8 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 		func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
 			return nil, nil
 		}))
-	require.Error(t, attachDaemon(context.Background(), reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(context.Background(), reg, daemonTarget(), time.Minute)
+	require.Error(t, err)
 
 	assert.Equal(t, int64(0), atomic.LoadInt64(&spawned), "must not spawn when autostart is disabled")
 	_, name, err := reg.SourceFor(daemonTarget())
@@ -552,7 +558,8 @@ func TestDaemon_RoutesSubdaemonKinds(t *testing.T) {
 	unusedBuiltin(clientReg)
 	ctx, cancelClient := context.WithTimeout(serveCtx, 15*time.Second)
 	t.Cleanup(cancelClient)
-	require.NoError(t, attachDaemon(ctx, clientReg, daemonTarget(), time.Minute))
+	_, err = attachDaemon(ctx, clientReg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	src, name, err := clientReg.SourceFor(daemonTarget())
 	require.NoError(t, err)
@@ -754,7 +761,8 @@ func TestDaemon_NeverShutsDownOnIdle(t *testing.T) {
 
 	reg := backend.NewRegistry()
 	unusedBuiltin(reg)
-	require.NoError(t, attachDaemon(ctx, reg, daemonTarget(), time.Minute))
+	_, err := attachDaemon(ctx, reg, daemonTarget(), time.Minute)
+	require.NoError(t, err)
 
 	source, name, err := reg.SourceFor(daemonTarget())
 	require.NoError(t, err)
