@@ -237,3 +237,66 @@ func TestRegistryListReportsCapabilitiesPerBackend(t *testing.T) {
 		t.Fatalf("relay kinds = %v, want [pr run]", relay.Kinds)
 	}
 }
+
+// stubReport stands in for a review-summary capability. Identity is compared
+// by pointer, so which backend won is observable.
+type stubReport struct{ id string }
+
+func (s *stubReport) ViewReport(context.Context, Target, ReportOptions) (*Report, error) {
+	return &Report{}, nil
+}
+
+// The report capability resolves by the same precedence as every other
+// capability, so a backend that covers only pull requests takes review
+// summaries for pull requests and leaves every other kind alone.
+func TestRegistryReportForPrefersKindSpecific(t *testing.T) {
+	reg := NewRegistry()
+	catchAll := &stubReport{id: "gh"}
+	relay := &stubReport{id: "relay"}
+	reg.RegisterReport("gh", nil, catchAll)
+	reg.RegisterReport("relay", []Kind{KindPR}, relay)
+
+	got, name, err := reg.ReportFor(Target{Kind: KindPR})
+	if err != nil {
+		t.Fatalf("ReportFor: %v", err)
+	}
+	if got != relay || name != "relay" {
+		t.Fatalf("pr should resolve to relay, got %q", name)
+	}
+
+	got, name, err = reg.ReportFor(Target{Kind: KindIssue})
+	if err != nil {
+		t.Fatalf("ReportFor: %v", err)
+	}
+	if got != catchAll || name != "gh" {
+		t.Fatalf("issue should fall back to gh, got %q", name)
+	}
+}
+
+// A backend that never registered report must not answer for it. A silent
+// zero value here would read as "no reviews", which is not the same claim.
+func TestRegistryNoReportIsALoudError(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterThreads("gh", nil, nil)
+
+	if _, _, err := reg.ReportFor(Target{Kind: KindPR}); !errors.Is(err, ErrNoBackend) {
+		t.Fatalf("want ErrNoBackend, got %v", err)
+	}
+}
+
+// Capabilities are listed in canonical order, so the report capability belongs
+// after the other mutation verbs in `gh monitor backends` output.
+func TestRegistryListOrdersReportAmongTheMutationCapabilities(t *testing.T) {
+	reg := NewRegistry()
+	reg.RegisterReport("gh", nil, &stubReport{})
+
+	infos := reg.List()
+	if len(infos) != 1 {
+		t.Fatalf("List() returned %d backends, want 1", len(infos))
+	}
+	got := infos[0].Capabilities
+	want := []Capability{CapReport}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("capabilities = %v, want %v", got, want)
+	}
+}

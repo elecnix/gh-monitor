@@ -93,6 +93,11 @@ func (r *Registry) RegisterReactions(name string, kinds []Kind, a ReactionActor)
 	r.registerActor(name, CapReactions, kinds, a)
 }
 
+// RegisterReport adds the review-summary capability.
+func (r *Registry) RegisterReport(name string, kinds []Kind, a ReportActor) {
+	r.registerActor(name, CapReport, kinds, a)
+}
+
 func (r *Registry) registerActor(name string, capability Capability, kinds []Kind, impl any) {
 	r.actors = append(r.actors, actorRegistration{
 		registration: registration[any]{name: name, kinds: kindSet(kinds), impl: impl},
@@ -123,6 +128,11 @@ func (r *Registry) DraftFor(t Target) (DraftActor, string, error) {
 // ReactionsFor returns the reaction capability covering t.
 func (r *Registry) ReactionsFor(t Target) (ReactionActor, string, error) {
 	return resolveActor[ReactionActor](r, t.Kind, CapReactions)
+}
+
+// ReportFor returns the review-summary capability covering t.
+func (r *Registry) ReportFor(t Target) (ReportActor, string, error) {
+	return resolveActor[ReportActor](r, t.Kind, CapReport)
 }
 
 // resolveActor applies the same precedence as resolve, over the subset of
