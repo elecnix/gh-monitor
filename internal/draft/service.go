@@ -4,17 +4,28 @@ import (
 	"fmt"
 
 	"github.com/elecnix/gh-monitor/internal/ghcli"
+	"github.com/elecnix/gh-monitor/internal/prlookup"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
+
+// pullLookup is the part of prlookup.Service this service depends on: the
+// canonical repository coordinates and the pull request's node id. It is an
+// interface so the service's GraphQL can be tested without the lookup.
+type pullLookup interface {
+	Repository(pr resolver.Identity) (prlookup.Repository, error)
+	PullRequest(pr resolver.Identity) (prlookup.Ref, error)
+}
 
 // Service exposes pull request draft operations.
 type Service struct {
 	API ghcli.API
+
+	pulls pullLookup
 }
 
 // NewService constructs a Service with the provided API client.
 func NewService(api ghcli.API) *Service {
-	return &Service{API: api}
+	return &Service{API: api, pulls: prlookup.NewService(api)}
 }
 
 // Draft marks a pull request as draft when permissions allow it.
@@ -29,47 +40,24 @@ func (s *Service) Ready(pr resolver.Identity, opts ActionOptions) (ActionResult,
 
 // Status returns the current draft status of a pull request.
 func (s *Service) Status(pr resolver.Identity, opts ActionOptions) (DraftInfo, error) {
-	prNumber := opts.PRNumber
-	if prNumber == 0 {
-		prNumber = pr.Number
-	}
-
-	variables := map[string]interface{}{
-		"owner":  pr.Owner,
-		"repo":   pr.Repo,
-		"number": prNumber,
-	}
-
-	var resp struct {
-		Repository struct {
-			PullRequest *struct {
-				Number  int    `json:"number"`
-				Title   string `json:"title"`
-				IsDraft bool   `json:"isDraft"`
-			} `json:"pullRequest"`
-		} `json:"repository"`
-	}
-
-	if err := s.API.GraphQL(pullRequestStatusQuery, variables, &resp); err != nil {
+	pull, err := s.lookup(pr, opts)
+	if err != nil {
 		return DraftInfo{}, err
 	}
 
-	if resp.Repository.PullRequest == nil {
-		return DraftInfo{}, fmt.Errorf("pull request %d not found in %s/%s", prNumber, pr.Owner, pr.Repo)
-	}
-
-	return DraftInfo{
-		PRNumber: resp.Repository.PullRequest.Number,
-		IsDraft:  resp.Repository.PullRequest.IsDraft,
-		Title:    resp.Repository.PullRequest.Title,
-	}, nil
+	return s.statusOf(pull)
 }
 
 // List returns all draft pull requests in the repository.
 func (s *Service) List(pr resolver.Identity) ([]DraftInfo, error) {
+	repo, err := s.pulls.Repository(pr)
+	if err != nil {
+		return nil, err
+	}
+
 	variables := map[string]interface{}{
-		"owner": pr.Owner,
-		"repo":  pr.Repo,
+		"owner": repo.Owner,
+		"repo":  repo.Name,
 	}
 
 	var resp struct {
@@ -103,13 +91,13 @@ func (s *Service) List(pr resolver.Identity) ([]DraftInfo, error) {
 }
 
 func (s *Service) changeDraftState(pr resolver.Identity, opts ActionOptions, makeDraft bool) (ActionResult, error) {
-	prNumber := opts.PRNumber
-	if prNumber == 0 {
-		prNumber = pr.Number
+	pull, err := s.lookup(pr, opts)
+	if err != nil {
+		return ActionResult{}, err
 	}
 
 	// First check current status
-	current, err := s.Status(pr, ActionOptions{PRNumber: prNumber})
+	current, err := s.statusOf(pull)
 	if err != nil {
 		return ActionResult{}, err
 	}
@@ -127,43 +115,56 @@ func (s *Service) changeDraftState(pr resolver.Identity, opts ActionOptions, mak
 		}, nil
 	}
 
-	// Get the pull request node ID for the mutation
-	nodeID, err := s.getPullRequestNodeID(pr, prNumber)
-	if err != nil {
-		return ActionResult{}, err
-	}
-
-	// Perform the appropriate mutation
+	// The node id comes from the lookup, so the mutation needs no further round trip.
 	if makeDraft {
-		return s.convertToDraft(nodeID)
+		return s.convertToDraft(pull.NodeID)
 	}
-	return s.markReadyForReview(nodeID)
+	return s.markReadyForReview(pull.NodeID)
 }
 
-func (s *Service) getPullRequestNodeID(pr resolver.Identity, prNumber int) (string, error) {
+// lookup resolves the requested pull request to its canonical repository and
+// node id, honouring an explicit PR number over the identity's.
+func (s *Service) lookup(pr resolver.Identity, opts ActionOptions) (prlookup.Ref, error) {
+	target := pr
+	if opts.PRNumber != 0 {
+		target.Number = opts.PRNumber
+	}
+	return s.pulls.PullRequest(target)
+}
+
+// statusOf reads the draft state from the canonical coordinates the lookup
+// resolved, so a renamed repository reports its pull request rather than
+// claiming it does not exist.
+func (s *Service) statusOf(pull prlookup.Ref) (DraftInfo, error) {
 	variables := map[string]interface{}{
-		"owner":  pr.Owner,
-		"repo":   pr.Repo,
-		"number": prNumber,
+		"owner":  pull.Owner,
+		"repo":   pull.Name,
+		"number": pull.Number,
 	}
 
 	var resp struct {
 		Repository struct {
 			PullRequest *struct {
-				ID string `json:"id"`
+				Number  int    `json:"number"`
+				Title   string `json:"title"`
+				IsDraft bool   `json:"isDraft"`
 			} `json:"pullRequest"`
 		} `json:"repository"`
 	}
 
-	if err := s.API.GraphQL(pullRequestNodeIDQuery, variables, &resp); err != nil {
-		return "", err
+	if err := s.API.GraphQL(pullRequestStatusQuery, variables, &resp); err != nil {
+		return DraftInfo{}, err
 	}
 
 	if resp.Repository.PullRequest == nil {
-		return "", fmt.Errorf("pull request %d not found in %s/%s", prNumber, pr.Owner, pr.Repo)
+		return DraftInfo{}, fmt.Errorf("pull request %d not found in %s/%s", pull.Number, pull.Owner, pull.Name)
 	}
 
-	return resp.Repository.PullRequest.ID, nil
+	return DraftInfo{
+		PRNumber: resp.Repository.PullRequest.Number,
+		IsDraft:  resp.Repository.PullRequest.IsDraft,
+		Title:    resp.Repository.PullRequest.Title,
+	}, nil
 }
 
 func (s *Service) convertToDraft(nodeID string) (ActionResult, error) {
@@ -231,16 +232,6 @@ query DraftList($owner: String!, $repo: String!) {
         title
         isDraft
       }
-    }
-  }
-}
-`
-
-const pullRequestNodeIDQuery = `
-query PullRequestNodeID($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      id
     }
   }
 }

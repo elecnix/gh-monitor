@@ -26,7 +26,10 @@ func TestDraftMarkCommandOutputsJSON(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/5":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
@@ -105,7 +108,10 @@ func TestDraftReadyCommandOutputsJSON(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/5":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
@@ -184,7 +190,10 @@ func TestDraftStatusCommandOutputsJSON(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/5":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
@@ -239,7 +248,10 @@ func TestDraftListCommandOutputsJSON(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/1":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
@@ -315,7 +327,10 @@ func TestDraftAlreadyInDesiredState(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/5":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
@@ -381,7 +396,10 @@ func TestDraftStatusWithSelector(t *testing.T) {
 			payload := map[string]interface{}{"full_name": "octo/demo"}
 			return assignJSON(result, payload)
 		case "repos/octo/demo/pulls/5":
-			payload := map[string]interface{}{"node_id": "PR_node"}
+			payload := map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			}
 			return assignJSON(result, payload)
 		default:
 			return errors.New("unexpected path")
