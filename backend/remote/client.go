@@ -47,26 +47,20 @@ func (p *Provider) Kinds() []backend.Kind { return p.hello.Kinds }
 
 // Register adds only the capabilities the server declared.
 func (p *Provider) Register(r *backend.Registry) error {
-	if p.hello.has(backend.CapSource) {
-		r.RegisterSource(p.hello.Name, p.hello.Kinds, backend.SourceFunc(p.Watch))
-	}
-	if p.hello.has(backend.CapReader) {
-		r.RegisterReader(p.hello.Name, p.hello.Kinds, backend.ReaderFunc(p.Read))
-	}
-	if p.hello.has(backend.CapThreads) {
-		r.RegisterThreads(p.hello.Name, p.hello.Kinds, p)
-	}
-	if p.hello.has(backend.CapReview) {
-		r.RegisterReview(p.hello.Name, p.hello.Kinds, p)
-	}
-	if p.hello.has(backend.CapComments) {
-		r.RegisterComments(p.hello.Name, p.hello.Kinds, p)
-	}
-	if p.hello.has(backend.CapDraft) {
-		r.RegisterDraft(p.hello.Name, p.hello.Kinds, p)
-	}
-	if p.hello.has(backend.CapReactions) {
-		r.RegisterReactions(p.hello.Name, p.hello.Kinds, p)
+	for _, c := range backend.AllCapabilities() {
+		if !p.hello.has(c) {
+			continue
+		}
+		b, ok := providerBindings[c]
+		if !ok {
+			// Unreachable while providerBindings covers every capability,
+			// which TestCapabilityBindingsCoverEveryCapability enforces. It
+			// stays a loud error rather than a silent skip: registering
+			// nothing for a capability the server announced is the failure
+			// this table exists to make impossible.
+			return fmt.Errorf("server %q declares %s, which this build cannot bind", p.hello.Name, c)
+		}
+		b.register(r, p.hello.Name, p.hello.Kinds, b.client(p))
 	}
 	return nil
 }

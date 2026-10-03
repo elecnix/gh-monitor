@@ -152,7 +152,10 @@ func readJSON(r io.Reader, v any) error {
 }
 
 // validateHello checks a server's opening frame before anything is registered
-// on the strength of it.
+// on the strength of it. A capability is known when backend's descriptor knows
+// it; anything else is rejected, because a capability this build does not
+// understand would be registered and then never resolved, which reads as a
+// backend that is present but silent.
 func validateHello(h Hello) error {
 	if h.Protocol != Protocol {
 		return fmt.Errorf("backend speaks protocol %d, this build speaks %d", h.Protocol, Protocol)
@@ -164,7 +167,7 @@ func validateHello(h Hello) error {
 		return fmt.Errorf("backend %q declares no capabilities", h.Name)
 	}
 	for _, c := range h.Capabilities {
-		if !knownCapabilities[c] {
+		if _, ok := backend.LookupCapability(c); !ok {
 			return fmt.Errorf("backend %q declares unknown capability %q", h.Name, c)
 		}
 	}
@@ -184,17 +187,4 @@ func (h Hello) has(c backend.Capability) bool {
 		}
 	}
 	return false
-}
-
-// knownCapabilities is what a server may declare. Anything else is rejected:
-// a capability this build does not understand would be registered and then
-// never resolved, which reads as a backend that is present but silent.
-var knownCapabilities = map[backend.Capability]bool{
-	backend.CapSource:    true,
-	backend.CapReader:    true,
-	backend.CapThreads:   true,
-	backend.CapReview:    true,
-	backend.CapComments:  true,
-	backend.CapDraft:     true,
-	backend.CapReactions: true,
 }
