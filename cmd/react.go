@@ -23,7 +23,7 @@ func newReactCommand() *cobra.Command {
 
 The node-id is the GraphQL node ID of the target object. Use --type to specify the reaction.
 
-Valid reaction types: ` + strings.Join(reactions.ValidReactionNames(), ", "),
+Valid reaction types: ` + strings.Join(backend.ReactionNames(), ", "),
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodeID := strings.TrimSpace(args[0])
@@ -36,6 +36,9 @@ Valid reaction types: ` + strings.Join(reactions.ValidReactionNames(), ", "),
 				return fmt.Errorf("--type is required")
 			}
 
+			// The name is validated against the protocol vocabulary, which is
+			// the same list an out-of-process backend receives it in — so it
+			// travels the wire unchanged and needs no translation here.
 			if err := reactions.Validate(reactionType); err != nil {
 				return fmt.Errorf("--type: %w", err)
 			}
@@ -64,7 +67,7 @@ Valid reaction types: ` + strings.Join(reactions.ValidReactionNames(), ", "),
 		},
 	}
 
-	cmd.Flags().StringVar(&reactionType, "type", "", "Reaction type (required): "+strings.Join(reactions.ValidReactionNames(), ", "))
+	cmd.Flags().StringVar(&reactionType, "type", "", "Reaction type (required): "+strings.Join(backend.ReactionNames(), ", "))
 	addBackendFlags(cmd, bo)
 	_ = cmd.MarkFlagRequired("type")
 
