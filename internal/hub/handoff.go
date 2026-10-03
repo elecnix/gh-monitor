@@ -7,10 +7,10 @@
 // Two kinds of state move across:
 //
 //   - Pollers: one per watched identity (any target kind), carrying the last
-//     fetched raw snapshot, the idle-backoff counter, the query tier, and the
-//     cached ruleset. The next daemon seeds its pollers with these, so a
-//     watcher that reconnects is served from continuity, not from a cold
-//     first poll.
+//     observation the fetch produced, the idle-backoff counter, the query
+//     tier, and the cached ruleset. The next daemon seeds its pollers with
+//     these, so a watcher that reconnects is served from continuity, not from
+//     a cold first poll.
 //   - Resumes: one per connected watcher, carrying the distilled baseline
 //     that watcher had already been shown. The next daemon holds these until
 //     the watcher reconnects with the same ResumeID, then diffs against the
@@ -46,10 +46,10 @@ type State struct {
 	Resumes []ResumeState `json:"resumes,omitempty"`
 }
 
-// PollerState is one watched identity's continuity. Latest is the raw fetch
-// payload as JSON — its concrete shape depends on the identity's target kind,
-// and the adopting daemon decodes it with that kind's traits rather than
-// guessing.
+// PollerState is one watched identity's continuity. Latest is what the last
+// successful fetch produced, as JSON: for most kinds the wire payload, for a
+// kind that distils at the source (run) the distilled status. The adopting
+// daemon decodes it by the identity's kind rather than guessing.
 type PollerState struct {
 	Identity resolver.Identity      `json:"identity"`
 	Latest   json.RawMessage        `json:"latest,omitempty"`
@@ -94,7 +94,7 @@ func (h *Hub) ExportState() State {
 		ps := PollerState{Identity: p.identity}
 		p.mu.Lock()
 		if p.latest != nil {
-			// The raw payload's concrete type is JSON-tagged, so it travels
+			// The fetch result's concrete type is JSON-tagged, so it travels
 			// encoded and the successor decodes it by kind.
 			if b, err := json.Marshal(p.latest); err == nil {
 				ps.Latest = b
@@ -153,9 +153,9 @@ func (h *Hub) RestoreState(s State) error {
 		}
 		p := newPoller(h, ps.Identity, h.interval)
 		if len(ps.Latest) > 0 {
-			raw := rawForKind(key.kind)
-			if err := json.Unmarshal(ps.Latest, raw); err == nil {
-				p.latest = raw
+			fetched := zeroFetched(key.kind)
+			if err := json.Unmarshal(ps.Latest, fetched); err == nil {
+				p.latest = fetched
 			}
 		}
 		p.noChange, p.tier, p.ruleset = ps.NoChange, ps.Tier, ps.Ruleset
