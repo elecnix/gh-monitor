@@ -185,6 +185,106 @@ func TestAdoptTransfersStateAndSocket(t *testing.T) {
 	}
 }
 
+// stalledPredecessor runs an in-process stand-in for a daemon that is
+// mid-upgrade and has stopped making progress: it greets every connection,
+// then blocks forever inside the named op without answering it. Because it
+// blocks rather than returns, the connection stays open, so a client waiting
+// on it waits for real — the condition the exchange bound exists for.
+func stalledPredecessor(t *testing.T, ctx context.Context, socket string, h *hub.Hub, stallOn string) {
+	t.Helper()
+	l, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release); _ = l.Close() })
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				cfg := remote.ServerConfig{
+					Name: "daemon",
+					Source: backend.SourceFunc(func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+						return nil, errors.New("not used in this test")
+					}),
+					HandleOp: func(ctx context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
+						if req.Op == stallOn {
+							<-release
+							return true, nil
+						}
+						if req.Op == OpHandoff {
+							raw, err := json.Marshal(h.ExportState())
+							if err != nil {
+								return true, remote.WriteFrame(conn, remote.Frame{Error: err.Error()})
+							}
+							return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+						}
+						return false, nil
+					},
+				}
+				_ = remote.Serve(ctx, c, cfg)
+			}(conn)
+		}
+	}()
+}
+
+// boundAdopt runs Adopt against socket with the exchange bound shortened, and
+// reports how long it took. Production uses remote.ExchangeTimeout; the test
+// shortens it so a bound that is not actually enforced shows up as a test
+// timeout rather than as a stall.
+func boundAdopt(t *testing.T, socket string) (time.Duration, error) {
+	t.Helper()
+	prev := exchangeTimeout
+	exchangeTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { exchangeTimeout = prev })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	start := time.Now()
+	listener, _, err := Adopt(ctx, socket)
+	if listener != nil {
+		_ = listener.Close()
+	}
+	return time.Since(start), err
+}
+
+// TestAdoptBoundedWhenPredecessorNeverAnswers covers the wait for the
+// predecessor's state response. The exchange bound is set on the context, but
+// a context deadline does not interrupt a blocking socket read — so without a
+// deadline on the socket itself, this call never returns.
+func TestAdoptBoundedWhenPredecessorNeverAnswers(t *testing.T) {
+	socket := shortPath(t, "ghmon-silent-*.d")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stalledPredecessor(t, ctx, socket, handoffHub(t), OpHandoff)
+
+	elapsed, err := boundAdopt(t, socket)
+	require.Error(t, err, "a predecessor that never answers must not hang the successor")
+	assert.Less(t, elapsed, 10*time.Second, "the exchange must give up on its own")
+}
+
+// TestAdoptBoundedWhenPredecessorNeverPassesTheSocket covers the fd pass,
+// the one step whose answer is not a frame at all. It is also the one step
+// that wedges both daemons: the predecessor has already been told to hand the
+// socket over and will not exit until it has, so a successor blocked in the
+// receive leaves two daemons on one socket and no fallback.
+func TestAdoptBoundedWhenPredecessorNeverPassesTheSocket(t *testing.T) {
+	socket := shortPath(t, "ghmon-nofd-*.d")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stalledPredecessor(t, ctx, socket, handoffHub(t), OpHandoffFD)
+
+	elapsed, err := boundAdopt(t, socket)
+	require.Error(t, err, "a predecessor that never passes the socket must not hang the successor")
+	assert.Less(t, elapsed, 10*time.Second, "the fd receive must give up on its own")
+}
+
 // TestAdoptRefusedByOldDaemon verifies the successor falls back cleanly when
 // the running daemon predates the handoff ops: Adopt reports an error, and
 // the caller surfaces the ordinary "socket in use" failure.
