@@ -127,22 +127,19 @@ func runPrefsGet(cmd *cobra.Command, opts *prefsOptions) error {
 	return encodeJSON(cmd, p)
 }
 
-// daemonReadPrefKeys are the settings only the resident daemon reads: they
-// take effect when a daemon starts, not when the file is written. Listed in
-// one place so the prefs-set hint and any future reader stay in sync.
-var daemonReadPrefKeys = []string{"selfUpdate", "pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy"}
-
 // warnDaemonRestartHint prints a stderr hint (stdout stays clean JSON for
 // callers that pipe it) when an override touches a daemon-read key, naming
 // `gh monitor reload` so applying the change is one command away — not
-// silently pending until some future restart.
+// silently pending until some future restart. The daemon-read set lives in
+// internal/prefs, beside the code that validates these keys, so adding a
+// daemon-read preference there cannot leave this hint behind.
 func warnDaemonRestartHint(cmd *cobra.Command, data []byte) {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return // UpdateFile already rejected unparseable overrides
 	}
 	var touched []string
-	for _, k := range daemonReadPrefKeys {
+	for _, k := range prefs.DaemonReadKeys() {
 		if _, ok := raw[k]; ok {
 			touched = append(touched, k)
 		}

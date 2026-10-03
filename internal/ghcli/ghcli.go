@@ -368,12 +368,6 @@ func (c *Client) FailedRunLogs(owner, repo string, runID int) (string, error) {
 	return string(stdout), nil
 }
 
-// RunGh executes the `gh` CLI command with provided arguments and optional stdin data.
-// Exported for use by tests and other packages.
-func RunGh(args []string, stdin []byte) ([]byte, string, error) {
-	return runGh(args, stdin)
-}
-
 // runGh executes the `gh` CLI command with provided arguments and optional stdin data.
 // It is a variable so tests can replace the gh process.
 var runGh = func(args []string, stdin []byte) ([]byte, string, error) {

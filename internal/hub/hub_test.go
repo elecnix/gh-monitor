@@ -863,6 +863,24 @@ func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
 		"once degraded, nextDelay must fall back within the normal ceiling, not the broker-healthy extended one")
 }
 
+// rateLimitResource is one budget bucket of a GET /rate_limit response.
+type rateLimitResource struct {
+	Limit     int   `json:"limit"`
+	Remaining int   `json:"remaining"`
+	Reset     int64 `json:"reset"`
+}
+
+// rateLimitPayload is the GET /rate_limit response body. The stub builds its
+// own copy of the wire shape rather than borrowing monitor's: the shape is a
+// REST contract, not a cross-package API, and encoding/json unmarshals into
+// monitor's own copy of it however these bytes were produced.
+type rateLimitPayload struct {
+	Resources struct {
+		Core    rateLimitResource `json:"core"`
+		GraphQL rateLimitResource `json:"graphql"`
+	} `json:"resources"`
+}
+
 // rateLimitAPIStub serves GET /rate_limit over REST with the given GraphQL
 // remaining/limit, mirroring the monitor package's test fixture.
 type rateLimitAPIStub struct {
@@ -871,7 +889,7 @@ type rateLimitAPIStub struct {
 }
 
 func (r *rateLimitAPIStub) REST(method, path string, params map[string]string, body interface{}, result interface{}) error {
-	rl := monitor.RateLimitResponse{}
+	rl := rateLimitPayload{}
 	rl.Resources.GraphQL.Remaining = r.remaining
 	rl.Resources.GraphQL.Limit = r.limit
 	rl.Resources.GraphQL.Reset = time.Now().Add(30 * time.Minute).Unix()
