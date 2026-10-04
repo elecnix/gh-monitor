@@ -80,10 +80,29 @@ type WatchOptions struct {
 
 	// Interval is the caller's preferred cadence. A backend that polls uses
 	// it; one that does not ignores it.
+	//
+	// The gh-monitor shared-poller daemon ignores it, and cannot honour it: a
+	// poller is shared by every watcher on a target, so its cadence is the
+	// hub's own, fixed at construction (hub.New) from the daemon's --interval
+	// and the pollInterval preference. Honouring a per-watch value would
+	// retune every other watcher's poll rate. A watch served by a running
+	// daemon therefore gets that daemon's cadence; the client says so on
+	// stderr rather than let the caller believe this value was applied.
 	Interval time.Duration `json:"interval,omitempty"`
 
 	// Timeout stops the watch after this duration. Zero means run until the
 	// target is terminal or the context is cancelled.
+	//
+	// Ownership is every relay boundary on the path, not one layer: a Source
+	// that shares polling across subscribers (the gh-monitor daemon's hub)
+	// cannot enforce it, because it outlives any single watch. Each boundary
+	// that forwards this stream — hubSource.Watch on the daemon side, a mux
+	// fallback or sub-daemon handoff, and the client's own loop — closes the
+	// channel when the deadline passes, and the client is the one that reports
+	// the timeout and maps it to an exit code. Applying it at several layers
+	// is deliberate: the client must not depend on any one of them still
+	// working (a sub-daemon that lost its broker connection keeps a stream
+	// open past the deadline).
 	Timeout time.Duration `json:"timeout,omitempty"`
 
 	// Once asks for the target's current actionable state rather than an
