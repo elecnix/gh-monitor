@@ -241,8 +241,11 @@ func ciAllGreen(s *PRStatus) bool {
 // healthy, a poller's idle backoff may grow well past the normal 300s, because
 // a real change now arrives as an immediate wake instead of waiting for the
 // next tick — polling becomes a rare safety net, not the primary path.
-// cap <= 0 is treated as "no ceiling" (the backoff still starts at base and
-// only grows, so this is never used to stop polling altogether).
+// cap <= 0 means the cap itself imposes no ceiling: the backoff still starts
+// at base and only grows, so this is never used to stop polling altogether.
+// Growth is not literally unbounded, though — the shift saturates at 20, so
+// the interval tops out at base<<20 rather than running forever. The result
+// is never below base either, so a cap smaller than base has no effect.
 func IdleIntervalCapped(base time.Duration, noChange int, cap time.Duration) time.Duration {
 	d := base
 	if noChange >= 3 {
