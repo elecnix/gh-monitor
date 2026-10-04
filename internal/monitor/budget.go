@@ -54,7 +54,7 @@ type BudgetGuard struct {
 
 	mu        sync.Mutex
 	lastCheck time.Time
-	cached    *RateLimitResponse
+	cached    *rateLimitResponse
 	wasLow    bool // last known low state, for transition notices
 }
 
@@ -203,7 +203,7 @@ func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok 
 		return 0, 0, false
 	}
 	if g.lastCheck.IsZero() || now.Sub(g.lastCheck) >= g.checkEvery {
-		rl, err := g.svc.FetchRateLimit()
+		rl, err := g.svc.fetchRateLimit()
 		if err == nil && rl != nil {
 			g.cached = rl
 			g.lastCheck = now
@@ -215,8 +215,8 @@ func (g *BudgetGuard) GraphQLRemaining(now time.Time) (remaining, limit int, ok 
 	return g.cached.Resources.GraphQL.Remaining, g.cached.Resources.GraphQL.Limit, true
 }
 
-// currentTier returns the fetch tier for the next poll: TierFull when no
-// BudgetGuard is wired, otherwise derived from the advisory GraphQL budget.
+// IsQueryCostError reports whether err is a GraphQL resource-limit rejection —
+// the signal that the next poll should back off rather than retry at full tier.
 func IsQueryCostError(err error) bool {
 	var gqlErr *ghcli.GraphQLError
 	if errors.As(err, &gqlErr) {
@@ -226,7 +226,3 @@ func IsQueryCostError(err error) bool {
 	}
 	return false
 }
-
-// applyBudgetStretch consults the loop's BudgetGuard (when set), emits a loud
-// notice on transitions into/out of the low state, and returns the delay with
-// any stretch added, capped at the idle-backoff ceiling.

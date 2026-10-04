@@ -8,13 +8,14 @@ import (
 
 // ---------------------------------------------------------------------------
 // Readiness query — fetches open PRs with head-commit checkSuites in the same
-// shape as MONITOR_QUERY so the existing Snapshot, awaitingChecks, ciAllGreen,
-// and truncatedSuites functions work unchanged.
+// shape the full monitor tier returns, so the existing Snapshot,
+// awaitingChecks, ciAllGreen, and truncatedSuites functions work unchanged.
 // ---------------------------------------------------------------------------
 
 // MONITOR_READINESS_QUERY fetches every open PR with its author, review state,
-// and the head commit's check suites (the same shape as MONITOR_QUERY).
-// Comments, threads, and reactions are omitted to keep the payload lean.
+// and the head commit's check suites (the same shape the full monitor tier
+// returns). Comments, threads, and reactions are omitted to keep the payload
+// lean.
 const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: String!, $first: Int!, $after: String) {
   repository(owner: $owner, name: $repo) {
     pullRequests(first: $first, after: $after, states: OPEN, orderBy: {field: CREATED_AT, direction: DESC}) {
