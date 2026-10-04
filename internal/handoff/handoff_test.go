@@ -235,6 +235,14 @@ func stalledPredecessor(t *testing.T, ctx context.Context, socket string, h *hub
 // reports how long it took. Production uses remote.ExchangeTimeout; the test
 // shortens it so a bound that is not actually enforced shows up as a test
 // timeout rather than as a stall.
+//
+// Shortening a package-level var is only safe while the package's tests run
+// one at a time, so this is the one place in package handoff that writes
+// shared state and it is written for the duration of a single test. A test
+// that calls t.Parallel() would overlap with this write and race against
+// Adopt's read of the same variable; if one is ever added, this has to become
+// a parameter instead. Nothing in the package parallelises today — that is
+// what makes the write safe, not the absence of a race detector.
 func boundAdopt(t *testing.T, socket string) (time.Duration, error) {
 	t.Helper()
 	prev := exchangeTimeout
