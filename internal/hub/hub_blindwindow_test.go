@@ -88,7 +88,7 @@ func TestPoller_BlindWindowStartsAtLastSuccess(t *testing.T) {
 
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	var from time.Time
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -144,7 +144,7 @@ func TestPoller_FirstFetchFailureDeclaresNoWindow(t *testing.T) {
 	waitDegraded(t, ch, "the first fetch must fail and broadcast")
 
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:

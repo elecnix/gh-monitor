@@ -240,10 +240,6 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	p.started = true
 	h.mu.Unlock()
 
-	if start {
-		go p.run()
-	}
-
 	// The consumer only needs enough run configuration to diff and to stamp
 	// the updates it emits; templates never reach the daemon.
 	ro := monitor.RunOptions{Identity: identity}
@@ -312,6 +308,19 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		}
 	}
 	p.mu.Unlock()
+
+	// The poller starts only once its first subscriber is attached, never
+	// before: run() fetches at once, so starting it earlier raced that first
+	// fetch against the registration above. A poller broadcasts a fetch error
+	// to whoever is attached when it happens, and nothing replays a degraded
+	// notice afterwards — unlike a snapshot, which Subscribe hands over from
+	// p.latest — so a first fetch that failed with no subscriber attached
+	// degraded silently and stayed silent until the error backoff expired (up
+	// to 300s). That is exactly the blindness the degraded broadcast exists to
+	// announce.
+	if start {
+		go p.run()
+	}
 
 	var once sync.Once
 	cancel := func() {

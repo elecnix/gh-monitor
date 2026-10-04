@@ -53,6 +53,25 @@ const (
 	EventAllClear EventType = "all-clear"
 )
 
+// AllEventTypes returns every event type in declaration order, so the same
+// order as the constants above. Callers that need to enumerate the vocabulary
+// — `gh monitor --events` validation is the one that matters — read it here
+// instead of keeping a hand-written copy of the list. A new EventType is a
+// recognised kind the day it is declared, with no second edit to remember.
+func AllEventTypes() []EventType {
+	return []EventType{
+		EventNewFailingChecks, EventCIAllGreen, EventNewUnresolvedThreads,
+		EventNewGeneralComments, EventConflict, EventReviewApproved,
+		EventReviewChangesRequested, EventReviewDismissed, EventNewCommit,
+		EventMerged, EventClosed,
+		EventIssueClosed, EventIssueReopened, EventIssueNewComment, EventIssueMention,
+		EventRunQueued, EventRunInProgress, EventRunCompleted,
+		EventRepoNewPR, EventRepoNewIssue, EventCheckAnnotations,
+		EventRepoReadiness, EventDegraded,
+		EventFirstPoll, EventAllClear,
+	}
+}
+
 // Event describes a single genuinely-new change on a Target. Only the fields
 // relevant to Type are populated.
 type Event struct {
