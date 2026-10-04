@@ -800,7 +800,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 			// A run's distillation reads no snapshot options, so the fetch
 			// already did it (issue #140). There is nothing here to derive
 			// per subscriber.
-			distill:     snapDistill(alreadyDistilled),
+			distill: snapDistill(alreadyDistilled),
 			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
 				c := monitor.NewRunConsumer(ro)
 				// The failed-run log snippet is fetched through the gh CLI,
