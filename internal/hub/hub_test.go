@@ -523,6 +523,51 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 		"entering a shed tier must broadcast a degraded notice")
 }
 
+// TestSubscribe_FirstDegradedBroadcastReachesItsFirstSubscriber pins the
+// ordering Subscribe owes the subscriber that starts a poller. A poller
+// fetches the moment it runs, and a fetch error is broadcast to whoever is
+// attached when it happens: a poller started before its first subscriber is
+// attached therefore announces that failure to nobody. Nothing replays a
+// degraded notice afterwards — a snapshot is handed over from p.latest, a
+// degraded episode is not — and the error backoff then pushes the next poll
+// minutes out, so the watcher that just attached sees "nothing to report"
+// while it is blind, which is the failure the degraded broadcast exists to
+// prevent. The ordering is the scheduler's to decide, so the test repeats
+// the subscribe rather than trying to provoke a specific interleaving.
+func TestSubscribe_FirstDegradedBroadcastReachesItsFirstSubscriber(t *testing.T) {
+	const attempts = 200
+	missed := 0
+	for i := 0; i < attempts; i++ {
+		h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+			return nil, errors.New("gh api failed: exit status 1")
+		}, nil, time.Hour, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		deadline := time.After(time.Second)
+	waitFirst:
+		for {
+			select {
+			case u, ok := <-ch:
+				if !ok {
+					t.Fatalf("subscription closed before the first failure was announced (attempt %d)", i)
+				}
+				if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+					break waitFirst
+				}
+			case <-deadline:
+				missed++
+				break waitFirst
+			}
+		}
+		cancel()
+		cancelSub()
+		h.Stop()
+	}
+	assert.Zero(t, missed,
+		"%d of %d subscribe-then-degrade cycles left the first subscriber unannounced", missed, attempts)
+}
+
 // TestPoller_FetchErrorNamesBlindSharedSurfaces verifies issue #98: a PR's
 // check outcomes, head commit, and mergeability ride in the SAME GraphQL
 // query as the shed-able surfaces, so when that query fails, those surfaces
