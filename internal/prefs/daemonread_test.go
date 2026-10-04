@@ -87,10 +87,39 @@ func TestDaemonReadKeys_ReturnsCopy(t *testing.T) {
 // needs to know, and it spares the test a sample per key.
 func TestValidPrefKeysAreAcceptedByUpdateFile(t *testing.T) {
 	dir := t.TempDir()
+	accepted := map[string]bool{}
 	for _, key := range validPrefKeys {
 		_, err := UpdateFile(dir, []byte(`{"`+key+`": null}`))
 		if err != nil && strings.Contains(err.Error(), "unknown preference key") {
 			t.Errorf("validPrefKeys names %q but UpdateFile rejects it: %v", key, err)
+			continue
+		}
+		accepted[key] = true
+	}
+	// The other direction, which is the one that makes the error message
+	// trustworthy: every key UpdateFile accepts must be listed. A key added to
+	// the switch and not here would otherwise pass this test and leave the
+	// unknown-key error naming a set that is out of date.
+	for _, key := range updateFileKeys(t) {
+		if !accepted[key] {
+			t.Errorf("UpdateFile accepts %q but validPrefKeys omits it", key)
 		}
 	}
+}
+
+// updateFileKeys is every top-level key UpdateFile recognises, discovered by
+// probing it rather than by reading the switch, so the two lists in this file
+// cannot drift apart without the tests above noticing.
+func updateFileKeys(t *testing.T) []string {
+	t.Helper()
+	var keys []string
+	for _, candidate := range append([]string{"templates", "ignoredBots", "retriggerComments",
+		"selfUpdate", "pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy",
+		"reactOnNotify", "eventLog", "notAKeyAtAll"}, []string{}...) {
+		_, err := UpdateFile(t.TempDir(), []byte(`{"`+candidate+`": null}`))
+		if err == nil || !strings.Contains(err.Error(), "unknown preference key") {
+			keys = append(keys, candidate)
+		}
+	}
+	return keys
 }
