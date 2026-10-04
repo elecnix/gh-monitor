@@ -412,4 +412,5 @@ func TestBackendsCommandListsMutationCapabilities(t *testing.T) {
 	assert.Contains(t, byName["gh"].Capabilities, backend.CapReview)
 	assert.Contains(t, byName["gh"].Capabilities, backend.CapDraft)
 	assert.Contains(t, byName["gh"].Capabilities, backend.CapReactions)
+	assert.Contains(t, byName["gh"].Capabilities, backend.CapReport)
 }

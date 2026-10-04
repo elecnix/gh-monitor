@@ -49,6 +49,7 @@ func (p *Provider) Register(r *backend.Registry) error {
 	r.RegisterComments(Name, nil, commentActor{p})
 	r.RegisterDraft(Name, nil, draftActor{p})
 	r.RegisterReactions(Name, nil, reactionActor{p})
+	r.RegisterReport(Name, nil, reportActor{p})
 	return nil
 }
 
