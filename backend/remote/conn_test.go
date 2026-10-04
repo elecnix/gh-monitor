@@ -182,10 +182,153 @@ func TestConnSendDoesNotWaitForAnAnswer(t *testing.T) {
 	assert.Less(t, time.Since(start), 5*time.Second)
 }
 
+// TestSendDoesNotAliasTheCallersRequest pins the lifetime of the wire
+// request. Send takes its argument by value, so &req.Target and
+// &req.Options are the addresses of Send's own copy, and the wire struct is a
+// local that json.Marshal consumes in full before the bytes are written — so
+// nothing a caller does with its Request after Send returns can reach the
+// frame already on the socket, and a second Send of the same Request reads it
+// afresh rather than replaying a struct the first call retained.
+//
+// The mutation below is deliberately everything a caller could do: overwrite
+// the scalar fields, replace the slice header, and reuse the whole value.
+func TestSendDoesNotAliasTheCallersRequest(t *testing.T) {
+	addr := socketPath(t, "ghmon-alias-*")
+	lines := make(chan string, 2)
+	serveOne(t, addr, func(c net.Conn) {
+		_, _ = c.Write([]byte(greeting))
+		br := bufio.NewReader(c)
+		for range 2 {
+			line, err := br.ReadBytes('\n')
+			if err != nil && len(line) == 0 {
+				return
+			}
+			lines <- string(line)
+		}
+		_ = c.Close()
+	})
+
+	c, err := Dial(t.Context(), "unix", addr)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	req := Request{
+		Op:      OpRead,
+		Target:  backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7},
+		Options: backend.WatchOptions{Since: "S0", Kinds: []backend.EventType{backend.EventNewGeneralComments}},
+	}
+	require.NoError(t, c.Send(req))
+	first := <-lines
+
+	req.Target.Owner = "mutated"
+	req.Options.Since = "S1"
+	req.Options.Kinds = []backend.EventType{backend.EventConflict}
+	require.NoError(t, c.Send(req))
+	second := <-lines
+
+	var decoded struct {
+		Op      string               `json:"op"`
+		Target  backend.Target       `json:"target"`
+		Options backend.WatchOptions `json:"options"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(first), &decoded))
+	assert.Equal(t, OpRead, decoded.Op)
+	assert.Equal(t, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7}, decoded.Target)
+	assert.Equal(t, "S0", decoded.Options.Since)
+	assert.Equal(t, []backend.EventType{backend.EventNewGeneralComments}, decoded.Options.Kinds)
+
+	// The second call reads the Request as it stands now, which is what
+	// "nothing is retained" looks like from the outside.
+	require.NoError(t, json.Unmarshal([]byte(second), &decoded))
+	assert.Equal(t, "mutated", decoded.Target.Owner)
+	assert.Equal(t, "S1", decoded.Options.Since)
+	assert.Equal(t, []backend.EventType{backend.EventConflict}, decoded.Options.Kinds)
+}
+
+// deadlineRecorder records the deadlines set on a connection, so a test can
+// assert what a Conn leaves on the socket and not only what it does with it.
+type deadlineRecorder struct {
+	net.Conn
+	set []string
+}
+
+func (d *deadlineRecorder) note(label string, when time.Time) error {
+	if when.IsZero() {
+		d.set = append(d.set, label+":none")
+	} else {
+		d.set = append(d.set, label+":some")
+	}
+	return nil
+}
+
+func (d *deadlineRecorder) SetDeadline(when time.Time) error      { return d.note("all", when) }
+func (d *deadlineRecorder) SetReadDeadline(when time.Time) error  { return d.note("read", when) }
+func (d *deadlineRecorder) SetWriteDeadline(when time.Time) error { return d.note("write", when) }
+
+// greetsOnPipe runs a peer that sends the hello and then drains whatever the
+// client writes, which is all these tests need to get past the handshake.
+func greetsOnPipe(t *testing.T, mine net.Conn) {
+	t.Helper()
+	go func() {
+		if _, err := mine.Write([]byte(greeting)); err != nil {
+			return
+		}
+		for {
+			if _, err := mine.Read(make([]byte, 4096)); err != nil {
+				return
+			}
+		}
+	}()
+}
+
+// TestNewConnLeavesTheSocketUnboundedAfterTheHello covers the deadline the
+// handshake arms. It is an absolute instant chosen to bound a peer that never
+// greets; anything left on the socket afterwards bounds operations that
+// never asked to be bounded, and a UnixConn caller arms nothing at all.
+func TestNewConnLeavesTheSocketUnboundedAfterTheHello(t *testing.T) {
+	mine, theirs := net.Pipe()
+	defer func() { _ = theirs.Close() }()
+	greetsOnPipe(t, theirs)
+
+	rec := &deadlineRecorder{Conn: mine}
+	c, err := NewConn(t.Context(), rec)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+
+	require.NotEmpty(t, rec.set)
+	assert.Equal(t, "all:none", rec.set[len(rec.set)-1],
+		"a successful handshake must leave no deadline on the socket")
+}
+
+// TestSendAndReadFrameEachArmTheirOwnBound is why the stale handshake instant
+// cannot fail an operation: both halves of the deadline are re-armed per call,
+// so a connection that sat idle past the handshake still sends and still reads.
+// SetDeadline arms both halves at once, so the record is read, write, read.
+func TestSendAndReadFrameEachArmTheirOwnBound(t *testing.T) {
+	mine, theirs := net.Pipe()
+	defer func() { _ = theirs.Close() }()
+	greetsOnPipe(t, theirs)
+
+	rec := &deadlineRecorder{Conn: mine}
+	c, err := NewConn(t.Context(), rec)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	before := len(rec.set)
+
+	go func() {
+		_ = WriteFrame(theirs, Frame{Result: json.RawMessage(`{}`)})
+	}()
+	require.NoError(t, c.Send(Request{Op: "handoff"}))
+	_, err = c.ReadFrame()
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"write:some", "read:some"}, rec.set[before:])
+}
+
 // TestNewConnClosesTheConnectionItOwns pins the contract NewConn documents:
-// taking ownership means closing on every failure path. A caller that hands it
-// an already-open socket — the fd-passing handoff path — has no handle left to
-// close with, so a leak here is a leak in that caller.
+// taking ownership means closing on every failure path. A caller that opened
+// the connection itself has no handle left to close with once NewConn takes
+// it, so a leak here is a leak in that caller.
 func TestNewConnClosesTheConnectionItOwns(t *testing.T) {
 	for _, tc := range []struct {
 		name string

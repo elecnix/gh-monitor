@@ -83,13 +83,15 @@ func NewConn(ctx context.Context, conn net.Conn) (*Conn, error) {
 	c := &Conn{conn: conn, br: bufio.NewReader(conn)}
 	// The socket gets a deadline too. readHello closes the connection when
 	// HandshakeTimeout fires, but the deadline is what bounds the read if
-	// that goroutine is ever not the one that loses the race.
+	// that goroutine is ever not the one that loses the race. It is the
+	// longer ExchangeTimeout, not HandshakeTimeout, so that the closing
+	// goroutine always wins the race rather than sometimes losing it to a
+	// read that fails first and reports a timeout nobody was waiting for.
 	_ = conn.SetDeadline(time.Now().Add(ExchangeTimeout))
 	// From this point the connection is ours, and every way out closes it.
-	// A caller that hands NewConn an already-open socket — the fd-passing
-	// handoff path does exactly that — would otherwise leak it on a
-	// protocol mismatch or a failed hello, since it has no handle left to
-	// close with.
+	// A caller that hands NewConn a connection it opened itself would
+	// otherwise leak it on a protocol mismatch or a failed hello, since it
+	// has no handle left to close with.
 	fail := func(err error) (*Conn, error) {
 		_ = conn.Close()
 		return nil, err
@@ -102,6 +104,16 @@ func NewConn(ctx context.Context, conn net.Conn) (*Conn, error) {
 		return fail(fmt.Errorf("peer speaks protocol %d, this build speaks %d", hello.Protocol, Protocol))
 	}
 	c.hello = hello
+	// The handshake deadline was armed for the hello alone, and it is an
+	// absolute instant, so leaving it on the socket would silently bound
+	// everything that follows. Send and ReadFrame each arm their own bound
+	// per operation, which is why a lapsed one cannot fail them — but
+	// UnixConn hands out the raw connection for a caller that arms nothing,
+	// and that read would inherit an instant chosen for a different purpose
+	// and possibly already in the past. Clearing it costs no guarantee: a
+	// Conn's socket carries a deadline exactly when a Conn method asked for
+	// one.
+	_ = conn.SetDeadline(time.Time{})
 	return c, nil
 }
 
