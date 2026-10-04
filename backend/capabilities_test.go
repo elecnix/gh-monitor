@@ -283,9 +283,13 @@ func TestRenderTableToleratesRaggedRows(t *testing.T) {
 	// N+1 separators. Deriving it keeps the assertion honest if the fixture
 	// ever changes width.
 	wantPipes := 1
-	for _, r := range rows {
+	widest := -1
+	for i, r := range rows {
 		if len(r)+1 > wantPipes {
 			wantPipes = len(r) + 1
+		}
+		if len(r) == wantPipes-1 {
+			widest = i
 		}
 	}
 	got := strings.Split(renderTable(rows), "\n")
@@ -299,9 +303,18 @@ func TestRenderTableToleratesRaggedRows(t *testing.T) {
 			t.Errorf("row %d has %d cell separators, want %d: %q", i, n, wantPipes, line)
 		}
 	}
-	// got[0] header, got[1] separator, got[2] the over-long data row
-	if !strings.Contains(got[2], "3") {
-		t.Errorf("the over-long row's extra cell was dropped: %q", got[2])
+	// The over-long row's line. Its index is derived from the fixture rather
+	// than hardcoded, because the count check above only proves len(got), not
+	// that this particular row exists: a fixture shrunk to a single row would
+	// leave got[2] out of range, and the panic that follows would be blamed on
+	// renderTable by the recover above instead of on the fixture.
+	if widest < 0 {
+		t.Fatalf("fixture has no widest row to check")
+	}
+	// got[0] header, got[1] separator, so data row i is at got[i+1].
+	overLong := got[widest+1]
+	if !strings.Contains(overLong, "3") {
+		t.Errorf("the over-long row's extra cell was dropped: %q", overLong)
 	}
 	renderTable([][]string{{"only"}})
 	renderTable([][]string{{"a", "b", "c"}, {"d"}})
