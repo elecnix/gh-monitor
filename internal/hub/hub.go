@@ -1353,7 +1353,7 @@ func restModeNotice(label string, resetAt, from time.Time) monitor.Event {
 	ev := monitor.Event{
 		Type:             monitor.EventDegraded,
 		DegradedSurface:  "graphql",
-		DegradedSurfaces: shed,
+		DegradedSurfaces: shed.Names(),
 	}
 	until := ""
 	if !resetAt.IsZero() {
@@ -1366,7 +1366,7 @@ func restModeNotice(label string, resetAt, from time.Time) monitor.Event {
 		since = " since " + ev.DegradedFrom
 	}
 	ev.Notice = fmt.Sprintf("⚠️ reading PR state over REST because GraphQL is exhausted%s on %s: state, merge, head commit and check outcomes remain watched, and %s are not watched%s until GraphQL answers again. A merge or close read over REST ends the watch without a GraphQL catch-up read, so backfill those surfaces from REST if completeness matters",
-		until, label, strings.Join(shed, ", "), since)
+		until, label, shed, since)
 	return ev
 }
 
@@ -1398,7 +1398,7 @@ func (p *poller) leaveRESTMode(tier monitor.QueryTier) {
 			ev.DegradedFrom, ev.DegradedTo)
 	}
 	if shed := tier.ShedSurfaces(); len(shed) > 0 {
-		msg += fmt.Sprintf(". The GraphQL budget is still low, so %s stay unwatched until it recovers", strings.Join(shed, ", "))
+		msg += fmt.Sprintf(". The GraphQL budget is still low, so %s stay unwatched until it recovers", shed)
 	} else {
 		msg += ". Resuming full monitoring"
 	}
@@ -1565,7 +1565,7 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	var msg string
 	if len(shed) > 0 {
 		msg = fmt.Sprintf("⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers; PR status and check outcomes remain watched",
-			p.label(), strings.Join(shed, ", "))
+			p.label(), shed)
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
 	}

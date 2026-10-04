@@ -10,15 +10,15 @@ import (
 func TestTierSurfaces(t *testing.T) {
 	cases := []struct {
 		tier     QueryTier
-		shed     []string
+		shed     Surfaces
 		comments bool
 		reviews  bool
 		anns     bool
 	}{
 		{TierFull, nil, true, true, true},
-		{TierNoAnnotations, []string{"annotations"}, true, true, false},
-		{TierNoReviews, []string{"annotations", "reviews", "review threads"}, true, false, false},
-		{TierStatus, []string{"annotations", "reviews", "review threads", "comments"}, false, false, false},
+		{TierNoAnnotations, Surfaces{SurfaceAnnotations}, true, true, false},
+		{TierNoReviews, Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads}, true, false, false},
+		{TierStatus, Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads, SurfaceComments}, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tier.String(), func(t *testing.T) {
@@ -104,27 +104,27 @@ func TestCarryForwardShed(t *testing.T) {
 	})
 
 	t.Run("annotations carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"annotations"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceAnnotations}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, prev.CheckAnnotations, curr.CheckAnnotations, "annotations must be carried forward")
 	})
 
 	t.Run("reviews carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"reviews"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviews}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, "APPROVED", curr.ReviewDecision, "review decision must be carried forward")
 		assert.Equal(t, "alice", curr.ReviewAuthor)
 	})
 
 	t.Run("threads and comments carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"review threads", "comments"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviewThreads, SurfaceComments}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, prev.UnresolvedThreads, curr.UnresolvedThreads)
 		assert.Equal(t, prev.GeneralComments, curr.GeneralComments)
 	})
 
 	t.Run("nil prev is a no-op", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"reviews"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviews}}
 		CarryForwardShed(nil, curr)
 		assert.Empty(t, curr.ReviewDecision)
 	})
@@ -140,7 +140,7 @@ func TestCarryForwardShed_PreventsFalseEvents(t *testing.T) {
 		UnresolvedThreads: []ThreadSummary{{ID: "t1"}},
 		FailingChecks:     []string{"ci-build"},
 	}
-	curr := &PRStatus{State: "OPEN", FailingChecks: []string{"ci-build"}, ShedSurfaces: []string{"reviews", "review threads"}}
+	curr := &PRStatus{State: "OPEN", FailingChecks: []string{"ci-build"}, ShedSurfaces: Surfaces{SurfaceReviews, SurfaceReviewThreads}}
 	CarryForwardShed(prev, curr)
 
 	events := Diff(prev, curr)

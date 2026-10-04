@@ -1,12 +1,12 @@
 package monitor
 
 // CarryForwardShed retains the last-known values for surfaces the current
-// snapshot's tier no longer fetches (listed in curr.ShedSurfaces), so Diff
-// sees "not watched" rather than "cleared": a shed review decision must not
-// read as dismissed, shed check annotations must not vanish, and shed
-// comments/threads must not re-emit as new. Without this, dropping a tier
-// would fire false events — an APPROVED review reading as DISMISSED is the
-// worst of them.
+// snapshot's tier no longer fetches (listed in curr.ShedSurfaces, a typed
+// Surfaces vocabulary — see surface.go), so Diff sees "not watched" rather
+// than "cleared": a shed review decision must not read as dismissed, shed
+// check annotations must not vanish, and shed comments/threads must not
+// re-emit as new. Without this, dropping a tier would fire false events — an
+// APPROVED review reading as DISMISSED is the worst of them.
 //
 // It must run before Diff, and only against the consumer's own previous
 // snapshot (shed surfaces on the very first poll have nothing to carry).
@@ -14,23 +14,20 @@ func CarryForwardShed(prev, curr *PRStatus) {
 	if prev == nil || curr == nil || len(curr.ShedSurfaces) == 0 {
 		return
 	}
-	shed := make(map[string]bool, len(curr.ShedSurfaces))
-	for _, s := range curr.ShedSurfaces {
-		shed[s] = true
-	}
-	if shed["annotations"] {
+	shed := curr.ShedSurfaces
+	if shed.Has(SurfaceAnnotations) {
 		curr.CheckAnnotations = append([]AnnotationSummary(nil), prev.CheckAnnotations...)
 		curr.AnnotationsTruncated = prev.AnnotationsTruncated
 		curr.AnnotationsURL = prev.AnnotationsURL
 	}
-	if shed["reviews"] {
+	if shed.Has(SurfaceReviews) {
 		curr.ReviewDecision = prev.ReviewDecision
 		curr.ReviewAuthor = prev.ReviewAuthor
 	}
-	if shed["review threads"] {
+	if shed.Has(SurfaceReviewThreads) {
 		curr.UnresolvedThreads = append([]ThreadSummary(nil), prev.UnresolvedThreads...)
 	}
-	if shed["comments"] {
+	if shed.Has(SurfaceComments) {
 		curr.GeneralComments = append([]GeneralComment(nil), prev.GeneralComments...)
 	}
 }
