@@ -24,8 +24,14 @@ func TestIdleIntervalCapped(t *testing.T) {
 	// mechanism the daemon's broker transport (internal/hub) relies on to
 	// poll less while the broker is healthy.
 	assert.Equal(t, 30*time.Minute, IdleIntervalCapped(base, 100, 30*time.Minute))
-	// cap<=0 means "no ceiling"; growth is unbounded (still >= base).
+	// cap<=0 means the cap imposes no ceiling. Growth still saturates at
+	// base<<20 — the shift clamp — so "no ceiling" is not unbounded.
 	assert.Greater(t, IdleIntervalCapped(base, 40, 0), maxIdleInterval)
+	saturated := base * time.Duration(1) << 20
+	assert.Equal(t, saturated, IdleIntervalCapped(base, 40, 0))
+	assert.Equal(t, saturated, IdleIntervalCapped(base, 1000, 0))
+	// A cap below base is ignored: the result is never under base.
+	assert.Equal(t, base, IdleIntervalCapped(base, 100, base/2))
 }
 
 // TestIdleIntervalCapped_MeasuresPollReductionOverAWindow is the "prove it
