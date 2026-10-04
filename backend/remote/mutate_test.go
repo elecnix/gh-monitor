@@ -2,7 +2,9 @@ package remote
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/stretchr/testify/assert"
 	"testing"
 
 	"github.com/elecnix/gh-monitor/backend"
@@ -180,12 +182,55 @@ func TestReactionRoundTripsAcrossTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	if err := p.React(context.Background(), prTarget(), "PRRC_1", "THUMBS_UP"); err != nil {
+	// The spelling the CLI sends. gh monitor react validates --type against
+	// the lower_snake_case vocabulary and hands it straight to React, so the
+	// GraphQL enum ("THUMBS_UP") never appears on this socket.
+	if err := p.React(context.Background(), prTarget(), "PRRC_1", backend.ReactionThumbsUp); err != nil {
 		t.Fatalf("React: %v", err)
 	}
-	if actor.subjectID != "PRRC_1" || actor.reaction != "THUMBS_UP" {
+	if actor.subjectID != "PRRC_1" || actor.reaction != backend.ReactionThumbsUp {
 		t.Fatalf("server saw %q %q", actor.subjectID, actor.reaction)
 	}
+}
+
+// TestReactionPayloadCarriesTheWireSpelling pins the bytes an out-of-process
+// backend has to parse: the field names, and values that are the CLI names
+// rather than any API's token.
+//
+// The vocabulary below is written out rather than taken from ReactionNames(),
+// because deriving it from the code under test pins nothing about the values —
+// only the key. A rename from thumbs_up to thumbsup would have passed a derived
+// expectation while breaking every third-party server, which is the whole thing
+// this test exists to prevent. Adding or renaming a reaction is a breaking
+// change to the protocol; it has to come here deliberately.
+func TestReactionPayloadCarriesTheWireSpelling(t *testing.T) {
+	for _, name := range []string{
+		"confused", "eyes", "heart", "hooray",
+		"laugh", "rocket", "thumbs_down", "thumbs_up",
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(reactPayload{SubjectID: "PRRC_1", Reaction: name})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			want := `{"subject_id":"PRRC_1","reaction":"` + name + `"}`
+			if string(raw) != want {
+				t.Fatalf("payload is %s, want %s", raw, want)
+			}
+		})
+	}
+}
+
+// TestReactionNamesMatchTheWireVocabulary keeps the list the protocol carries
+// and the list this file pins from drifting apart, so neither can gain a name
+// the other does not know about.
+func TestReactionNamesMatchTheWireVocabulary(t *testing.T) {
+	want := []string{
+		"confused", "eyes", "heart", "hooray",
+		"laugh", "rocket", "thumbs_down", "thumbs_up",
+	}
+	assert.Equal(t, want, backend.ReactionNames(),
+		"the carried vocabulary changed; update the pinned spellings above and treat it as a protocol change")
 }
 
 func TestMutationErrorsCrossTheWire(t *testing.T) {
