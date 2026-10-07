@@ -39,6 +39,7 @@ type CoverageMap struct {
 	degraded map[string]time.Time  // daemon name -> when it began reporting degraded
 	changed  chan struct{}         // closed and replaced on every change
 	timers   map[string]*time.Timer
+	epochs   map[string]uint64 // daemon name -> full sets received, see Epoch
 }
 
 type coverEntry struct {
@@ -57,6 +58,7 @@ func NewCoverageMap(ttl, grace time.Duration) *CoverageMap {
 		degraded: map[string]time.Time{},
 		changed:  make(chan struct{}),
 		timers:   map[string]*time.Timer{},
+		epochs:   map[string]uint64{},
 	}
 }
 
@@ -76,21 +78,36 @@ func (m *CoverageMap) bumpLocked() {
 }
 
 // Retain forgets the repositories daemon covered that are not in keep. A
-// stream calls it once its full set is complete.
+// stream calls it once its full set is complete. It starts a new epoch for
+// the daemon, which wakes the routers even when no entry changed.
 func (m *CoverageMap) Retain(daemon string, keep map[string]bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	dropped := false
 	for k, e := range m.repos {
 		if e.Daemon == daemon && !keep[k] {
 			delete(m.repos, k)
-			dropped = true
 		}
 	}
 	m.setDegradedLocked(daemon, false)
-	if dropped {
-		m.bumpLocked()
-	}
+	m.epochs[daemon]++
+	m.bumpLocked()
+}
+
+// Epoch counts the full sets daemon has sent. A new one usually means the
+// sub-daemon restarted, so a watch it dropped may go back to it.
+func (m *CoverageMap) Epoch(daemon string) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.epochs[daemon]
+}
+
+// Known reports whether any daemon has reported owner/repo, whether or not
+// that daemon is live or trusted right now.
+func (m *CoverageMap) Known(owner, repo string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.repos[repoKey(owner, repo)]
+	return ok
 }
 
 // Poke wakes everything waiting on Changed. The registry calls it when a

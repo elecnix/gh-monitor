@@ -68,18 +68,24 @@ func (h *scriptHub) counts() (once, continuous, active int) {
 
 // subSource stands in for a webhook sub-daemon's watch stream.
 type subSource struct {
-	mu    sync.Mutex
-	opts  []backend.WatchOptions
-	calls int
+	mu       sync.Mutex
+	opts     []backend.WatchOptions
+	calls    int
+	endFirst bool // the first watch ends right after its first poll, as a restarting sub-daemon's does
 }
 
 func (s *subSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
 	s.mu.Lock()
 	s.calls++
 	s.opts = append(s.opts, opts)
+	end := s.endFirst && s.calls == 1
 	s.mu.Unlock()
 	ch := make(chan backend.Update, 2)
 	ch <- backend.Update{Target: t, Event: backend.Event{Type: backend.EventFirstPoll}, At: time.Now()}
+	if end {
+		close(ch)
+		return ch, nil
+	}
 	go func() {
 		<-ctx.Done()
 		close(ch)

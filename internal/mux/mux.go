@@ -300,3 +300,21 @@ func (r *Registry) coverageRoute(t backend.Target) (p *remote.Provider, covered 
 	daemon, last, has := cov.Covered(t.Owner, t.Repo)
 	return p, has && daemon == p.Name(), last, true
 }
+
+// routesByCoverage reports whether a continuous watch on t takes the
+// coverage path. Besides a live provider with the capability, that includes
+// a repository the map knows while no sub-daemon serves t's kind yet, such
+// as in the first probe interval after a start: the hub serves the watch
+// until the sub-daemon comes up, then hands it over.
+func (r *Registry) routesByCoverage(t backend.Target) bool {
+	if _, _, _, ok := r.coverageRoute(t); ok {
+		return true
+	}
+	r.mu.RLock()
+	cov := r.cov
+	r.mu.RUnlock()
+	if cov == nil || t.Owner == "" || t.Repo == "" || r.Provider(t.Kind) != nil {
+		return false
+	}
+	return cov.Known(t.Owner, t.Repo)
+}

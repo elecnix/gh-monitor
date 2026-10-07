@@ -56,7 +56,7 @@ type RoutingSource struct {
 // Watch implements backend.Source with the routing described above.
 func (s RoutingSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
 	if s.Reg != nil && !opts.Once {
-		if _, _, _, ok := s.Reg.coverageRoute(t); ok {
+		if s.Reg.routesByCoverage(t) {
 			ch := s.coverageWatch(ctx, t, opts)
 			if opts.Timeout > 0 {
 				ch = relayWithTimeout(ctx, ch, opts.Timeout)

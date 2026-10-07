@@ -41,7 +41,13 @@ type coverWatch struct {
 
 	baseline string // JSON of the last status delivered
 	reported bool   // a first poll has been delivered
-	forceHub bool   // the sub-daemon ended the watch; stay on the hub until coverage changes
+	midBatch bool   // the last update delivered carried More; a move waits for the batch to end
+
+	// forceHub is set when the sub-daemon ended the watch. The watch stays on
+	// the hub until the repository loses coverage or the sub-daemon sends a
+	// new full set (servedEpoch is the epoch it ended the watch under).
+	forceHub    bool
+	servedEpoch uint64
 }
 
 // outcome of one serving phase.
@@ -78,6 +84,7 @@ func (w *coverWatch) deliver(u backend.Update, mode string) bool {
 	} else if len(u.RawStatus) > 0 {
 		w.baseline = string(u.RawStatus)
 	}
+	w.midBatch = u.More
 	if !w.send(u) {
 		return false
 	}
@@ -87,9 +94,11 @@ func (w *coverWatch) deliver(u backend.Update, mode string) bool {
 func (w *coverWatch) run() {
 	for w.ctx.Err() == nil {
 		changed := w.s.Reg.cov.Changed()
-		p, covered, last, _ := w.s.Reg.coverageRoute(w.t)
+		p, last, onSub := w.route()
 		var res phase
-		if covered && !w.forceHub {
+		if onSub {
+			w.forceHub = false
+			w.servedEpoch = w.s.Reg.cov.Epoch(p.Name())
 			res = w.serveSubdaemon(p, last, changed)
 		} else {
 			res = w.serveHub(changed)
@@ -99,20 +108,29 @@ func (w *coverWatch) run() {
 			return
 		case phaseDied:
 			w.forceHub = true
-		case phaseMoved:
-			w.forceHub = false
 		}
 	}
 }
 
-// stillHere re-reads coverage and reports whether the watch belongs where it
-// is. A change that moves another repository leaves this watch alone.
-func (w *coverWatch) stillHere(onSubdaemon bool) bool {
-	_, covered, _, _ := w.s.Reg.coverageRoute(w.t)
-	if w.forceHub {
-		return !onSubdaemon
+// route reads coverage and reports whether the watch belongs on the
+// sub-daemon p.
+func (w *coverWatch) route() (p *remote.Provider, lastEvent time.Time, onSubdaemon bool) {
+	p, covered, last, _ := w.s.Reg.coverageRoute(w.t)
+	if !covered {
+		w.forceHub = false
+		return p, last, false
 	}
-	return covered == onSubdaemon
+	if w.forceHub && w.s.Reg.cov.Epoch(p.Name()) == w.servedEpoch {
+		return p, last, false
+	}
+	return p, last, true
+}
+
+// stillHere reports whether the watch belongs where it is. A change that
+// moves another repository leaves this watch alone.
+func (w *coverWatch) stillHere(onSubdaemon bool) bool {
+	_, _, sub := w.route()
+	return sub == onSubdaemon
 }
 
 func (w *coverWatch) serveHub(changed <-chan struct{}) phase {
@@ -126,6 +144,7 @@ func (w *coverWatch) serveHub(changed <-chan struct{}) phase {
 		w.send(noticeUpdate(w.t, fmt.Sprintf("⚠️ the hub could not serve %s (%v)", w.t, err)))
 		return phaseEnded
 	}
+	pending := false // a change arrived mid-batch
 	for {
 		select {
 		case u, ok := <-ch:
@@ -135,9 +154,17 @@ func (w *coverWatch) serveHub(changed <-chan struct{}) phase {
 			if !w.deliver(u, mode) {
 				return phaseEnded
 			}
+			if pending && !w.midBatch {
+				pending = false
+				if !w.stillHere(false) {
+					return phaseMoved
+				}
+			}
 		case <-changed:
 			changed = w.s.Reg.cov.Changed()
-			if !w.stillHere(false) {
+			if w.midBatch {
+				pending = true
+			} else if !w.stillHere(false) {
 				return phaseMoved
 			}
 		case <-w.ctx.Done():
@@ -177,6 +204,7 @@ func (w *coverWatch) serveSubdaemon(p *remote.Provider, last time.Time, changed 
 		timer.Stop()
 	}
 	defer timer.Stop()
+	pending := false // a change arrived mid-batch
 	for {
 		select {
 		case u, ok := <-stream:
@@ -184,15 +212,24 @@ func (w *coverWatch) serveSubdaemon(p *remote.Provider, last time.Time, changed 
 				if w.ctx.Err() != nil {
 					return phaseEnded
 				}
+				w.midBatch = false
 				w.notice(fmt.Sprintf("⚠️ sub-daemon %s stopped serving %s; polling it through the hub instead", p.Name(), w.t))
 				return phaseDied
 			}
 			if !w.deliver(u, mode) {
 				return phaseEnded
 			}
+			if pending && !w.midBatch {
+				pending = false
+				if !w.stillHere(true) {
+					return phaseMoved
+				}
+			}
 		case <-changed:
 			changed = w.s.Reg.cov.Changed()
-			if !w.stillHere(true) {
+			if w.midBatch {
+				pending = true
+			} else if !w.stillHere(true) {
 				return phaseMoved
 			}
 		case <-timer.C:
