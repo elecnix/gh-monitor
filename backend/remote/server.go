@@ -30,6 +30,9 @@ type ServerConfig struct {
 	Comments  backend.CommentActor
 	Draft     backend.DraftActor
 	Reactions backend.ReactionActor
+	// Coverage serves the coverage stream. Optional; declaring it is what
+	// lets the daemon route by repository instead of by kind.
+	Coverage CoverageSource
 	// Resumable is announced in the hello: a dropped watch stream may be
 	// re-established by re-sending the request with the same ResumeID.
 	Resumable bool
@@ -37,6 +40,13 @@ type ServerConfig struct {
 	// handled=false to let Serve answer "unsupported op" as usual. The
 	// shared-poller daemon uses this for its upgrade handoff (issue #73).
 	HandleOp func(ctx context.Context, conn io.ReadWriter, req Request) (handled bool, err error)
+}
+
+// CoverageSource streams a server's coverage entries: its full set first,
+// then a change each time a repository gains or loses coverage. The channel
+// closes when ctx is cancelled or the source ends.
+type CoverageSource interface {
+	Coverage(ctx context.Context) (<-chan CoverageEntry, error)
 }
 
 func (c ServerConfig) capabilities() []backend.Capability {
@@ -61,6 +71,9 @@ func (c ServerConfig) capabilities() []backend.Capability {
 	}
 	if c.Reactions != nil {
 		caps = append(caps, backend.CapReactions)
+	}
+	if c.Coverage != nil {
+		caps = append(caps, backend.CapCoverage)
 	}
 	return caps
 }
@@ -117,6 +130,8 @@ func Serve(ctx context.Context, conn io.ReadWriter, cfg ServerConfig) error {
 		return serveWatch(ctx, conn, cfg, req)
 	case OpRead:
 		return serveRead(ctx, conn, cfg, req)
+	case OpCoverage:
+		return serveCoverage(ctx, conn, cfg)
 	}
 	if cfg.HandleOp != nil {
 		if handled, err := cfg.HandleOp(ctx, conn, req); handled {
@@ -172,4 +187,28 @@ func serveRead(ctx context.Context, conn io.Writer, cfg ServerConfig, req Reques
 		raw = b
 	}
 	return writeJSON(conn, Frame{Status: raw})
+}
+
+func serveCoverage(ctx context.Context, conn io.Writer, cfg ServerConfig) error {
+	if cfg.Coverage == nil {
+		return writeJSON(conn, Frame{Error: fmt.Sprintf("backend %q does not provide coverage", cfg.Name)})
+	}
+	ch, err := cfg.Coverage.Coverage(ctx)
+	if err != nil {
+		return writeJSON(conn, Frame{Error: err.Error()})
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case e, open := <-ch:
+			if !open {
+				return writeJSON(conn, Frame{Done: true})
+			}
+			entry := e
+			if err := writeJSON(conn, Frame{Coverage: &entry}); err != nil {
+				return err
+			}
+		}
+	}
 }

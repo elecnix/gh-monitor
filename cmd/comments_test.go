@@ -318,5 +318,15 @@ func TestMain(m *testing.M) {
 	// #73). In tests the "binary" is the test executable — never copy or
 	// exec it; tests that care stub maybeReexecFn themselves.
 	maybeReexecFn = func() error { return nil }
-	os.Exit(m.Run())
+	// A daemon with sub-daemons saves its coverage map; keep that out of the
+	// real user cache.
+	dir, err := os.MkdirTemp("", "ghm-cmd-test-*")
+	if err == nil {
+		_ = os.Setenv("GH_MONITOR_COVERAGE_FILE", filepath.Join(dir, "coverage.json"))
+	}
+	code := m.Run()
+	if err == nil {
+		_ = os.RemoveAll(dir)
+	}
+	os.Exit(code)
 }

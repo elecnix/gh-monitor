@@ -44,6 +44,10 @@ type State struct {
 	Version int           `json:"version"`
 	Pollers []PollerState `json:"pollers,omitempty"`
 	Resumes []ResumeState `json:"resumes,omitempty"`
+	// Coverage is the daemon's per-repository sub-daemon coverage map, opaque
+	// to the hub. It rides the handoff so the successor routes covered
+	// repositories without waiting for the sub-daemons to report again.
+	Coverage json.RawMessage `json:"coverage,omitempty"`
 }
 
 // PollerState is one watched identity's continuity. Latest is the raw fetch

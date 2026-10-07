@@ -29,6 +29,9 @@ import (
 //     idle-backoff ceiling, or ""/"0"/"false" to keep the --interval
 //     flag/built-in default. Null resets and removes from the file; invalid
 //     specs are rejected at set time.
+//   - "coveredSafetyInterval": string. How long a repository a sub-daemon
+//     covers may stay quiet before the daemon fetches an active watch on it
+//     once (default "30m"; "0"/"false" turns the check off). Null resets.
 //   - "pollWhenBrokerHealthy": bool (issue #90, default true). false suspends
 //     the daemon's timer-driven fetching while the broker wake path reports
 //     healthy; a degrade resumes polling immediately. Null resets to true.
@@ -117,13 +120,15 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				}
 				stored.SelfUpdate = &s
 			}
-		case "pollInterval", "idlePollCeiling":
+		case "pollInterval", "idlePollCeiling", "coveredSafetyInterval":
 			if string(v) == "null" {
 				switch key {
 				case "pollInterval":
 					stored.PollInterval = nil
 				case "idlePollCeiling":
 					stored.IdlePollCeiling = nil
+				case "coveredSafetyInterval":
+					stored.CoveredSafetyInterval = nil
 				}
 			} else {
 				var s string
@@ -140,6 +145,8 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 					stored.PollInterval = &s
 				case "idlePollCeiling":
 					stored.IdlePollCeiling = &s
+				case "coveredSafetyInterval":
+					stored.CoveredSafetyInterval = &s
 				}
 			}
 		case "pollWhenBrokerHealthy":
@@ -179,7 +186,7 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				stored.EventLog = &cfg
 			}
 		default:
-			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, pollWhenBrokerHealthy, reactOnNotify, eventLog)", key)
+			return Preferences{}, fmt.Errorf("unknown preference key: %q (valid: templates, ignoredBots, retriggerComments, selfUpdate, pollInterval, idlePollCeiling, coveredSafetyInterval, pollWhenBrokerHealthy, reactOnNotify, eventLog)", key)
 		}
 	}
 
@@ -277,6 +284,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.IdlePollCeiling != nil {
 		prefs.IdlePollCeiling = *stored.IdlePollCeiling
+	}
+	if stored.CoveredSafetyInterval != nil {
+		prefs.CoveredSafetyInterval = *stored.CoveredSafetyInterval
 	}
 	if stored.PollWhenBrokerHealthy != nil {
 		prefs.PollWhenBrokerHealthy = *stored.PollWhenBrokerHealthy

@@ -392,6 +392,7 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 		"prLabel":     fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number),
 		"prUrl":       fmt.Sprintf("https://%s/%s/%s/pull/%d", host, id.Owner, id.Repo, id.Number),
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
@@ -817,4 +818,13 @@ func degradedLabel(opts RunOptions) string {
 	default:
 		return fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number)
 	}
+}
+
+// pollMode is how the first-poll message says the watch is served: the mode
+// the daemon's router reported, or the client's own polling interval.
+func pollMode(ev Event, interval time.Duration) string {
+	if ev.PollMode != "" {
+		return ev.PollMode
+	}
+	return fmt.Sprintf("polling every %ds", int(interval.Seconds()))
 }

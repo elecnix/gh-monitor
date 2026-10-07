@@ -95,6 +95,12 @@ type Event struct {
 	// truncated, so a consumer can view the full set.
 	AnnotationsURL string `json:"annotations_url,omitempty"`
 
+	// PollMode describes how the watch is being served, for the first-poll
+	// message: "webhook via broker-subscriber, safety check every 30m" or
+	// "polling every 300s, repository has no webhook coverage". Empty means
+	// the client's own polling interval applies.
+	PollMode string `json:"poll_mode,omitempty"`
+
 	// DegradedSurface is set on EventDegraded to indicate which API surface
 	// could not be read: "rest", "graphql", or "both".
 	DegradedSurface string `json:"degraded_surface,omitempty"`

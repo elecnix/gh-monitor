@@ -224,6 +224,36 @@ claim every kind — a strong claim, since everything will then be routed to you
 | `{"done":true}`    | End of stream. The watch finished.                          |
 | `{"error":"..."}`  | End of stream with a failure; reported as a degraded event. |
 
+### Coverage
+
+A webhook-driven sub-daemon only hears about repositories whose webhooks reach
+it. Declare the `coverage` capability and the daemon routes a repository's
+watches to you only while you vouch for that repository. It polls every other
+repository itself.
+
+```
+server → {"protocol":1,"name":"relay","capabilities":["source","coverage"],"kinds":["pr"]}
+client → {"op":"coverage"}
+server → {"coverage":{"repo":"owner/repo","covered":true,"last_event":"2026-01-01T00:00:00Z"}}
+server → {"coverage":{"synced":true}}
+server → {"coverage":{"repo":"owner/other","covered":true}}
+server → {"coverage":{"repo":"owner/repo","covered":false}}
+server → {"coverage":{"degraded":true}}
+```
+
+Send your full set first, one entry per covered repository, then
+`{"synced":true}` to end it; the daemon forgets any repository it held for you
+that the set left out. After that, send one entry whenever a repository gains
+or loses coverage. Refresh `last_event` at most once a minute per repository;
+the daemon's safety timer reads it. An entry with no `repo` describes you as a
+whole: `{"degraded":true}` says your event source is down, and the daemon
+takes your repositories back once that lasts two minutes. Send
+`{"degraded":false}` when it recovers.
+
+Report a repository once you receive any event for it, or once your source
+declares it registered, such as with a retained broker message. A server
+without the capability keeps routing by kind.
+
 ### Mutation ops
 
 Mutations use the same request/response shape: one request in, one frame out.

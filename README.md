@@ -522,6 +522,18 @@ The daemon can launch and supervise **sub-daemon** processes configured by the o
 
 **gh-monitor owns the socket; sub-daemons are routed sources** ([#88](https://github.com/elecnix/gh-monitor/issues/88)). Earlier releases (v1.19.0–v1.22.0) conceded `$GH_MONITOR_SOCK` to whichever sub-daemon bound it, which left every target kind that sub-daemon did not serve unservable. Now the daemon always binds the public socket itself and runs the polling hub; each child is launched with `GH_MONITOR_SOCK` pointed at a private per-entry socket (`<daemon-socket dir>/subdaemon-<name>.sock`, so no change is needed in the sub-daemon binary), the daemon discovers which kinds each live child serves from its protocol hello, and watches for those kinds are routed to the child while every other kind — and every resumable watch, whose history lives in the hub — is served by the polling hub on the public socket. A child that dies is restarted by the supervisor, and while it is down its kinds fall back to hub polling: degraded-but-covered instead of unmonitored.
 
+##### Sub-daemon coverage is per-repository ([#173](https://github.com/elecnix/gh-monitor/issues/173))
+
+A webhook-driven sub-daemon only hears about repositories whose webhooks reach it, so routing a whole kind to it leaves a pull request in any other repository without updates after its backlog. A sub-daemon that declares the `coverage` capability in its hello is routed by repository instead (the protocol is in [`docs/BACKENDS.md`](docs/BACKENDS.md#coverage)):
+
+- A repository starts uncovered, and the hub polls it at the normal cadence.
+- It becomes covered when the sub-daemon reports it, after any event for it or when its source declares it registered. The watch then moves to the sub-daemon with one catch-up fetch, and the hub stops polling it.
+- It loses coverage when the sub-daemon withdraws it, stays `degraded` for two minutes, or exits. The watch moves back to the hub with one catch-up fetch.
+- A covered repository with no event for `coveredSafetyInterval` (default `30m`, `0` turns it off) gets one safety fetch per active watch. Any event resets the timer, so a busy repository never triggers one.
+- The daemon saves the coverage map to `coverage.json` in the user cache directory, and passes it to a successor over the upgrade handoff. Entries older than `GH_MONITOR_BROKER_COVERAGE_TTL` (default 6 hours) are dropped on load. A stale entry delays a watch by at most the safety interval.
+
+The first-poll message says which mode serves the watch, such as `(webhook via broker-subscriber, safety check every 30m)` or `(polling every 300s, repository has no webhook coverage)`. A sub-daemon without the capability keeps per-kind routing.
+
 Configure it with a line-delimited file, one sub-daemon per line (`<name> <executable> [args...]`, `#` comments and blank lines ignored, double-quoted fields may contain spaces):
 
 ```sh
