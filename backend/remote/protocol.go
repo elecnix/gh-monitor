@@ -78,7 +78,30 @@ const (
 	OpWatch = "watch"
 	// OpRead asks for the target's current status, once.
 	OpRead = "read"
+	// OpCoverage opens a long-lived stream of per-repository coverage
+	// entries. Only a server that declares CapCoverage serves it.
+	OpCoverage = "coverage"
 )
+
+// CoverageEntry is one frame of the coverage stream. A server sends its full
+// set first, one entry per covered repository, then one entry each time a
+// repository gains or loses coverage. It refreshes LastEvent for a covered
+// repository at most once a minute.
+//
+//	{"repo":"owner/repo","covered":true,"last_event":"2026-01-01T00:00:00Z"}
+//
+// An entry with an empty Repo describes the whole server. Degraded reports
+// that its event source is down, and the daemon stops trusting every
+// repository it covers once that outlasts a grace period. Synced marks the
+// end of the full set: the daemon then forgets any repository the server
+// covered on an earlier stream and did not repeat.
+type CoverageEntry struct {
+	Repo      string    `json:"repo,omitempty"`
+	Covered   bool      `json:"covered"`
+	LastEvent time.Time `json:"last_event,omitzero"`
+	Degraded  bool      `json:"degraded,omitempty"`
+	Synced    bool      `json:"synced,omitempty"`
+}
 
 // Hello is the server's opening frame, declaring what it provides.
 type Hello struct {
@@ -120,6 +143,8 @@ type Frame struct {
 	Done bool `json:"done,omitempty"`
 	// Result carries a mutation's return value, encoded as JSON.
 	Result json.RawMessage `json:"result,omitempty"`
+	// Coverage carries one coverage entry (OpCoverage).
+	Coverage *CoverageEntry `json:"coverage,omitempty"`
 }
 
 // writeJSON writes one newline-delimited JSON frame.
@@ -197,4 +222,5 @@ var knownCapabilities = map[backend.Capability]bool{
 	backend.CapComments:  true,
 	backend.CapDraft:     true,
 	backend.CapReactions: true,
+	backend.CapCoverage:  true,
 }

@@ -36,6 +36,7 @@ The document shape:
     "selfUpdate":           "30m" | "1" | "" | null,
     "pollInterval":         "10m" | "" | null,
     "idlePollCeiling":      "6h" | "" | null,
+    "coveredSafetyInterval": "30m" | "0" | "" | null,
     "pollWhenBrokerHealthy": true | false | null,
     "reactOnNotify":        true | false | null,
     "eventLog":             { "dir": "/path", "keepDays": 10 } | null
@@ -54,6 +55,10 @@ duration ("10m"), or ""/"0"/"false"/null to keep the flag/default.
   idlePollCeiling caps the exponential idle backoff for every target — busy
 or quiet, broker-healthy or not — replacing the built-in 300s ceiling. A Go
 duration ("6h"), or ""/"0"/"false"/null for the default.
+
+  coveredSafetyInterval (default 30m) bounds how long a repository that a
+sub-daemon covers may stay quiet before the daemon fetches an active watch on
+it once. "0" or "false" turns the check off; null resets to the default.
 
   pollWhenBrokerHealthy (default true): false suspends timer-driven fetching
 entirely while the broker wake path reports healthy; a degrade resumes
@@ -130,7 +135,7 @@ func runPrefsGet(cmd *cobra.Command, opts *prefsOptions) error {
 // daemonReadPrefKeys are the settings only the resident daemon reads: they
 // take effect when a daemon starts, not when the file is written. Listed in
 // one place so the prefs-set hint and any future reader stay in sync.
-var daemonReadPrefKeys = []string{"selfUpdate", "pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy"}
+var daemonReadPrefKeys = []string{"selfUpdate", "pollInterval", "idlePollCeiling", "coveredSafetyInterval", "pollWhenBrokerHealthy"}
 
 // warnDaemonRestartHint prints a stderr hint (stdout stays clean JSON for
 // callers that pipe it) when an override touches a daemon-read key, naming

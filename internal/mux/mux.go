@@ -66,6 +66,9 @@ type Registry struct {
 	tracks  map[string]remote.Transport // entry name -> how to reach it
 	live    map[string]*remote.Provider // entry name -> last successful hello
 	serving map[string][]backend.Kind   // entry name -> kinds announced (for change logs)
+
+	cov     *CoverageMap                  // per-repository coverage; nil disables coverage routing
+	streams map[string]context.CancelFunc // entry name -> its running coverage stream
 }
 
 // NewRegistry builds a registry that logs discovery transitions to out.
@@ -78,7 +81,16 @@ func NewRegistry(out io.Writer) *Registry {
 		tracks:  map[string]remote.Transport{},
 		live:    map[string]*remote.Provider{},
 		serving: map[string][]backend.Kind{},
+		streams: map[string]context.CancelFunc{},
 	}
+}
+
+// SetCoverage turns on per-repository routing for sub-daemons that declare
+// the coverage capability. Without it every sub-daemon routes by kind.
+func (r *Registry) SetCoverage(m *CoverageMap) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cov = m
 }
 
 // Track registers one sub-daemon entry for probing. Track is safe to call
@@ -110,7 +122,16 @@ func (r *Registry) Probe(ctx context.Context) {
 				delete(r.live, name)
 				delete(r.serving, name)
 			}
+			cancelStream := r.streams[name]
+			delete(r.streams, name)
+			cov := r.cov
 			r.mu.Unlock()
+			if cancelStream != nil {
+				cancelStream()
+			}
+			if wasLive && cov != nil {
+				cov.Poke() // its covered repositories move back to the hub
+			}
 			if wasLive {
 				_, _ = fmt.Fprintf(r.out, "gh-monitor daemon: sub-daemon %q stopped answering; its kinds fall back to the polling hub\n", name)
 			}
@@ -121,7 +142,17 @@ func (r *Registry) Probe(ctx context.Context) {
 		prev, wasLive := r.serving[name]
 		r.live[name] = prov
 		r.serving[name] = kinds
+		cov := r.cov
+		_, streaming := r.streams[name]
+		if cov != nil && prov.HasCoverage() && !streaming {
+			sctx, cancel := context.WithCancel(ctx)
+			r.streams[name] = cancel
+			go r.runCoverage(sctx, prov, cov)
+		}
 		r.mu.Unlock()
+		if cov != nil && !wasLive {
+			cov.Poke() // a sub-daemon that comes up may cover watches the hub holds
+		}
 		changed := !sameKinds(prev, kinds)
 		if !wasLive || changed {
 			_, _ = fmt.Fprintf(r.out, "gh-monitor daemon: sub-daemon %q (%s) serves %s — watches for those kinds route to it\n",
@@ -217,4 +248,73 @@ func renderKinds(kinds []backend.Kind) string {
 		quoted[i] = string(k)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// runCoverage keeps one sub-daemon's coverage stream open, reconnecting with
+// a bounded backoff, and applies what it reports to the map. The stream ends
+// when ctx is cancelled, which is when the sub-daemon stops answering probes.
+func (r *Registry) runCoverage(ctx context.Context, prov *remote.Provider, cov *CoverageMap) {
+	name := prov.Name()
+	backoff := 250 * time.Millisecond
+	for ctx.Err() == nil {
+		ch, err := prov.Coverage(ctx)
+		if err == nil {
+			backoff = 250 * time.Millisecond
+			seen := map[string]bool{}
+			for e := range ch {
+				if e.Synced {
+					cov.Retain(name, seen)
+					continue
+				}
+				if e.Repo != "" && e.Covered {
+					seen[strings.ToLower(e.Repo)] = true
+				}
+				cov.Apply(name, e)
+			}
+			cov.Poke()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, 5*time.Second)
+	}
+}
+
+// coverageRoute resolves where a watch on t belongs when its provider
+// declares the coverage capability: ok=false means the target routes by kind
+// as before. covered is true when the provider is live and has reported the
+// target's repository, and lastEvent is when it last saw an event there.
+func (r *Registry) coverageRoute(t backend.Target) (p *remote.Provider, covered bool, lastEvent time.Time, ok bool) {
+	r.mu.RLock()
+	cov := r.cov
+	r.mu.RUnlock()
+	if cov == nil || t.Owner == "" || t.Repo == "" {
+		return nil, false, time.Time{}, false
+	}
+	p = r.Provider(t.Kind)
+	if p == nil || !p.HasCoverage() {
+		return nil, false, time.Time{}, false
+	}
+	daemon, last, has := cov.Covered(t.Owner, t.Repo)
+	return p, has && daemon == p.Name(), last, true
+}
+
+// routesByCoverage reports whether a continuous watch on t takes the
+// coverage path. Besides a live provider with the capability, that includes
+// a repository the map knows while no sub-daemon serves t's kind yet, such
+// as in the first probe interval after a start: the hub serves the watch
+// until the sub-daemon comes up, then hands it over.
+func (r *Registry) routesByCoverage(t backend.Target) bool {
+	if _, _, _, ok := r.coverageRoute(t); ok {
+		return true
+	}
+	r.mu.RLock()
+	cov := r.cov
+	r.mu.RUnlock()
+	if cov == nil || t.Owner == "" || t.Repo == "" || r.Provider(t.Kind) != nil {
+		return false
+	}
+	return cov.Known(t.Owner, t.Repo)
 }

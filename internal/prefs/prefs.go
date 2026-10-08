@@ -67,8 +67,33 @@ type Preferences struct {
 	PollInterval          string            `json:"pollInterval,omitempty"`
 	IdlePollCeiling       string            `json:"idlePollCeiling,omitempty"`
 	PollWhenBrokerHealthy bool              `json:"pollWhenBrokerHealthy"`
-	ReactOnNotify         bool              `json:"reactOnNotify"`
-	EventLog              *EventLogConfig   `json:"eventLog,omitempty"`
+	// CoveredSafetyInterval is how long a repository a sub-daemon covers may
+	// go without an event before the daemon fetches an active watch on it
+	// once. Unset means DefaultCoveredSafetyInterval; "0" or "false" turns
+	// the check off.
+	CoveredSafetyInterval string          `json:"coveredSafetyInterval,omitempty"`
+	ReactOnNotify         bool            `json:"reactOnNotify"`
+	EventLog              *EventLogConfig `json:"eventLog,omitempty"`
+}
+
+// DefaultCoveredSafetyInterval is the coveredSafetyInterval default.
+const DefaultCoveredSafetyInterval = 30 * time.Minute
+
+// CoveredSafetyInterval interprets a coveredSafetyInterval preference value.
+// Unlike the cadence keys, "0" and "false" mean off, because a covered
+// repository has no other timer to fall back on; anything unparseable keeps
+// the default, so a typo never disables the safety net.
+func CoveredSafetyInterval(spec string) time.Duration {
+	switch spec {
+	case "":
+		return DefaultCoveredSafetyInterval
+	case "0", "false":
+		return 0
+	}
+	if d, err := time.ParseDuration(spec); err == nil && d > 0 {
+		return d
+	}
+	return DefaultCoveredSafetyInterval
 }
 
 // DefaultIdlePollCeiling is the idle-backoff ceiling used when idlePollCeiling
@@ -91,7 +116,7 @@ var defaultTemplates = map[string]string{
 	"new-commit":               "📝 New commit {commitShortOid} pushed to {prLabel} by {commitAuthor}. Review the PR description to ensure it still reflects the latest changes.",
 	"merged":                   "🔀 PR {prLabel} was merged. Monitoring stopped.",
 	"closed":                   "❌ PR {prLabel} was closed. Monitoring stopped.",
-	"first-poll":               "📡 Monitoring {prLabel} (polling every {intervalSec}s)",
+	"first-poll":               "📡 Monitoring {prLabel} ({pollMode})",
 	"all-clear":                "✨ {prLabel} — open, all clear",
 	"issue-closed":             "❌ Issue {prLabel} was closed. Monitoring stopped.",
 	"issue-reopened":           "🔄 Issue {prLabel} was reopened.",
@@ -229,6 +254,7 @@ var recognizedTokens = map[string]bool{
 	"failingChecks":         true,
 	"conflict":              true,
 	"intervalSec":           true,
+	"pollMode":              true,
 	"reviewAuthor":          true,
 	"commitOid":             true,
 	"commitShortOid":        true,
@@ -391,6 +417,7 @@ type storedPreferences struct {
 	PollInterval          *string            `json:"pollInterval,omitempty"`
 	IdlePollCeiling       *string            `json:"idlePollCeiling,omitempty"`
 	PollWhenBrokerHealthy *bool              `json:"pollWhenBrokerHealthy,omitempty"`
+	CoveredSafetyInterval *string            `json:"coveredSafetyInterval,omitempty"`
 	ReactOnNotify         *bool              `json:"reactOnNotify,omitempty"`
 	EventLog              *EventLogConfig    `json:"eventLog,omitempty"`
 }

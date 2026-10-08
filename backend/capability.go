@@ -11,6 +11,10 @@ const (
 	CapSource Capability = "source"
 	// CapReader means the backend returns the current Status (queries).
 	CapReader Capability = "reader"
+	// CapCoverage means the backend reports, per repository, whether it is
+	// receiving events for it. The daemon routes a repository's watches to
+	// the backend only while it reports the repository as covered.
+	CapCoverage Capability = "coverage"
 )
 
 // Source delivers Updates for a Target. It is the notification capability.
@@ -59,4 +63,5 @@ func (f ReaderFunc) Read(ctx context.Context, t Target) (Status, error) { return
 var allCapabilities = []Capability{
 	CapSource, CapReader,
 	CapThreads, CapReview, CapComments, CapDraft, CapReactions,
+	CapCoverage,
 }

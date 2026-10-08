@@ -44,10 +44,26 @@ type RoutingSource struct {
 	Reg *Registry
 	// Fallback serves everything no live sub-daemon covers: the hubSource.
 	Fallback backend.Source
+	// SafetyInterval is how long a covered repository may go without an
+	// event before the hub fetches an active watch on it once. Zero turns
+	// the safety fetch off.
+	SafetyInterval time.Duration
+	// HubInterval is the hub's polling cadence, quoted in the first-poll
+	// message of a watch the hub serves.
+	HubInterval time.Duration
 }
 
 // Watch implements backend.Source with the routing described above.
 func (s RoutingSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
+	if s.Reg != nil && !opts.Once {
+		if s.Reg.routesByCoverage(t) {
+			ch := s.coverageWatch(ctx, t, opts)
+			if opts.Timeout > 0 {
+				ch = relayWithTimeout(ctx, ch, opts.Timeout)
+			}
+			return ch, nil
+		}
+	}
 	if s.Reg != nil {
 		if p := s.Reg.Provider(t.Kind); p != nil && !opts.Once {
 			ch := s.handOff(ctx, t, opts, p)

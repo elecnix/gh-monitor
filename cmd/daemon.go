@@ -199,6 +199,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: sub-daemon config: %v\n", subErr)
 	}
 	var routes *mux.Registry
+	var coverage *mux.CoverageMap
 	var launcherDone <-chan struct{}
 	if cfgOK && len(entries) > 0 {
 		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
@@ -226,6 +227,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	listener, adopted, err := listenOrAdopt(ctx, socket)
 	if err != nil {
 		return err
+	}
+	if routes != nil {
+		coverage = startCoverageMap(ctx, cmd, routes, adopted)
 	}
 	// Closing the listener is what unblocks Accept when the daemon stops —
 	// the signal goroutine above only cancels, because it is registered
@@ -299,6 +303,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		hub:       h,
 		listener:  listener,
 		routes:    routes,
+		coverage:  coverage,
+		interval:  interval,
+		safety:    prefs.CoveredSafetyInterval(daemonPrefs.CoveredSafetyInterval),
 		handedOff: &handedOff,
 		shutdown:  func() { cancel(); _ = listener.Close() },
 	}
@@ -368,6 +375,9 @@ func (srv *daemonServer) handleHandoffOp(ctx context.Context, conn io.ReadWriter
 	switch req.Op {
 	case handoff.OpHandoff:
 		state := srv.hub.ExportState()
+		if srv.coverage != nil {
+			state.Coverage = srv.coverage.Export()
+		}
 		raw, err := json.Marshal(state)
 		if err != nil {
 			_ = remote.WriteFrame(conn, remote.Frame{Error: fmt.Sprintf("encode handoff state: %v", err)})
@@ -555,6 +565,9 @@ type daemonServer struct {
 	hub       *hub.Hub
 	listener  net.Listener
 	routes    *mux.Registry
+	coverage  *mux.CoverageMap // per-repository coverage; nil without sub-daemons
+	interval  time.Duration    // the hub's polling cadence, quoted in first-poll messages
+	safety    time.Duration    // coveredSafetyInterval; 0 turns the safety fetch off
 	handedOff *atomic.Bool
 	shutdown  func()
 }
@@ -568,7 +581,10 @@ func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 	if srv.routes != nil {
 		// Sub-daemon kinds go to their owning sub-daemon, and the hub serves
 		// everything else (issue #114 routes resumable watches too).
-		src = mux.RoutingSource{Reg: srv.routes, Fallback: hubSource{hub: srv.hub}}
+		src = mux.RoutingSource{
+			Reg: srv.routes, Fallback: hubSource{hub: srv.hub},
+			SafetyInterval: srv.safety, HubInterval: srv.interval,
+		}
 	}
 	cfg := remote.ServerConfig{
 		Name:   DaemonBackendName,
@@ -658,4 +674,57 @@ func spawnDaemon(socket string, interval time.Duration) error {
 	// Release the child so it is not reaped when this client exits.
 	_ = cmd.Process.Release()
 	return nil
+}
+
+// coverageFile is where the daemon keeps the coverage map between runs:
+// $GH_MONITOR_COVERAGE_FILE, else coverage.json in the user cache directory.
+func coverageFile() string {
+	if p := os.Getenv("GH_MONITOR_COVERAGE_FILE"); p != "" {
+		return p
+	}
+	base, err := os.UserCacheDir()
+	if err != nil {
+		home, _ := os.UserHomeDir()
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "gh-monitor", "coverage.json")
+}
+
+// startCoverageMap builds the per-repository coverage map for a daemon with
+// sub-daemons: it loads what the last run (or the predecessor daemon, over
+// the upgrade handoff) knew, hands it to the registry, and saves it again
+// whenever it changes. A map that cannot be read starts empty, which fails
+// towards polling.
+func startCoverageMap(ctx context.Context, cmd *cobra.Command, routes *mux.Registry, adopted *hub.State) *mux.CoverageMap {
+	m := mux.NewCoverageMap(broker.CoverageTTLFromEnv(broker.DefaultCoverageTTL), mux.DefaultDegradedGrace)
+	path := coverageFile()
+	if err := m.Load(path); err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: ignoring unreadable coverage map %s (%v)\n", path, err)
+	}
+	if adopted != nil {
+		m.Import(adopted.Coverage)
+	}
+	if n := len(m.Snapshot()); n > 0 {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: %d repositories had sub-daemon coverage before this start; they route to it until it reports otherwise\n", n)
+	}
+	routes.SetCoverage(m)
+	go func() {
+		save := func() {
+			if err := m.Save(path); err != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: could not save the coverage map (%v)\n", err)
+			}
+		}
+		for {
+			changed := m.Changed()
+			select {
+			case <-ctx.Done():
+				save()
+				return
+			case <-changed:
+				time.Sleep(time.Second) // coalesce a burst, such as a full set arriving
+				save()
+			}
+		}
+	}()
+	return m
 }

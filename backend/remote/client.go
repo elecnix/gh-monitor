@@ -275,3 +275,58 @@ func (p *Provider) Read(ctx context.Context, t backend.Target) (backend.Status, 
 	}
 	return backend.DecodeStatus(t.Kind, frame.Status)
 }
+
+// HasCoverage reports whether the server declared the coverage capability.
+func (p *Provider) HasCoverage() bool { return p.hello.has(backend.CapCoverage) }
+
+// Coverage opens the coverage stream. The channel delivers the server's full
+// set first, then each change, and closes when the stream ends for any reason
+// or ctx is cancelled. A caller that sees it close treats the server's
+// coverage as unknown and reconnects.
+func (p *Provider) Coverage(ctx context.Context) (<-chan CoverageEntry, error) {
+	if !p.HasCoverage() {
+		return nil, fmt.Errorf("%s does not provide coverage", p.hello.Name)
+	}
+	conn, err := p.transport.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	if _, err := readHello(ctx, conn, br); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read hello from %s: %w", p.transport, err)
+	}
+	if err := writeJSON(conn, Request{Op: OpCoverage}); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("send coverage request to %s: %w", p.transport, err)
+	}
+	out := make(chan CoverageEntry, 16)
+	go func() {
+		defer close(out)
+		done := make(chan struct{})
+		defer close(done)
+		defer func() { _ = conn.Close() }()
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = conn.Close()
+			case <-done:
+			}
+		}()
+		for {
+			var f Frame
+			if err := readJSON(br, &f); err != nil || f.Error != "" || f.Done {
+				return
+			}
+			if f.Coverage == nil {
+				continue
+			}
+			select {
+			case out <- *f.Coverage:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
