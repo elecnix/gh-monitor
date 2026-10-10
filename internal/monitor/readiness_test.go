@@ -1,12 +1,86 @@
 package monitor
 
 import (
-	"fmt"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// noReadinessSleep replaces the retry backoff for one test and restores it.
+func noReadinessSleep(t *testing.T) {
+	t.Helper()
+	original := readinessRetrySleep
+	readinessRetrySleep = func(time.Duration) {}
+	t.Cleanup(func() { readinessRetrySleep = original })
+}
+
+// readinessPage builds one readiness response page with the given cursor state.
+func readinessPage(nodes int, hasNext bool, cursor string) ReadinessQueryResponse {
+	var resp ReadinessQueryResponse
+	resp.Repository.PullRequests.TotalCount = nodes
+	resp.Repository.PullRequests.PageInfo = PageInfo{HasNextPage: hasNext, EndCursor: cursor}
+	for i := 0; i < nodes; i++ {
+		resp.Repository.PullRequests.Nodes = append(resp.Repository.PullRequests.Nodes, ReadinessPR{Number: i + 1})
+	}
+	return resp
+}
+
+func TestFetchReadinessRetriesTransientServerError(t *testing.T) {
+	noReadinessSleep(t)
+	var calls []map[string]interface{}
+	api := &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		calls = append(calls, variables)
+		switch len(calls) {
+		case 1:
+			return assign(result, readinessPage(1, true, "c1"))
+		case 2:
+			return &ghcli.APIError{StatusCode: 502, Message: "gh: HTTP 502"}
+		default:
+			return assign(result, readinessPage(1, false, ""))
+		}
+	}}
+	svc := &Service{API: api}
+	got, err := svc.FetchReadiness("octocat", "hello")
+	require.NoError(t, err)
+	assert.Len(t, got.Repository.PullRequests.Nodes, 2)
+	require.Len(t, calls, 3)
+	assert.Equal(t, 25, calls[2]["first"])
+	assert.Equal(t, "c1", calls[2]["after"])
+}
+
+func TestFetchReadinessBoundsTransientServerErrorRetries(t *testing.T) {
+	noReadinessSleep(t)
+	calls := 0
+	var sizes []int
+	api := &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		calls++
+		sizes = append(sizes, variables["first"].(int))
+		return &ghcli.APIError{StatusCode: 502, Message: "gh: HTTP 502"}
+	}}
+	svc := &Service{API: api}
+	_, err := svc.FetchReadiness("octocat", "hello")
+	require.Error(t, err)
+	// Three attempts per page size (one try and two retries) at 25, 12 and 6.
+	assert.LessOrEqual(t, calls, 9, "retries must be bounded")
+	assert.Contains(t, sizes, 12, "exhausted retries must shrink the page size")
+}
+
+func TestFetchReadinessReturnsNonTransientErrorAtOnce(t *testing.T) {
+	noReadinessSleep(t)
+	calls := 0
+	api := &fakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		calls++
+		return errors.New("boom")
+	}}
+	svc := &Service{API: api}
+	_, err := svc.FetchReadiness("octocat", "hello")
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+}
 
 // ---------------------------------------------------------------------------
 // Readiness query tests
@@ -32,7 +106,9 @@ func TestFetchReadiness(t *testing.T) {
 								State:            "OPEN",
 								Mergeable:        "MERGEABLE",
 								MergeStateStatus: "CLEAN",
-								Author:           struct{ Login string `json:"login"` }{Login: "alice"},
+								Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"},
 							},
 						},
 					},
@@ -64,7 +140,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 45,
 							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-25"},
 							Nodes: []ReadinessPR{
-								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+								{Number: 1, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"}},
 							},
 						},
 					},
@@ -79,7 +157,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 45,
 							PageInfo:   PageInfo{HasNextPage: false},
 							Nodes: []ReadinessPR{
-								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+								{Number: 2, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "bob"}},
 							},
 						},
 					},
@@ -108,7 +188,7 @@ func TestFetchReadiness(t *testing.T) {
 			case 1:
 				// First attempt: pageSize 25 fails with resource limit.
 				assert.Equal(t, 25, variables["first"])
-				return fmt.Errorf("gh api error: gh: Resource limits for this query exceeded")
+				return &ghcli.GraphQLError{Errors: []ghcli.GraphQLErrorEntry{{Message: "Resource limits for this query exceeded"}}}
 			case 2:
 				// Retry: pageSize 12 succeeds.
 				assert.Equal(t, 12, variables["first"])
@@ -121,7 +201,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 41,
 							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-12"},
 							Nodes: []ReadinessPR{
-								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+								{Number: 1, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"}},
 							},
 						},
 					},
@@ -138,7 +220,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 41,
 							PageInfo:   PageInfo{HasNextPage: false},
 							Nodes: []ReadinessPR{
-								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+								{Number: 2, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "bob"}},
 							},
 						},
 					},
@@ -167,7 +251,9 @@ func makeReadinessPR(number int, author string, mergeable string, mergeStateStat
 		State:            "OPEN",
 		Mergeable:        mergeable,
 		MergeStateStatus: mergeStateStatus,
-		Author:           struct{ Login string `json:"login"` }{Login: author},
+		Author: struct {
+			Login string `json:"login"`
+		}{Login: author},
 	}
 }
 
@@ -262,7 +348,9 @@ func makeReadinessPRWithConflict(number int, author string) ReadinessPR {
 func makeReadinessPRWithReviewChanges(number int, author string) ReadinessPR {
 	rp := makeReadinessPRWithCI(number, author, "MERGEABLE", "CLEAN")
 	rp.Reviews = ReviewNodes{Nodes: []Review{
-		{State: "CHANGES_REQUESTED", Author: struct{ Login string `json:"login"` }{Login: "reviewer"}},
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "reviewer"}},
 	}}
 	return rp
 }
@@ -558,10 +646,10 @@ func TestReadinessReport_FormatZeroOpen(t *testing.T) {
 func TestReadinessReport_Reconcile(t *testing.T) {
 	t.Run("clean report passes", func(t *testing.T) {
 		report := &ReadinessReport{
-			Open:  3,
-			Ready: []PRReadiness{{Number: 1}},
+			Open:     3,
+			Ready:    []PRReadiness{{Number: 1}},
 			NotReady: []PRReadiness{{Number: 2}},
-			Others: []PRReadiness{{Number: 3}},
+			Others:   []PRReadiness{{Number: 3}},
 		}
 		assert.Empty(t, report.Reconcile())
 	})
@@ -577,8 +665,8 @@ func TestReadinessReport_Reconcile(t *testing.T) {
 
 	t.Run("duplicate across buckets fails", func(t *testing.T) {
 		report := &ReadinessReport{
-			Open:  2,
-			Ready: []PRReadiness{{Number: 1}},
+			Open:     2,
+			Ready:    []PRReadiness{{Number: 1}},
 			NotReady: []PRReadiness{{Number: 1}},
 		}
 		err := report.Reconcile()

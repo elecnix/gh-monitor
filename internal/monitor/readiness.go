@@ -1,10 +1,18 @@
 package monitor
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 )
+
+// readinessRetrySleep waits between retries of a transient server error. Tests
+// replace it so they do not sleep.
+var readinessRetrySleep = time.Sleep
 
 // ---------------------------------------------------------------------------
 // Readiness query — fetches open PRs with head-commit checkSuites in the same
@@ -135,14 +143,14 @@ type PRReadiness struct {
 
 // ReadinessReport is a repo-wide merge-readiness snapshot.
 type ReadinessReport struct {
-	Owner   string
-	Repo    string
-	Open    int
-	Viewer  string
-	Ready   []PRReadiness
+	Owner    string
+	Repo     string
+	Open     int
+	Viewer   string
+	Ready    []PRReadiness
 	NotReady []PRReadiness
-	Others  []PRReadiness
-	Unknown []PRReadiness
+	Others   []PRReadiness
+	Unknown  []PRReadiness
 
 	// Degraded is set when the fetch failed — no classification performed.
 	Degraded        bool
@@ -344,16 +352,23 @@ func readinessReasonFull(rp *ReadinessPR, status *PRStatus, viewer string) strin
 
 // readinessDefaultPageSize is the starting page size for the readiness query.
 // On repos with heavy CI (many suites/runs per commit) the first page may
-// still exceed GitHub's node budget; FetchReadiness detects the "Resource
-// limits" error and halves the page size down to a floor, adapting to the
-// repo's CI footprint rather than assuming a one-size-fits-all constant.
+// still exceed GitHub's node budget; FetchReadiness detects a query-cost
+// failure or a transient server error and halves the page size down to a
+// floor, adapting to the repo's CI footprint rather than assuming a
+// one-size-fits-all constant.
 const readinessDefaultPageSize = 25
 const readinessMinPageSize = 5
 
+// readinessRetryBackoffs are the waits before each retry of one page after a
+// transient server error. The retry reuses the same cursor. Two retries means
+// at most three attempts per page size.
+var readinessRetryBackoffs = []time.Duration{500 * time.Millisecond, time.Second}
+
 // FetchReadiness fetches all open PRs for a repo using the readiness query,
-// paginating to keep each GraphQL request under the node budget. If the
-// first page exceeds GitHub's resource limits the page size is halved and
-// retried, adapting to repos with heavier check suites.
+// paginating to keep each GraphQL request under the node budget. When a page
+// hits a query-cost limit, or still fails with HTTP 502/503/504 after its
+// retries, the page size is halved and the fetch restarts from page 1.
+// Other errors return at once.
 func (s *Service) FetchReadiness(owner, repo string) (*ReadinessQueryResponse, error) {
 	pageSize := readinessDefaultPageSize
 
@@ -365,9 +380,9 @@ func (s *Service) FetchReadiness(owner, repo string) (*ReadinessQueryResponse, e
 		// GitHub scores queries by maximum potential nodes, not actual
 		// nodes returned. A repo with 14 suites × 26 runs per commit
 		// needs a smaller page than one with 3 suites × 5 runs, even
-		// when the PR count is lower. On a resource-limit failure,
-		// halve the page size and retry.
-		if isResourceLimitError(err) && pageSize/2 >= readinessMinPageSize {
+		// when the PR count is lower. A smaller page also lightens a
+		// heavy page that GitHub answers with a plain 5xx.
+		if (IsQueryCostError(err) || isTransientServerError(err)) && pageSize/2 >= readinessMinPageSize {
 			pageSize /= 2
 			continue
 		}
@@ -375,10 +390,30 @@ func (s *Service) FetchReadiness(owner, repo string) (*ReadinessQueryResponse, e
 	}
 }
 
-// isResourceLimitError reports whether err is GitHub's "Resource limits for
-// this query exceeded" error, indicating the query's node budget was exceeded.
-func isResourceLimitError(err error) bool {
-	return strings.Contains(err.Error(), "Resource limits")
+// isTransientServerError reports whether err is an HTTP 502, 503 or 504 from
+// the gh api call. GitHub returns these for a heavy page. The check reads the
+// typed status code, never the error text.
+func isTransientServerError(err error) bool {
+	var apiErr *ghcli.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case 502, 503, 504:
+			return true
+		}
+	}
+	return false
+}
+
+// fetchReadinessPage runs one page of the readiness query. A transient server
+// error is retried with the same variables, so the same cursor is reused.
+func (s *Service) fetchReadinessPage(vars map[string]interface{}, page *ReadinessQueryResponse) error {
+	err := s.API.GraphQL(MONITOR_READINESS_QUERY, vars, page)
+	for attempt := 0; err != nil && isTransientServerError(err) && attempt < len(readinessRetryBackoffs); attempt++ {
+		readinessRetrySleep(readinessRetryBackoffs[attempt])
+		*page = ReadinessQueryResponse{}
+		err = s.API.GraphQL(MONITOR_READINESS_QUERY, vars, page)
+	}
+	return err
 }
 
 // fetchReadinessPaged runs the readiness query with a fixed page size,
@@ -398,7 +433,7 @@ func (s *Service) fetchReadinessPaged(owner, repo string, pageSize int) (*Readin
 		}
 
 		var page ReadinessQueryResponse
-		if err := s.API.GraphQL(MONITOR_READINESS_QUERY, vars, &page); err != nil {
+		if err := s.fetchReadinessPage(vars, &page); err != nil {
 			return nil, err
 		}
 
