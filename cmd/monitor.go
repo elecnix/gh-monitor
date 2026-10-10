@@ -73,6 +73,14 @@ type monitorOptions struct {
 	Backend       backendOptions
 }
 
+// repoOnly reports whether the invocation names a repository and no target.
+// Only then does the monitor show the repo-wide readiness view. A PR number
+// with --repo is a PR watch, so Pull must be zero here too.
+func (o *monitorOptions) repoOnly() bool {
+	return o.Repo != "" && o.Selector == "" && o.Pull == 0 && o.Ref == "" &&
+		o.Commit == "" && o.Issue == 0 && o.RunID == 0
+}
+
 func (o *monitorOptions) Validate() error {
 	if o.Interval < 10 {
 		return errors.New("--interval must be at least 10 seconds")
@@ -110,9 +118,7 @@ func (o *monitorOptions) Validate() error {
 	if o.RunID > 0 {
 		targets++
 	}
-	// Repo-only (--repo without any other target) uses the readiness view.
-	repoOnly := o.Repo != "" && o.Selector == "" && o.Pull == 0 && o.Ref == "" && o.Commit == "" && o.Issue == 0 && o.RunID == 0
-	if repoOnly {
+	if o.repoOnly() {
 		return nil
 	}
 	if targets > 1 {
@@ -154,7 +160,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		identity, err = resolver.ResolveIssue(opts.Issue, opts.Repo, os.Getenv("GH_HOST"))
 	} else if opts.RunID > 0 {
 		identity, err = resolver.ResolveRun(opts.RunID, opts.Repo, os.Getenv("GH_HOST"))
-	} else if opts.Repo != "" && opts.Selector == "" && opts.Ref == "" && opts.Commit == "" && opts.Issue == 0 && opts.RunID == 0 {
+	} else if opts.repoOnly() {
 		// Repo-only: use the readiness view instead of the old repo-monitor.
 		return runReadiness(cmd, opts)
 	} else {
