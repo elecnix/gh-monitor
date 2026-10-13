@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
       - name: Run Prettier check
@@ -60,7 +60,7 @@ jobs:
         with:
           # The merge-base has to be reachable for the delta scan.
           fetch-depth: 0
-      - uses: elecnix/dupdelta@658504a2c2fc19ced01337e2e84c79aa4699a7a7 # v0.2.0
+      - uses: elecnix/dupdelta@c95b985a8e9ba75c1473f2fe3695d8478f869d53 # v0.3.0
         with:
           # actions/checkout does not create a local branch for the base, so
           # compare against the remote-tracking ref fetched by fetch-depth: 0.
