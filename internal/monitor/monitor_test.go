@@ -461,8 +461,17 @@ func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
 	t.Run("named check keeps only its annotations", func(t *testing.T) {
 		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
 		require.Len(t, s.CheckAnnotations, 1)
-		assert.Equal(t, "dupdelta", s.CheckAnnotations[0].CheckName)
-		assert.Equal(t, "duplication", s.CheckAnnotations[0].Title)
+		// The surviving annotation is the one the named check posted, whole:
+		// its check name, its path, its line, its level and its message all
+		// come from that check's run.
+		assert.Equal(t, AnnotationSummary{
+			CheckName: "dupdelta",
+			Path:      "src/dup.go",
+			Line:      12,
+			Level:     "WARNING",
+			Title:     "duplication",
+			Message:   "clone of src/orig.go",
+		}, s.CheckAnnotations[0])
 	})
 
 	t.Run("the name is matched on the whole name", func(t *testing.T) {
@@ -477,6 +486,13 @@ func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
 		// over any other name in the list.
 		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("none", "dupdelta")})
 		assert.Empty(t, s.CheckAnnotations, "\"none\" must drop every check")
+	})
+
+	t.Run("a name that no check carries keeps the snapshot empty", func(t *testing.T) {
+		// The allowlist can name a check the pull request never ran: the
+		// result is an empty annotation set, not a fallback to every check.
+		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("no-such-check")})
+		assert.Empty(t, s.CheckAnnotations, "an unmatched name must not admit every check")
 	})
 
 	t.Run("the level filter still applies alongside the name filter", func(t *testing.T) {
