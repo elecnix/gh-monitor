@@ -21,6 +21,7 @@ var daemonReadSamples = map[string]string{
 	"selfUpdate":            `"30m"`,
 	"pollInterval":          `"10m"`,
 	"idlePollCeiling":       `"20m"`,
+	"coveredSafetyInterval": `"30m"`,
 	"pollWhenBrokerHealthy": `false`,
 }
 
