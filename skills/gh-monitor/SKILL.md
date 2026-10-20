@@ -177,7 +177,7 @@ gh monitor review view --unresolved --not_outdated --tail 1 -R owner/repo --pr $
 
 - Comments can only be edited/deleted while the review is pending (before submit).
 - Numeric review IDs are rejected — always use GraphQL node IDs (`PRR_*`).
-- Monitor notification templates are overridable via `${XDG_CONFIG_HOME:-~/.config}/gh-monitor/preferences.json`.
+- Monitor notification templates are overridable via `${XDG_CONFIG_HOME:-~/.config}/gh-monitor/preferences.json`. A clause wrapped in `[[…]]` in a template is optional: it is dropped when every `{token}` inside it renders empty. The built-in `new-commit` message uses it to name the commit's co-authors, and to omit the clause entirely when the commit has none. The markers only mean anything around a recognized `{token}`; anything else stays literal text.
 - All commands return structured JSON with consistent field names, no nulls, pre-joined thread replies.
 
 ## References
