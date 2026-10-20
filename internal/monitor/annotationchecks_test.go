@@ -10,7 +10,9 @@ import (
 // TestAnnotationChecks_Allows exercises the predicate directly.
 //
 // The cases are table-driven: each row pairs an allowlist with the check
-// name it is asked about and the answer it must give.
+// name it is asked about and the answer it must give. A nil allowlist is
+// one of the rows, because the default — no filter at all — is a case of
+// the predicate rather than a special case of it.
 func TestAnnotationChecks_Allows(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -18,6 +20,7 @@ func TestAnnotationChecks_Allows(t *testing.T) {
 		check string
 		want  bool
 	}{
+		{"no filter admits every check", nil, "anything at all", true},
 		{"a listed check passes", []string{"dupdelta"}, "dupdelta", true},
 		{"an unlisted check does not", []string{"dupdelta"}, "lint", false},
 		{"an empty check name does not", []string{"dupdelta"}, "", false},
@@ -30,18 +33,13 @@ func TestAnnotationChecks_Allows(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := NewAnnotationChecks(tc.allow...)
+			var f *AnnotationChecks
+			if tc.allow != nil {
+				f = NewAnnotationChecks(tc.allow...)
+			}
 			assert.Equal(t, tc.want, f.Allows(tc.check))
 		})
 	}
-}
-
-// TestAnnotationChecks_NilFilterAllowsEveryCheck confirms a nil filter — the
-// default — admits every check, whatever it is named.
-func TestAnnotationChecks_NilFilterAllowsEveryCheck(t *testing.T) {
-	var nilFilter *AnnotationChecks
-	assert.True(t, nilFilter.Allows("dupdelta"))
-	assert.True(t, nilFilter.Allows("anything at all"))
 }
 
 // TestAnnotationChecks_None exercises the explicit "none" spelling: a
