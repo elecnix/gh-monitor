@@ -2,8 +2,6 @@ package monitor
 
 import (
 	"errors"
-	"net/http"
-	"strconv"
 	"testing"
 	"time"
 
@@ -133,18 +131,6 @@ func TestBudgetGuard_BlindOnRateLimitError(t *testing.T) {
 	assert.False(t, st.Changed)
 }
 
-// graphqlHeaders builds the rate-limit headers GitHub sends on a GraphQL
-// response.
-func graphqlHeaders(remaining, limit int, reset time.Time) http.Header {
-	h := http.Header{}
-	h.Set("X-RateLimit-Resource", "graphql")
-	h.Set("X-RateLimit-Limit", strconv.Itoa(limit))
-	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-	h.Set("X-RateLimit-Used", strconv.Itoa(limit-remaining))
-	h.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
-	return h
-}
-
 // TestBudgetGuard_HeadersOverrideRateLimitEndpoint reproduces issue #123:
 // GET /rate_limit reported used 0 while the X-RateLimit-* headers of a real
 // GraphQL call in the same minute read 5000 of 5000. The guard must decide
@@ -152,7 +138,7 @@ func graphqlHeaders(remaining, limit int, reset time.Time) http.Header {
 func TestBudgetGuard_HeadersOverrideRateLimitEndpoint(t *testing.T) {
 	now := time.Now()
 	store := ghcli.NewRateLimitStore()
-	store.Observe("github.com", graphqlHeaders(0, 5000, now.Add(20*time.Minute)), now)
+	store.Observe("github.com", ghcli.GraphQLHeaders(0, 5000, now.Add(20*time.Minute)), now)
 
 	g := NewBudgetGuard(&Service{API: rateLimitAPI(5000, 5000)}, 60*time.Second)
 	g.UseObserved(store, "github.com")
@@ -176,7 +162,7 @@ func TestBudgetGuard_HeadersOverrideRateLimitEndpoint(t *testing.T) {
 func TestBudgetGuard_StaleHeadersFallBackToRateLimitEndpoint(t *testing.T) {
 	now := time.Now()
 	store := ghcli.NewRateLimitStore()
-	store.Observe("github.com", graphqlHeaders(0, 5000, now.Add(-time.Minute)), now.Add(-10*time.Minute))
+	store.Observe("github.com", ghcli.GraphQLHeaders(0, 5000, now.Add(-time.Minute)), now.Add(-10*time.Minute))
 
 	g := NewBudgetGuard(&Service{API: rateLimitAPI(4800, 5000)}, 60*time.Second)
 	g.UseObserved(store, "github.com")
@@ -193,7 +179,7 @@ func TestBudgetGuard_StaleHeadersFallBackToRateLimitEndpoint(t *testing.T) {
 func TestBudgetGuard_NoRateLimitCallWhileHeadersAreFresh(t *testing.T) {
 	now := time.Now()
 	store := ghcli.NewRateLimitStore()
-	store.Observe("github.com", graphqlHeaders(3000, 5000, now.Add(20*time.Minute)), now)
+	store.Observe("github.com", ghcli.GraphQLHeaders(3000, 5000, now.Add(20*time.Minute)), now)
 
 	api := &fakeAPI{restFunc: func(string, string, map[string]string, interface{}, interface{}) error {
 		t.Fatal("GET /rate_limit called although a fresh header reading exists")

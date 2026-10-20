@@ -493,6 +493,18 @@ func (s *eventLogSink) log(record any) {
 	}
 }
 
+// logFetch records one hub fetch: the target, the tier the read ran at, and
+// whether it changed anything.
+func (s *eventLogSink) logFetch(target backend.Target, tier string, changed bool, at time.Time) {
+	s.log(eventlog.NewFetchRecord(target, tier, changed, at))
+}
+
+// logFailover records one watch that fell back from a sub-daemon to the
+// hub: the watch, the sub-daemon it came from, and why it moved.
+func (s *eventLogSink) logFailover(target backend.Target, from, reason string, at time.Time) {
+	s.log(eventlog.NewFailoverRecord(target, from, reason, at))
+}
+
 // daemonFetchObserver records every hub fetch in the daemon's event log
 // (issue #122): the target, the tier it was read at, and whether the read
 // changed anything. A poll that found nothing changed delivers no update, so
@@ -503,7 +515,7 @@ func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
 		return nil
 	}
 	return func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-		sink.log(eventlog.FetchRecordFor(target, tier.String(), changed, at))
+		sink.logFetch(target, tier.String(), changed, at)
 	}
 }
 
@@ -515,7 +527,7 @@ func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
 		return nil
 	}
 	return func(target backend.Target, from, reason string, at time.Time) {
-		sink.log(eventlog.FailoverRecordFor(target, from, reason, at))
+		sink.logFailover(target, from, reason, at)
 	}
 }
 

@@ -10,15 +10,13 @@
 // without an import cycle, the same reason internal/mux/muxtest exists.
 package testrec
 
-import (
-	"net/http"
-	"strconv"
-	"sync"
-	"time"
-)
+import "sync"
 
 // Recorder collects observations in the order they arrive. It is safe for
 // concurrent use: several pollers or several watches report at once.
+//
+// A Recorder holds a mutex, so it is used through a pointer: a test that
+// embeds one embeds a *Recorder.
 type Recorder[T any] struct {
 	mu    sync.Mutex
 	items []T
@@ -46,20 +44,16 @@ func (r *Recorder[T]) Len() int {
 	return len(r.items)
 }
 
-// GraphQLHeaders builds the X-RateLimit-* headers a GraphQL response
-// carries, with the given remaining count against a limit, and a reset that
-// far in the future.
+// New returns a recorder and the callback that feeds it.
 //
-// It exists because a test that drives a rate-limit reading writes these
-// five headers by hand, and two packages' test suites do it: one for a
-// budget guard, one for a hub poller. The spelling is identical, so it
-// lives here rather than twice.
-func GraphQLHeaders(remaining, limit int, reset time.Time) http.Header {
-	h := http.Header{}
-	h.Set("X-RateLimit-Resource", "graphql")
-	h.Set("X-RateLimit-Limit", strconv.Itoa(limit))
-	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-	h.Set("X-RateLimit-Used", strconv.Itoa(limit-remaining))
-	h.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
-	return h
+// The callback takes the arguments the watched callback takes and turns
+// them into an observation with build. A test hands the callback straight
+// to the thing it watches, so it never writes a one-line wrapper of its
+// own — and two tests that watch different callbacks do not write the
+// same wrapper twice.
+func New[T any, A, B, C, D any](build func(A, B, C, D) T) (*Recorder[T], func(A, B, C, D)) {
+	r := &Recorder[T]{}
+	return r, func(a A, b B, c C, d D) {
+		r.Add(build(a, b, c, d))
+	}
 }
