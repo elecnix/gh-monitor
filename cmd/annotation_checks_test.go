@@ -89,9 +89,10 @@ func annotationCheckNames(t *testing.T, stdout string) []string {
 	return names
 }
 
-// runMonitorOnce runs a one-shot watch with the given extra flags and
-// returns the stdout it produced.
-func runMonitorOnce(t *testing.T, extraArgs ...string) string {
+// runMonitorOnceWith runs a one-shot watch against a PR carrying the two
+// annotated checks, with the given extra flags, and returns the stdout it
+// produced.
+func runMonitorOnceWith(t *testing.T, extraArgs ...string) string {
 	t.Helper()
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()
@@ -123,11 +124,11 @@ func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 
 	t.Run("without the filter every check is reported", func(t *testing.T) {
 		// The two checks, in the order the snapshot lists them.
-		assert.Equal(t, []string{"dupdelta", "lint"}, annotationCheckNames(t, runMonitorOnce(t)))
+		assert.Equal(t, []string{"dupdelta", "lint"}, annotationCheckNames(t, runMonitorOnceWith(t)))
 	})
 
 	t.Run("the flag keeps only the named check", func(t *testing.T) {
-		names := annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "dupdelta"))
+		names := annotationCheckNames(t, runMonitorOnceWith(t, "--annotation-checks", "dupdelta"))
 		require.NotEmpty(t, names, "the named check's annotation must be reported")
 		for _, n := range names {
 			assert.Equal(t, "dupdelta", n, "--annotation-checks must drop the other checks' annotations")
@@ -135,7 +136,7 @@ func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 	})
 
 	t.Run("none drops every annotation", func(t *testing.T) {
-		names := annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "none"))
+		names := annotationCheckNames(t, runMonitorOnceWith(t, "--annotation-checks", "none"))
 		assert.Empty(t, names, "\"none\" must drop every annotation")
 	})
 }
@@ -154,7 +155,7 @@ func TestMonitorOnceAnnotationChecksReadsPreferences(t *testing.T) {
 		[]byte(`{"annotationChecks": ["dupdelta"]}`), 0o644))
 
 	// The stored list applies.
-	names := annotationCheckNames(t, runMonitorOnce(t))
+	names := annotationCheckNames(t, runMonitorOnceWith(t))
 	require.NotEmpty(t, names, "the configured check's annotation must be reported")
 	for _, n := range names {
 		assert.Equal(t, "dupdelta", n, "the configured allowlist must filter the annotations")
@@ -163,7 +164,7 @@ func TestMonitorOnceAnnotationChecksReadsPreferences(t *testing.T) {
 	// The flag overrides the stored value: an explicit per-invocation
 	// allowlist replaces the stored one, so an agent can ask for a
 	// different check for one probe.
-	names = annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "lint"))
+	names = annotationCheckNames(t, runMonitorOnceWith(t, "--annotation-checks", "lint"))
 	require.NotEmpty(t, names, "the flagged check's annotation must be reported")
 	for _, n := range names {
 		assert.Equal(t, "lint", n, "the flag must override the stored allowlist")

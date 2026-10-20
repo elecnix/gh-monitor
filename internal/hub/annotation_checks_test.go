@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -50,60 +49,6 @@ func annotatedPRFixture() *monitor.PullRequest {
 	}
 }
 
-// annotationCheckNames collects the check names of the annotations an update
-// carries.
-func annotationCheckNames(u backend.Update) []string {
-	var out []string
-	for _, a := range u.Event.Annotations {
-		out = append(out, a.CheckName)
-	}
-	return out
-}
-
-// drainAnnotations reads ch until an update carrying annotations arrives, and
-// returns the check names it names. It returns nil when the stream goes quiet
-// without one, which is how the "none" case is observed: no annotation event
-// ever arrives.
-func drainAnnotations(t *testing.T, ch <-chan backend.Update, timeout time.Duration) []string {
-	t.Helper()
-	deadline := time.After(timeout)
-	for {
-		select {
-		case u, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			if u.Event.Type == backend.EventCheckAnnotations {
-				return annotationCheckNames(u)
-			}
-		case <-deadline:
-			return nil
-		}
-	}
-}
-
-// drainAnnotationEvent reads ch until an update carrying annotations arrives,
-// and returns the first of them. It returns nil when the stream goes quiet
-// without one.
-func drainAnnotationEvent(t *testing.T, ch <-chan backend.Update, timeout time.Duration) *backend.AnnotationSummary {
-	t.Helper()
-	deadline := time.After(timeout)
-	for {
-		select {
-		case u, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			if u.Event.Type == backend.EventCheckAnnotations && len(u.Event.Annotations) > 0 {
-				a := u.Event.Annotations[0]
-				return &a
-			}
-		case <-deadline:
-			return nil
-		}
-	}
-}
-
 // TestHub_AnnotationChecksFilterCrossesTheProcessBoundary confirms the
 // per-check-name filter survives the trip through WatchOptions — the wire
 // the daemon and an out-of-process backend see (issue #110).
@@ -128,7 +73,7 @@ func TestHub_AnnotationChecksFilterCrossesTheProcessBoundary(t *testing.T) {
 		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
 		t.Cleanup(cancelSub)
 
-		names := drainAnnotations(t, ch, 2*time.Second)
+		names := collectAnnotations(ch, 2*time.Second)
 		require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
 		for _, n := range names {
 			assert.Equal(t, "dupdelta", n, "the check-name filter must cross the WatchOptions boundary")
@@ -144,7 +89,7 @@ func TestHub_AnnotationChecksFilterCrossesTheProcessBoundary(t *testing.T) {
 
 		// The first-poll notice still arrives, so the stream is not silent;
 		// what must never arrive is an annotation event.
-		assert.Nil(t, drainAnnotations(t, ch, 500*time.Millisecond),
+		assert.Nil(t, collectAnnotations(ch, 500*time.Millisecond),
 			"\"none\" must drop every annotation")
 	})
 
@@ -159,7 +104,7 @@ func TestHub_AnnotationChecksFilterCrossesTheProcessBoundary(t *testing.T) {
 		opts.AnnotationChecks = []string{"dupdelta"}
 
 		ch := h.Once(ctx, testHubTarget(), opts)
-		got := drainAnnotationEvent(t, ch, 2*time.Second)
+		got := collectAnnotation(ch, 2*time.Second)
 		require.NotNil(t, got, "the one-shot read must deliver the named check's annotation")
 		assert.Equal(t, "clone of src/orig.go", got.Message)
 		assert.Equal(t, 12, got.Line)

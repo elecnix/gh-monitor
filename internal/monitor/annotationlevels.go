@@ -83,9 +83,8 @@ func (f *AnnotationLevels) Allows(level string) bool {
 	if f == nil {
 		return defaultAnnotationLevels.Allows(level)
 	}
-	return f.allowed[strings.ToLower(strings.TrimSpace(level))]
+	return allowlisted(f.allowed, level)
 }
-
 
 // Names returns the level names this filter allows, in canonical order, so the
 // filter can cross a process boundary and be rebuilt with
