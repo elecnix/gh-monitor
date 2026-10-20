@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -103,4 +104,46 @@ func TestEventFilter_String(t *testing.T) {
 	s := populated.String()
 	assert.Equal(t, "conflict,merged,new-failing-checks", s, "String must be sorted and comma-separated")
 	assert.True(t, strings.Contains(s, "conflict"))
+}
+
+// TestEventFilter_EveryBackendEventTypeIsARecognisedKind replaces the
+// hand-maintained list of EventType constants that used to sit in
+// validEventKinds. That list claimed to be a superset of the constants but
+// named 22 of the 25 backend declares; it was only correct because
+// prefs.TemplateKeys happened to cover the three it omitted.
+//
+// The rule now is: anything backend.AllEventTypes reports is a kind --events
+// accepts, whether or not it has a template entry. The loop-level kinds the
+// backend does not emit (first-poll, all-clear) and the client's own "timeout"
+// kind are asserted separately, because those are exactly the ones a
+// vocabulary read from backend must not be expected to carry.
+func TestEventFilter_EveryBackendEventTypeIsARecognisedKind(t *testing.T) {
+	for _, e := range backend.AllEventTypes() {
+		f, err := ParseEventFilter(string(e))
+		require.NoErrorf(t, err, "--events %s must be accepted", e)
+		assert.Truef(t, f.Allows(string(e)), "the filter must allow the kind it just accepted")
+		assert.Falsef(t, f.Allows(string(e)+"-nope"), "%s must not match a longer name", e)
+	}
+}
+
+// TestEventFilter_LoopLevelKindsAreRecognised covers the kinds --events accepts
+// that are not backend events: the two the loop emits itself, and the client's
+// own timeout line (issue #127).
+func TestEventFilter_LoopLevelKindsAreRecognised(t *testing.T) {
+	for _, kind := range []string{"first-poll", "all-clear", "timeout"} {
+		f, err := ParseEventFilter(kind)
+		require.NoErrorf(t, err, "--events %s must be accepted", kind)
+		assert.True(t, f.Allows(kind))
+	}
+}
+
+// TestEventFilter_RejectsSomethingOutsideTheVocabulary guards the other
+// direction: reading the vocabulary from backend must not make the filter
+// accept everything. A typo still fails loudly rather than silently muting the
+// kind the caller wanted.
+func TestEventFilter_RejectsSomethingOutsideTheVocabulary(t *testing.T) {
+	for _, typo := range []string{"not-a-real-kind", "check-annotationss", "issues", "thread"} {
+		_, err := ParseEventFilter(typo)
+		assert.Errorf(t, err, "--events %s must be rejected", typo)
+	}
 }
