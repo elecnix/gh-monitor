@@ -419,7 +419,11 @@ func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
 		// The check outcomes are not annotations, so the filter must not
 		// touch them: both checks ran and passed, and both must still be
 		// reported as successful.
-		assert.Equal(t, []string{"dupdelta", "lint"}, s.SuccessfulChecks)
+		//
+		// The comparison is order-independent: SuccessfulChecks is built
+		// from a map, so its order is not fixed. An ordered assertion here
+		// would fail on some runs and not others.
+		assert.ElementsMatch(t, []string{"dupdelta", "lint"}, s.SuccessfulChecks)
 		assert.Empty(t, s.FailingChecks)
 		assert.Empty(t, s.PendingChecks)
 	})
