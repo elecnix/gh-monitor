@@ -159,21 +159,24 @@ func TestRoutingSourceObservesDialFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a failed dial must fall back, not error: %v", err)
 	}
-	// Drain the backlog and the notice.
+	// The failover is observed as soon as the dial fails, which happens
+	// before the backlog is read. The recorder is polled on a ticker rather
+	// than checked after a read from ch: the fallback holds its stream open,
+	// so once the backlog is drained a read from ch blocks until the
+	// deadline, and the test would fail on a failover it had already
+	// recorded.
 	deadline := time.After(3 * time.Second)
-	for {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for len(rec.all()) == 0 {
 		select {
 		case _, ok := <-ch:
 			if !ok {
 				t.Fatal("the stream closed before the fallback notice arrived")
 			}
+		case <-ticker.C:
 		case <-deadline:
 			t.Fatal("no fallback notice")
-		}
-		// The failover is observed as soon as the dial fails, which happens
-		// before the backlog is read; give it a moment and check.
-		if len(rec.all()) > 0 {
-			break
 		}
 	}
 	notes := rec.all()
