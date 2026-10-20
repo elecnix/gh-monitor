@@ -331,36 +331,10 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		// The snapshot below is what Snapshot produces for a PR carrying
 		// both checks under a "dupdelta"-only filter.
 		prev := &PRStatus{}
-		curr := Snapshot(&PullRequest{
-			Commits: CommitNodes{Nodes: []Commit{{
-				Commit: CommitDetails{
-					Oid: "abc",
-					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
-						Status:     "COMPLETED",
-						Conclusion: "SUCCESS",
-						App:        AppInfo{Name: "CI"},
-						CheckRuns: RunNodes{Nodes: []CheckRun{
-							{
-								Name:       "dupdelta",
-								Conclusion: "SUCCESS",
-								Status:     "COMPLETED",
-								Annotations: AnnotationNodes{Nodes: []Annotation{{
-									Path: "src/dup.go", Level: "WARNING", Title: "duplication", Message: "clone",
-								}}},
-							},
-							{
-								Name:       "lint",
-								Conclusion: "SUCCESS",
-								Status:     "COMPLETED",
-								Annotations: AnnotationNodes{Nodes: []Annotation{{
-									Path: "src/x.go", Level: "WARNING", Title: "deprecated", Message: "Foo is deprecated",
-								}}},
-							},
-						}},
-					}}},
-				},
-			}}},
-		}, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+		curr := Snapshot(mkAnnotatedPR(
+			mkAnnotatedRun("dupdelta", "src/dup.go", "duplication", "clone", 12),
+			mkAnnotatedRun("lint", "src/x.go", "deprecated", "Foo is deprecated", 5),
+		), SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
 
 		// The lint annotation never reached the snapshot.
 		require.Len(t, curr.CheckAnnotations, 1)

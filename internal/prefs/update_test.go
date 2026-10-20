@@ -133,35 +133,6 @@ func TestUpdateFileSetsAnnotationChecks(t *testing.T) {
 	assert.Equal(t, []string{}, eff.AnnotationChecks)
 }
 
-// TestUpdateFileRejectsInvalidAnnotationChecks confirms a malformed
-// annotationChecks value is rejected at set time.
-//
-// A blank name would never match a check, so accepting it would narrow the
-// allowlist to nothing while looking configured. A value that is not a list
-// of strings is not the shape at all.
-func TestUpdateFileRejectsInvalidAnnotationChecks(t *testing.T) {
-	cases := []struct {
-		name    string
-		payload string
-		wantMsg string
-	}{
-		{"a blank check name", `{"annotationChecks":["dupdelta","  "]}`, "annotationChecks"},
-		{"a value that is not a list", `{"annotationChecks":"dupdelta"}`, "annotationChecks"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			base := t.TempDir()
-			_, err := UpdateFile(base, []byte(tc.payload))
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tc.wantMsg)
-
-			// Nothing was written by the failed attempt.
-			_, statErr := os.Stat(mustPath(t, base))
-			assert.True(t, os.IsNotExist(statErr))
-		})
-	}
-}
-
 func TestUpdateFileSetsRetriggerComments(t *testing.T) {
 	base := t.TempDir()
 	eff, err := UpdateFile(base, []byte(`{"retriggerComments":true}`))
@@ -290,15 +261,39 @@ func TestUpdateFileSetsEventLog(t *testing.T) {
 	assert.NotContains(t, stored, "eventLog")
 }
 
-func TestUpdateFileRejectsInvalidEventLog(t *testing.T) {
-	base := t.TempDir()
-	_, err := UpdateFile(base, []byte(`{"eventLog":{"keepDays":-1}}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "keepDays")
+// TestUpdateFileRejectsInvalidValues confirms a malformed value is rejected
+// at set time, for every key whose grammar has one.
+//
+// A rejected value is worth failing on rather than storing: an operator who
+// typed a bad value should learn about it immediately, not discover days
+// later that the setting never took effect. A blank check name would never
+// match a check, so accepting it would narrow the allowlist to nothing
+// while looking configured.
+func TestUpdateFileRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		wantMsg string
+	}{
+		{"a negative keepDays", `{"eventLog":{"keepDays":-1}}`, "keepDays"},
+		{"an eventLog that is not an object", `{"eventLog":"on"}`, "eventLog"},
+		{"an unparseable selfUpdate duration", `{"selfUpdate":"banana"}`, "selfUpdate"},
+		{"a selfUpdate that is not a string", `{"selfUpdate":true}`, "selfUpdate"},
+		{"a blank annotation check name", `{"annotationChecks":["dupdelta","  "]}`, "annotationChecks"},
+		{"an annotationChecks that is not a list", `{"annotationChecks":"dupdelta"}`, "annotationChecks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			_, err := UpdateFile(base, []byte(tc.payload))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
 
-	// A bare string is not the object shape.
-	_, err = UpdateFile(base, []byte(`{"eventLog":"on"}`))
-	require.Error(t, err)
+			// Nothing was written by the failed attempt.
+			_, statErr := os.Stat(mustPath(t, base))
+			assert.True(t, os.IsNotExist(statErr))
+		})
+	}
 }
 
 func TestUpdateFileSetsSelfUpdate(t *testing.T) {
@@ -330,23 +325,6 @@ func TestUpdateFileNullResetsSelfUpdate(t *testing.T) {
 	// The key is removed from the file so the built-in default (off) applies.
 	stored := readStoredFile(t, base)
 	assert.NotContains(t, stored, "selfUpdate")
-}
-
-func TestUpdateFileRejectsInvalidSelfUpdate(t *testing.T) {
-	base := t.TempDir()
-	// Unparseable durations are rejected at set time — the operator notices
-	// the typo immediately instead of a daemon that silently never updates.
-	_, err := UpdateFile(base, []byte(`{"selfUpdate":"banana"}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "selfUpdate")
-
-	// A JSON bool is not the string grammar; reject it too.
-	_, err = UpdateFile(base, []byte(`{"selfUpdate":true}`))
-	require.Error(t, err)
-
-	// Nothing was written by either failed attempt.
-	_, statErr := os.Stat(mustPath(t, base))
-	assert.True(t, os.IsNotExist(statErr))
 }
 
 func mustPath(t *testing.T, base string) string {
