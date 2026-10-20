@@ -883,7 +883,6 @@ func lastComment(nodes []Comment) *Comment {
 	return &nodes[len(nodes)-1]
 }
 
-
 var nonDecisiveReviewStates = map[string]bool{"PENDING": true, "COMMENTED": true}
 
 // reviewDecision returns the state and author of the latest decisive review —

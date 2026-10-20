@@ -1503,8 +1503,6 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
 }
 
-
-
 // broadcast fans a loop-level event out to every subscriber. Sends are
 // non-blocking: a consumer that has not drained its previous notice drops the
 // intermediate one, which is acceptable for state-change notices (the next

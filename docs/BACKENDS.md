@@ -148,7 +148,6 @@ except `Once`, which changes what the caller is asking for.
 | `AnnotationChecks` | Which checks' annotations to report. Empty means every check; `["none"]` means report none.                                                                                                                                                                                            |
 | `RepeatUnresolved` | Re-report still-open items on every observation, not only when they first appear.                                                                                                                                                                                                      |
 
-
 ### Say so when you go blind
 
 A `Source` that stops seeing its target must emit an `EventDegraded` update
