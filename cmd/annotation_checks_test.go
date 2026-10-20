@@ -1,15 +1,11 @@
 package cmd
 
 import (
-	"bytes"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -100,22 +96,16 @@ func annotationCheckNames(t *testing.T, stdout string) []string {
 // produced.
 func runMonitorOnceWith(t *testing.T, extraArgs ...string) string {
 	t.Helper()
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
+	stdout, _ := runMonitorCommand(t, "", openPRWithTwoAnnotatedChecks(), extraArgs...)
+	return stdout
+}
 
-	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		return assignJSON(result, openPRWithTwoAnnotatedChecks())
-	}}
-	apiClientFactory = func(string) ghcli.API { return fake }
-
-	root := newRootCommand()
-	stdout := &bytes.Buffer{}
-	root.SetOut(stdout)
-	root.SetErr(&bytes.Buffer{})
-	args := append([]string{"7", "-R", "o/r", "--once"}, extraArgs...)
-	root.SetArgs(args)
-	require.NoError(t, root.Execute())
-	return stdout.String()
+// runMonitorOnceWithPrefs is runMonitorOnceWith with a preferences file in
+// place, written the way `gh monitor prefs set` would.
+func runMonitorOnceWithPrefs(t *testing.T, prefsJSON string, extraArgs ...string) string {
+	t.Helper()
+	stdout, _ := runMonitorCommand(t, prefsJSON, openPRWithTwoAnnotatedChecks(), extraArgs...)
+	return stdout
 }
 
 // TestMonitorOnceAnnotationChecksFilter confirms the --annotation-checks flag
@@ -150,18 +140,11 @@ func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 // TestMonitorOnceAnnotationChecksReadsPreferences confirms the annotationChecks
 // preference applies when the flag is absent, and that the flag overrides it.
 func TestMonitorOnceAnnotationChecksReadsPreferences(t *testing.T) {
-	configDir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", configDir)
-	t.Setenv("GH_HOST", "")
-
-	// Write the preference the way `gh monitor prefs set` would.
-	prefsDir := filepath.Join(configDir, "gh-monitor")
-	require.NoError(t, os.MkdirAll(prefsDir, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(prefsDir, "preferences.json"),
-		[]byte(`{"annotationChecks": ["dupdelta"]}`), 0o644))
+	// The stored list, written the way `gh monitor prefs set` would.
+	const stored = `{"annotationChecks": ["dupdelta"]}`
 
 	// The stored list applies.
-	names := annotationCheckNames(t, runMonitorOnceWith(t))
+	names := annotationCheckNames(t, runMonitorOnceWithPrefs(t, stored))
 	require.NotEmpty(t, names, "the configured check's annotation must be reported")
 	for _, n := range names {
 		assert.Equal(t, "dupdelta", n, "the configured allowlist must filter the annotations")
@@ -170,7 +153,7 @@ func TestMonitorOnceAnnotationChecksReadsPreferences(t *testing.T) {
 	// The flag overrides the stored value: an explicit per-invocation
 	// allowlist replaces the stored one, so an agent can ask for a
 	// different check for one probe.
-	names = annotationCheckNames(t, runMonitorOnceWith(t, "--annotation-checks", "lint"))
+	names = annotationCheckNames(t, runMonitorOnceWithPrefs(t, stored, "--annotation-checks", "lint"))
 	require.NotEmpty(t, names, "the flagged check's annotation must be reported")
 	for _, n := range names {
 		assert.Equal(t, "lint", n, "the flag must override the stored allowlist")
