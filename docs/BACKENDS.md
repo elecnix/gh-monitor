@@ -254,6 +254,25 @@ Report a repository once you receive any event for it, or once your source
 declares it registered, such as with a retained broker message. A server
 without the capability keeps routing by kind.
 
+#### Watch handoff
+
+When the daemon routes a covered repository's watch to your sub-daemon, it
+reads the repository once through the polling hub first. The fetch delivers the
+backlog — everything that happened before your event stream started. The daemon
+passes the caller's own baseline to that fetch so it only reports what changed
+after the caller's last snapshot, not the full current state.
+
+After the backlog fetch, the daemon opens a `Watch` against you with the
+baseline advanced to the hub's snapshot. The daemon then drops your first-poll
+batch, since the hub already provided it.
+
+The daemon's safety timer also uses this path: it fires one hub read at a
+regular interval while the repository stays covered. Set `last_event` to the
+timestamp of the most recent webhook event you received; the daemon resets the
+timer each time it fires. The timer guards against webhook gaps — if an event
+is never delivered, the daemon polls the hub and carries any missed changes to
+the caller.
+
 ### Mutation ops
 
 Mutations use the same request/response shape: one request in, one frame out.
