@@ -220,8 +220,8 @@ func TestRenderNotificationRepo(t *testing.T) {
 	assert.Contains(t, n2.Message, "bug")
 
 	// Test first-poll notification
-	n3 := renderNotificationRepo(opts, status, firstPollType, Event{})
-	assert.Equal(t, firstPollType, n3.Type)
+	n3 := renderNotificationRepo(opts, status, string(EventFirstPoll), Event{})
+	assert.Equal(t, string(EventFirstPoll), n3.Type)
 	assert.Contains(t, n3.Message, "o/r")
 }
 

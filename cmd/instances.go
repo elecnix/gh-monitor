@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -134,10 +132,9 @@ With --all, deletes every stored cursor.`,
 
 // cursorStore creates a DiskStore under the gh-monitor config directory.
 func cursorStore() (*cursor.DiskStore, error) {
-	prefsPath, err := prefs.ConfigPath("")
+	cfgDir, err := prefs.ConfigDir("")
 	if err != nil {
-		return nil, fmt.Errorf("resolve config path: %w", err)
+		return nil, fmt.Errorf("resolve config dir: %w", err)
 	}
-	cfgDir := strings.TrimSuffix(prefsPath, string(filepath.Separator)+"preferences.json")
 	return cursor.NewDiskStore(cfgDir)
 }
