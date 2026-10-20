@@ -264,23 +264,37 @@ type verdictPredicates struct {
 }
 
 // failingPredicates classify the red side of the mirror.
-func failingPredicates() verdictPredicates {
-	return verdictPredicates{
+//
+// The two sides are declared as ONE table rather than two constructors, because
+// two constructors over the same four fields are themselves a duplicate pair:
+// the table keeps the symmetry visible in a single place, and each row names
+// its own side.
+var verdictPredicateTable = []struct {
+	side string
+	p    verdictPredicates
+}{
+	{"failure", verdictPredicates{
 		suiteConclusion: isFailureConclusion,
 		commitState:     func(s string) bool { return failureCommitStates[s] },
 		verdict:         isFailureVerdict,
 		fallback:        isFailureConclusion,
-	}
-}
-
-// successfulPredicates classify the green side of the mirror.
-func successfulPredicates() verdictPredicates {
-	return verdictPredicates{
+	}},
+	{"success", verdictPredicates{
 		suiteConclusion: isSuccessConclusion,
 		commitState:     func(s string) bool { return successCommitStates[s] },
 		verdict:         isSuccessConclusion,
 		fallback:        isSuccessConclusion,
+	}},
+}
+
+// predicatesFor returns the predicate set for one side of the mirror.
+func predicatesFor(side string) verdictPredicates {
+	for _, row := range verdictPredicateTable {
+		if row.side == side {
+			return row.p
+		}
 	}
+	panic("unknown verdict side: " + side)
 }
 
 // classifiedChecks collects the names that one side of the failing/successful
@@ -353,7 +367,7 @@ func classifiedChecks(v HeadCommitView, p verdictPredicates) []string {
 // failingChecks collects names of failing check suites/runs plus old-style
 // status contexts in FAILURE/ERROR states.
 func failingChecks(v HeadCommitView) []string {
-	return classifiedChecks(v, failingPredicates())
+	return classifiedChecks(v, predicatesFor("failure"))
 }
 
 // successfulChecks collects names of check suites/runs that finished without
@@ -363,7 +377,7 @@ func failingChecks(v HeadCommitView) []string {
 // are both empty whether every check passed or no check has been created yet,
 // and only the former should be reported as green.
 func successfulChecks(v HeadCommitView) []string {
-	return classifiedChecks(v, successfulPredicates())
+	return classifiedChecks(v, predicatesFor("success"))
 }
 
 // pendingChecks collects names of pending check suites plus old-style status

@@ -246,7 +246,12 @@ func TestJudgeCI_EveryNonCompletedCheckStatusStateIsPending(t *testing.T) {
 // isFailureVerdict (which excludes CANCELLED) while success's uses
 // isSuccessConclusion (which includes SKIPPED). A single predicate for the
 // whole function would change behaviour on the SKIPPED/CANCELLED cases, so
-// these tests pin the asymmetry down.
+// this test pins the asymmetry down.
+//
+// The verdict step's own behaviour — a CANCELLED run never overriding a
+// verdict — is already covered by
+// TestJudgeCI_CancelledBesideSuccessfulIsNotFailing, so it is not repeated
+// here.
 // ---------------------------------------------------------------------------
 
 func TestJudgeCI_MirrorPredicatesAreNotSymmetric(t *testing.T) {
@@ -266,21 +271,6 @@ func TestJudgeCI_MirrorPredicatesAreNotSymmetric(t *testing.T) {
 	skipped := JudgeCI(skippedOnly, CIVerdictOptions{})
 	assert.Equal(t, []string{"test"}, skipped.Successful, "a SKIPPED run with no verdict settles the check")
 	assert.Empty(t, skipped.Failing, "and it is not failing")
-}
-
-func TestJudgeCI_MirrorVerdictStepExcludesCancelledFromFailure(t *testing.T) {
-	// The verdict step and the fallback step use DIFFERENT predicates on the
-	// failure side. A CANCELLED run is a non-verdict, so runVerdict never
-	// returns it; it can only reach the failure side through the fallback.
-	// With a real verdict beside it, the CANCELLED run is invisible.
-	v := view([]CheckSuite{checkSuite("CI", "ci-app", "",
-		CheckRun{Name: "test", Status: "COMPLETED", Conclusion: "SUCCESS", CompletedAt: ts(time.Minute)},
-		CheckRun{Name: "test", Status: "COMPLETED", Conclusion: "CANCELLED", CompletedAt: ts(0)})}, nil)
-
-	got := JudgeCI(v, CIVerdictOptions{})
-
-	assert.Empty(t, got.Failing, "a CANCELLED run never overrides a verdict")
-	assert.Equal(t, []string{"test"}, got.Successful)
 }
 
 // ---------------------------------------------------------------------------
