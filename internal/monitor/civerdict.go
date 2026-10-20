@@ -243,9 +243,56 @@ func isContainerApp(s *CheckSuite) bool {
 // The five classifiers
 // ---------------------------------------------------------------------------
 
-// failingChecks collects names of failing check suites/runs plus old-style
-// status contexts in FAILURE/ERROR states.
-func failingChecks(v HeadCommitView) []string {
+// verdictPredicates is the set of classifiers one side of the failing/
+// successful mirror uses. The two sides are not symmetric in every predicate:
+// the suite-level step and the status-context step differ, the run-verdict
+// step differs, and the fallback step uses a DIFFERENT predicate set again
+// (failure uses isFailureVerdict, which excludes CANCELLED; success uses
+// isSuccessConclusion, which includes SKIPPED). A single parameterised helper
+// therefore needs one predicate per step, not one for the whole function.
+type verdictPredicates struct {
+	// suiteConclusion classifies a suite's OWN conclusion, used when the
+	// suite carries no runs and is not the container app.
+	suiteConclusion func(string) bool
+	// commitState classifies an old-style status context's state.
+	commitState func(string) bool
+	// verdict classifies the winning run's conclusion.
+	verdict func(string) bool
+	// fallback classifies a run's conclusion when the name has no verdict at
+	// all. Deliberately distinct from verdict.
+	fallback func(string) bool
+}
+
+// failingPredicates classify the red side of the mirror.
+func failingPredicates() verdictPredicates {
+	return verdictPredicates{
+		suiteConclusion: isFailureConclusion,
+		commitState:     func(s string) bool { return failureCommitStates[s] },
+		verdict:         isFailureVerdict,
+		fallback:        isFailureConclusion,
+	}
+}
+
+// successfulPredicates classify the green side of the mirror.
+func successfulPredicates() verdictPredicates {
+	return verdictPredicates{
+		suiteConclusion: isSuccessConclusion,
+		commitState:     func(s string) bool { return successCommitStates[s] },
+		verdict:         isSuccessConclusion,
+		fallback:        isSuccessConclusion,
+	}
+}
+
+// classifiedChecks collects the names that one side of the failing/successful
+// mirror claims: a suite's own conclusion when the suite carries no runs and
+// is not the container app, an old-style status context in a matching state,
+// and a run name whose winning verdict matches.
+//
+// The two sides share this body because the RULES are the same rules read
+// through different classifiers: classification is per NAME across all runs,
+// never per run (measured 2026-08-18), and a name whose latest verdict does
+// not match is not claimed at all.
+func classifiedChecks(v HeadCommitView, p verdictPredicates) []string {
 	var out []string
 	seen := map[string]bool{}
 	add := func(name string) {
@@ -254,9 +301,6 @@ func failingChecks(v HeadCommitView) []string {
 			out = append(out, name)
 		}
 	}
-	// Per-name across ALL suites on the head: a cancelled run beside a successful one
-	// for the same name is a superseded attempt, not a verdict. Classification is per
-	// NAME across all runs, never per run (measured 2026-08-18).
 	byName := map[string][]CheckRun{}
 	for _, c := range v.Commits {
 		for j := range c.Suites.Nodes {
@@ -266,7 +310,7 @@ func failingChecks(v HeadCommitView) []string {
 			// CANCELLED and produced nothing. Where runs exist, classification
 			// defers to them per name; where the app is the container, an empty
 			// suite is not a check at all (see suiteCarriesRuns).
-			if isFailureConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
+			if p.suiteConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
 				add(suiteName(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
@@ -281,7 +325,7 @@ func failingChecks(v HeadCommitView) []string {
 		}
 		if c.Status != nil {
 			for _, ctx := range c.Status.Contexts {
-				if failureCommitStates[ctx.State] {
+				if p.commitState(ctx.State) {
 					add(ctx.Context)
 				}
 			}
@@ -289,7 +333,7 @@ func failingChecks(v HeadCommitView) []string {
 	}
 	for name, runs := range byName {
 		if ver, ok := runVerdict(runs); ok {
-			if isFailureVerdict(ver.Conclusion) {
+			if p.verdict(ver.Conclusion) {
 				add(name)
 			}
 			continue
@@ -297,13 +341,19 @@ func failingChecks(v HeadCommitView) []string {
 		// No verdict at all: fall back to any failure-shaped conclusion (a cancelled
 		// suite that ran and was the only record still reads red, never green).
 		for _, r := range runs {
-			if isFailureConclusion(r.Conclusion) {
+			if p.fallback(r.Conclusion) {
 				add(name)
 				break
 			}
 		}
 	}
 	return out
+}
+
+// failingChecks collects names of failing check suites/runs plus old-style
+// status contexts in FAILURE/ERROR states.
+func failingChecks(v HeadCommitView) []string {
+	return classifiedChecks(v, failingPredicates())
 }
 
 // successfulChecks collects names of check suites/runs that finished without
@@ -313,60 +363,7 @@ func failingChecks(v HeadCommitView) []string {
 // are both empty whether every check passed or no check has been created yet,
 // and only the former should be reported as green.
 func successfulChecks(v HeadCommitView) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(name string) {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	// Same per-name rule as failingChecks: the latest VERDICT decides. A name whose
-	// latest verdict is a failure is NOT successful even if an earlier run passed.
-	byName := map[string][]CheckRun{}
-	for _, c := range v.Commits {
-		for j := range c.Suites.Nodes {
-			suite := &c.Suites.Nodes[j]
-			// Mirror of the failingChecks rule: a suite's own conclusion is a result
-			// only when it carries no runs and is not the container app. A SUCCESS
-			// container suite would otherwise pad SuccessfulChecks with the app
-			// name, and every PR on GitHub has such a suite.
-			if isSuccessConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
-				add(suiteName(suite))
-			}
-			for _, run := range suite.CheckRuns.Nodes {
-				name := run.Name
-				if name == "" {
-					name = suiteName(suite)
-				}
-				if name != "" {
-					byName[name] = append(byName[name], run)
-				}
-			}
-		}
-		if c.Status != nil {
-			for _, ctx := range c.Status.Contexts {
-				if successCommitStates[ctx.State] {
-					add(ctx.Context)
-				}
-			}
-		}
-	}
-	for name, runs := range byName {
-		if ver, ok := runVerdict(runs); ok {
-			if isSuccessConclusion(ver.Conclusion) {
-				add(name)
-			}
-			continue
-		}
-		for _, r := range runs {
-			if isSuccessConclusion(r.Conclusion) {
-				add(name)
-				break
-			}
-		}
-	}
-	return out
+	return classifiedChecks(v, successfulPredicates())
 }
 
 // pendingChecks collects names of pending check suites plus old-style status
