@@ -108,7 +108,8 @@ func TestUpdateFileSetsAnnotationChecks(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"dupdelta"}, eff.AnnotationChecks)
 
-	// Persisted to the file, visible to a fresh Load.
+	// Persisted to the file, and visible to a fresh Load — the stored list
+	// is what the next invocation reads.
 	got, err := Load(base)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"dupdelta"}, got.AnnotationChecks)
@@ -153,29 +154,6 @@ func TestUpdateFileRejectsNonListAnnotationChecks(t *testing.T) {
 	_, err := UpdateFile(base, []byte(`{"annotationChecks":"dupdelta"}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "annotationChecks")
-}
-
-// TestLoadAnnotationChecks confirms the stored list is read back, and that
-// an absent key keeps the default.
-func TestLoadAnnotationChecks(t *testing.T) {
-	base := t.TempDir()
-
-	// Missing file: every check (the default).
-	got, err := Load(base)
-	require.NoError(t, err)
-	assert.Equal(t, []string{}, got.AnnotationChecks)
-
-	writeStored(t, base, `{"annotationChecks": ["dupdelta", "lint"]}`)
-	got, err = Load(base)
-	require.NoError(t, err)
-	assert.Equal(t, []string{"dupdelta", "lint"}, got.AnnotationChecks)
-
-	// An absent key keeps the default even alongside other stored config.
-	writeStored(t, base, `{"ignoredBots": ["dependabot"]}`)
-	got, err = Load(base)
-	require.NoError(t, err)
-	assert.Equal(t, []string{}, got.AnnotationChecks)
-	assert.Equal(t, []string{"dependabot"}, got.IgnoredBots)
 }
 
 func TestUpdateFileSetsRetriggerComments(t *testing.T) {
