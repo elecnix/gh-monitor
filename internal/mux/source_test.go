@@ -4,11 +4,11 @@ import (
 	"context"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/testrec"
 )
 
 // failoverNote is one recorded failover.
@@ -22,21 +22,17 @@ type failoverNote struct {
 // failoverRecorder collects the router's failover observations. It is safe
 // for concurrent use: several watches fail over at once.
 type failoverRecorder struct {
-	mu    sync.Mutex
-	notes []failoverNote
+	notes testrec.Recorder[failoverNote]
 }
 
+// record notes one failover.
 func (r *failoverRecorder) record(target backend.Target, from, reason string, at time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.notes = append(r.notes, failoverNote{target: target, from: from, reason: reason, at: at})
+	r.notes.Add(failoverNote{target: target, from: from, reason: reason, at: at})
 }
 
 // all returns the recorded failovers, oldest first.
 func (r *failoverRecorder) all() []failoverNote {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]failoverNote(nil), r.notes...)
+	return r.notes.All()
 }
 
 // TestRoutingSourceStampsSubdaemonUpdates proves that every update a

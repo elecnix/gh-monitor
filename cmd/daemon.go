@@ -499,10 +499,10 @@ func (s *eventLogSink) log(record any) {
 // changed anything. A poll that found nothing changed delivers no update, so
 // only the hub can say that it looked and found nothing.
 func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
-	if w == nil {
+	sink := newEventLogSink(w)
+	if sink == nil {
 		return nil
 	}
-	sink := &eventLogSink{w: w}
 	return func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
 		sink.log(eventlog.FetchRecord{
 			Kind:    eventlog.KindHubFetch,
@@ -517,10 +517,10 @@ func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
 // daemonFailoverObserver records every failover from a sub-daemon to the hub
 // in the daemon's event log (issue #122).
 func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
-	if w == nil {
+	sink := newEventLogSink(w)
+	if sink == nil {
 		return nil
 	}
-	sink := &eventLogSink{w: w}
 	return func(target backend.Target, from, reason string, at time.Time) {
 		sink.log(eventlog.FailoverRecord{
 			Kind:   eventlog.KindHubFailover,
@@ -530,6 +530,14 @@ func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
 			At:     at,
 		})
 	}
+}
+
+// newEventLogSink returns a sink writing to w, or nil when the log is off.
+func newEventLogSink(w *eventlog.Writer) *eventLogSink {
+	if w == nil {
+		return nil
+	}
+	return &eventLogSink{w: w}
 }
 
 // hubSource adapts the shared poller to backend.Source, so the daemon serves
