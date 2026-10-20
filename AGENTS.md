@@ -78,6 +78,14 @@ Practical consequences when debugging or extending the daemon:
   running an old binary.
 - "watching requires the shared-poller daemon" means no daemon owns the
   public socket — not that a sub-daemon is missing.
+- Every update carries the serving path that produced it in `Update.Source`:
+  `hub` for one the polling hub delivered, or the sub-daemon's name for one a
+  sub-daemon delivered ([#122](https://github.com/elecnix/gh-monitor/issues/122)).
+  The daemon's event log also records the polling itself: one
+  `hub-fetch` record per hub fetch (target, tier, and whether it changed
+  anything) and one `hub-failover` record per watch that fell back from a
+  sub-daemon to the hub. A log of delivered updates alone cannot show how
+  often the hub polls, or which watches gave up a sub-daemon's free serving.
 
 ## Releasing
 
