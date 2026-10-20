@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,6 +41,36 @@ func TestSurfaces_NamesAndString(t *testing.T) {
 	var empty Surfaces
 	assert.Nil(t, empty.Names(), "a nil list projects to nil so omitempty still applies")
 	assert.Empty(t, empty.String(), "an empty list renders empty, never a dangling separator")
+}
+
+// TestSurfaces_RendersAsACommaSeparatedListInAFormatString pins how a Surfaces
+// value reaches a notice. The notices in internal/hub print the shed list with
+// %s and no explicit join, so the rendering is the String method's job: a
+// reader must see "annotations, reviews", never Go's "[annotations reviews]".
+//
+// The format strings below are the shape the hub's notices use: a verb around
+// the list, so the test exercises the same call the notice makes.
+//
+// This is also the guard against the opposite mistake. Passing shed.Names()
+// where a Surfaces value belongs would print the []string form, because fmt
+// applies a Stringer to %s but not to the slice it returns.
+func TestSurfaces_RendersAsACommaSeparatedListInAFormatString(t *testing.T) {
+	shed := TierStatus.ShedSurfaces()
+	const list = "annotations, reviews, review threads, comments"
+
+	assert.Equal(t, "no longer watching "+list+" until the budget recovers",
+		fmt.Sprintf("no longer watching %s until the budget recovers", shed),
+		"a Surfaces value printed with %%s must read as a comma-separated list")
+	assert.Equal(t, "no longer watching "+list+" until the budget recovers",
+		fmt.Sprintf("no longer watching %v until the budget recovers", shed),
+		"%%v applies the same Stringer, so it agrees with %%s")
+
+	// The trap: Names() is a []string, and fmt prints that in slice syntax.
+	// Handing it to a %s verb reintroduces exactly the rendering this test
+	// forbids.
+	assert.Equal(t, "no longer watching [annotations reviews review threads comments] until the budget recovers",
+		fmt.Sprintf("no longer watching %s until the budget recovers", shed.Names()),
+		"the []string projection prints in slice syntax; do not use it for a notice")
 }
 
 // TestShedSurfacesJSONUnchanged is the compatibility guard for the typed
