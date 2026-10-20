@@ -23,6 +23,7 @@ import (
 	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/broker"
+	"github.com/elecnix/gh-monitor/internal/eventlog"
 	"github.com/elecnix/gh-monitor/internal/handoff"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
@@ -266,12 +267,26 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	budgetSvc := &monitor.Service{API: apiClientFactory("")}
 	budget := monitor.NewBudgetGuard(budgetSvc, interval)
 
+	// The daemon's own event log (issue #122): the operator turned it on in
+	// the global preferences, so the daemon records what it did — every hub
+	// fetch and every failover from a sub-daemon to the hub — alongside the
+	// updates the clients log. Without it, the polling cost and the
+	// fallbacks are invisible: the client-side log records only what was
+	// delivered, so a poll that found nothing changed leaves no trace.
+	evlog := openDaemonEventLog(cmd, daemonPrefs)
+	if evlog != nil {
+		defer func() { _ = evlog.Close() }()
+	}
+
 	h := hub.New(fetch, rulesetFn, interval, budget,
 		hub.WithFailedRunLogFetcher(gh.FailedRunLogs(apiClientFactory)),
 		hub.WithRESTFallback(gh.RESTFallback(apiClientFactory)),
 		hub.WithIdleCeiling(idleCeiling),
 		hub.WithPauseWhenBrokerHealthy(pauseWhenHealthy))
 	defer h.Stop()
+	if evlog != nil {
+		h.SetFetchObserver(daemonFetchObserver(evlog))
+	}
 	if adopted != nil {
 		if err := h.RestoreState(*adopted); err != nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: ignoring unusable handoff state (%v)\n", err)
@@ -307,6 +322,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		interval:  interval,
 		safety:    prefs.CoveredSafetyInterval(daemonPrefs.CoveredSafetyInterval),
 		handedOff: &handedOff,
+		evlog:     evlog,
 		shutdown:  func() { cancel(); _ = listener.Close() },
 	}
 
@@ -404,6 +420,95 @@ func (srv *daemonServer) handleHandoffOp(ctx context.Context, conn io.ReadWriter
 		return true, nil
 	}
 	return false, nil
+}
+
+// openDaemonEventLog opens the daemon's event log when the operator turned
+// it on in the global preferences. It returns nil when the log is off, and
+// reports a failure to open it with one loud line rather than refusing to
+// start: the log is a witness, and a daemon that will not start because its
+// log directory is unwritable is worse than a daemon that says so.
+func openDaemonEventLog(cmd *cobra.Command, p prefs.Preferences) *eventlog.Writer {
+	cfg := p.EventLog
+	if cfg == nil {
+		return nil
+	}
+	dir := cfg.Dir
+	if dir == "" {
+		dir = DefaultEventLogDir()
+	}
+	keep := cfg.KeepDays
+	if keep <= 0 {
+		keep = prefs.DefaultEventLogKeepDays
+	}
+	w, err := eventlog.New(dir, keep)
+	if err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+			"gh-monitor daemon: event log disabled (%v) — set a writable eventLog.dir in preferences\n", err)
+		return nil
+	}
+	return w
+}
+
+// daemonFetchObserver records every hub fetch in the daemon's event log
+// (issue #122): the target, the tier it was read at, and whether the read
+// changed anything. A poll that found nothing changed delivers no update, so
+// only the hub can say that it looked and found nothing.
+//
+// A write failure is reported once and then disables the log: a daemon that
+// keeps failing to write is a daemon that keeps paying for the attempt.
+func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
+	var failed bool
+	var mu sync.Mutex
+	return func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failed {
+			return
+		}
+		err := w.Log(eventlog.FetchRecord{
+			Kind:    eventlog.KindHubFetch,
+			Target:  target,
+			Tier:    tier.String(),
+			Changed: changed,
+			At:      at,
+		})
+		if err != nil {
+			failed = true
+			_, _ = fmt.Fprintf(os.Stderr,
+				"gh-monitor daemon: event log write failed (%v); logging disabled for this daemon\n", err)
+		}
+	}
+}
+
+// daemonFailoverObserver records every failover from a sub-daemon to the hub
+// in the daemon's event log (issue #122).
+//
+// A write failure is reported once and then disables the log, as above.
+func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
+	if w == nil {
+		return nil
+	}
+	var failed bool
+	var mu sync.Mutex
+	return func(target backend.Target, from, reason string, at time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		if failed {
+			return
+		}
+		err := w.Log(eventlog.FailoverRecord{
+			Kind:   eventlog.KindHubFailover,
+			Target: target,
+			From:   from,
+			Reason: reason,
+			At:     at,
+		})
+		if err != nil {
+			failed = true
+			_, _ = fmt.Fprintf(os.Stderr,
+				"gh-monitor daemon: event log write failed (%v); logging disabled for this daemon\n", err)
+		}
+	}
 }
 
 // hubSource adapts the shared poller to backend.Source, so the daemon serves
@@ -569,6 +674,7 @@ type daemonServer struct {
 	interval  time.Duration    // the hub's polling cadence, quoted in first-poll messages
 	safety    time.Duration    // coveredSafetyInterval; 0 turns the safety fetch off
 	handedOff *atomic.Bool
+	evlog     *eventlog.Writer // the daemon's event log; nil when it is off
 	shutdown  func()
 }
 
@@ -584,6 +690,7 @@ func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 		src = mux.RoutingSource{
 			Reg: srv.routes, Fallback: hubSource{hub: srv.hub},
 			SafetyInterval: srv.safety, HubInterval: srv.interval,
+			OnFailover: daemonFailoverObserver(srv.evlog),
 		}
 	}
 	cfg := remote.ServerConfig{
