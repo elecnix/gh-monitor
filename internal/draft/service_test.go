@@ -254,22 +254,26 @@ func TestAlreadyInDesiredStateSkipsMutation(t *testing.T) {
 		name   string
 		invoke func(*Service) (ActionResult, error)
 		state  string
+		// draft is the state the pull request is already in, so no mutation is
+		// needed. It is a field of the table rather than derived from the name:
+		// the row states the state it is in and the status it must report, and
+		// the two always agree.
+		draft bool
 	}{
-		{name: "draft", invoke: func(s *Service) (ActionResult, error) { return s.Draft(identity("octo", "demo", 5), ActionOptions{}) }, state: "already draft"},
-		{name: "ready", invoke: func(s *Service) (ActionResult, error) { return s.Ready(identity("octo", "demo", 5), ActionOptions{}) }, state: "already ready for review"},
+		{name: "draft", invoke: func(s *Service) (ActionResult, error) { return s.Draft(identity("octo", "demo", 5), ActionOptions{}) }, state: "already draft", draft: true},
+		{name: "ready", invoke: func(s *Service) (ActionResult, error) { return s.Ready(identity("octo", "demo", 5), ActionOptions{}) }, state: "already ready for review", draft: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			isDraft := tc.name == "draft"
 			api := apiForPullRequest("octo", "demo", "octo/demo", 5, "PR_kwNode")
 			api.graphqlResponses = map[string]func(map[string]interface{}, interface{}) error{
-				"PullRequestStatus": statusResponse(5, "Settled", isDraft),
+				"PullRequestStatus": statusResponse(5, "Settled", tc.draft),
 			}
 
 			result, err := tc.invoke(NewService(api))
 
 			require.NoError(t, err)
 			assert.Equal(t, tc.state, result.Status)
-			assert.Equal(t, isDraft, result.IsDraft)
+			assert.Equal(t, tc.draft, result.IsDraft)
 			assert.Len(t, api.graphqlCalls, 1)
 		})
 	}
