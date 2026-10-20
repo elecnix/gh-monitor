@@ -180,12 +180,7 @@ func TestBuildUpgradeCommandSharesOutput(t *testing.T) {
 // at a temp dir containing the given selfUpdate value.
 func writeSelfUpdatePrefs(t *testing.T, spec string) {
 	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	cfg := filepath.Join(dir, "gh-monitor")
-	require.NoError(t, os.MkdirAll(cfg, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(cfg, "preferences.json"),
-		[]byte(`{"selfUpdate":"`+spec+`"}`), 0o644))
+	writeTestPrefs(t, `{"selfUpdate":"`+spec+`"}`)
 }
 
 // countingUpgradeFn substitutes a counting no-op for the real `gh extension
