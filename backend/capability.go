@@ -44,6 +44,14 @@ type Provider interface {
 	Register(*Registry) error
 }
 
+// SourceHub is the Update.Source value for an update the polling hub
+// delivered. The hub is the daemon's own shared poller: an update it
+// delivered was paid for with an API fetch.
+//
+// A sub-daemon-served update carries the sub-daemon's own name instead, so
+// the two serving paths are told apart in a log (issue #122).
+const SourceHub = "hub"
+
 // SourceFunc adapts a plain function to the Source interface.
 type SourceFunc func(ctx context.Context, t Target, opts WatchOptions) (<-chan Update, error)
 

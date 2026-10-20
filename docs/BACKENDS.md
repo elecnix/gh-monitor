@@ -116,15 +116,16 @@ Each capability has its own `Register` method — `RegisterSource`,
 
 ### What an Update carries
 
-| Field      | Meaning                                                                                                                                                    |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ID`       | Stable identity. A repeat of an ID already seen is dropped, so at-least-once delivery does not notify twice. Empty disables deduplication for that update. |
-| `Target`   | What the update is about.                                                                                                                                  |
-| `Event`    | The change: a type from the shared vocabulary, plus the fields relevant to it.                                                                             |
-| `Status`   | The target's state at observation time. Optional — leave it nil if you do not have one.                                                                    |
-| `Cursor`   | Opaque resume token; a caller may hand it back as `WatchOptions.Since`.                                                                                    |
-| `At`       | When the change was observed.                                                                                                                              |
-| `Terminal` | The target is finished — merged, closed, completed. The channel closes after it.                                                                           |
+| Field      | Meaning                                                                                                                                                                                                                                                                             |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ID`       | Stable identity. A repeat of an ID already seen is dropped, so at-least-once delivery does not notify twice. Empty disables deduplication for that update.                                                                                                                          |
+| `Target`   | What the update is about.                                                                                                                                                                                                                                                           |
+| `Event`    | The change: a type from the shared vocabulary, plus the fields relevant to it.                                                                                                                                                                                                      |
+| `Status`   | The target's state at observation time. Optional — leave it nil if you do not have one.                                                                                                                                                                                             |
+| `Cursor`   | Opaque resume token; a caller may hand it back as `WatchOptions.Since`.                                                                                                                                                                                                             |
+| `At`       | When the change was observed.                                                                                                                                                                                                                                                       |
+| `Terminal` | The target is finished — merged, closed, completed. The channel closes after it.                                                                                                                                                                                                    |
+| `Source`   | Which serving path produced the update. Optional — leave it empty if your backend cannot tell its paths apart. `gh monitor` names its own paths `hub` (the shared poller) and the sub-daemon's name. A log that records updates uses this to show which path paid for the API call. |
 
 You do not render messages. `gh monitor` turns every `Update` into a
 notification using the user's own templates and `--events` filter, so your
