@@ -226,8 +226,17 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 
 	listener, adopted, err := listenOrAdopt(ctx, socket)
 	if err != nil {
+		// This daemon does not serve the socket: the bind failed, or the
+		// handoff that lets a successor take it over failed. Either way, the
+		// client that spawned it must not assume its own --interval reached
+		// the daemon that does serve (issue #170).
+		ipc.WriteBindResultTo(ipc.BindResultPathFromEnv(), ipc.BindLost)
 		return err
 	}
+	// This process owns the socket: it is the daemon the client will watch
+	// with, and the cadence it runs at is the one the client's --interval
+	// asked for.
+	ipc.WriteBindResultTo(ipc.BindResultPathFromEnv(), ipc.BindWon)
 	if routes != nil {
 		coverage = startCoverageMap(ctx, cmd, routes, adopted)
 	}
@@ -358,7 +367,12 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir
 		// any change in the sub-daemon binary. gh-monitor keeps the public
 		// socket and routes to these.
 		ChildEnv: func(e subdaemon.Entry) []string {
-			return append(os.Environ(), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
+			// A sub-daemon binds its own private socket and must not report
+			// the outcome into the file the client that spawned this daemon
+			// is waiting on: it would answer for a bind that has nothing to
+			// do with the client's watch (issue #170).
+			env := ipc.EnvWithBindResult(os.Environ(), "")
+			return append(env, "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
 		},
 	}
 }
@@ -641,18 +655,66 @@ func daemonAutostart() bool {
 // accept connections. It is race-safe: if several clients autostart at once,
 // ipc.Listen's liveness probe ensures only one daemon binds the socket, and
 // every client's WaitReady still succeeds against the winner.
-func autostartDaemon(ctx context.Context, socket string, interval time.Duration) error {
-	if err := spawnDaemonFn(socket, interval); err != nil {
-		return err
+//
+// The returned bool says whether THIS invocation's own daemon won the socket.
+// When it is false, the daemon serving the watch is somebody else's, so the
+// caller's --interval never reached it (issue #170). An unknown outcome — the
+// spawned daemon reported nothing, because it predates the report or died
+// before it could — is reported as true: the previous behaviour, in which a
+// client that spawned a daemon assumed the daemon was its own.
+func autostartDaemon(ctx context.Context, socket string, interval time.Duration) (bool, error) {
+	// The spawned daemon reports the bind outcome through this file, because
+	// it is detached with its stdio on /dev/null and cannot answer on a pipe
+	// the parent still holds. Each spawn gets its own file, so two clients
+	// cold-starting the same socket never read each other's answer.
+	resultPath, err := ipc.NewBindResultPath()
+	if err != nil {
+		// Without a place to put the answer, fall back to the old behaviour:
+		// spawn the daemon and assume it is the one serving.
+		resultPath = ""
 	}
-	return ipc.WaitReady(ctx, socket, 8*time.Second)
+	defer ipc.RemoveBindResult(resultPath)
+
+	if err := spawnDaemonFn(socket, interval, resultPath); err != nil {
+		return false, err
+	}
+	if err := ipc.WaitReady(ctx, socket, 8*time.Second); err != nil {
+		return false, err
+	}
+
+	if resultPath == "" {
+		return true, nil
+	}
+	// The socket can answer before the daemon's report lands: it binds, then
+	// writes down that it won. Wait briefly for the answer rather than read
+	// once and mistake the gap for an unknown outcome.
+	outcome, err := ipc.WaitForBindResult(resultPath, bindResultWait)
+	if err != nil {
+		// Unknown: assume the daemon this invocation started is the one
+		// serving. A missing report must never break the watch.
+		return true, nil
+	}
+	return outcome == ipc.BindWon, nil
 }
+
+// bindResultWait bounds how long a client waits for the spawned daemon to
+// report its bind outcome. The daemon writes the file within milliseconds of
+// binding, so this only covers the gap between the socket becoming
+// answerable and the report landing. It is short on purpose: an unreported
+// outcome falls back to the previous behaviour, and a watch must not wait on
+// a report that is never coming.
+const bindResultWait = 2 * time.Second
 
 // spawnDaemon re-executes the current binary as a detached `gh monitor daemon`
 // that outlives the client. Stdio is redirected to /dev/null and the process
 // is detached from the parent terminal (setsid on Unix, CREATE_NEW_PROCESS_GROUP
 // | DETACHED_PROCESS on Windows) so it survives the client exiting.
-func spawnDaemon(socket string, interval time.Duration) error {
+//
+// bindResultPath, when not empty, is where the spawned daemon reports whether
+// it won the socket. The client needs the answer: a daemon that lost the bind
+// race serves nothing, and the client must not assume its own --interval
+// reached the daemon that does serve (issue #170).
+func spawnDaemon(socket string, interval time.Duration, bindResultPath string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -667,6 +729,9 @@ func spawnDaemon(socket string, interval time.Duration) error {
 	cmd.Stdin = devnull
 	cmd.Stdout = devnull
 	cmd.Stderr = devnull
+	if bindResultPath != "" {
+		cmd.Env = ipc.EnvWithBindResult(os.Environ(), bindResultPath)
+	}
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn daemon: %w", err)

@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/orphan"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/reexec"
@@ -106,7 +107,14 @@ func watchInstalledBinary(ctx context.Context, installed, socket string, interva
 
 // buildUpgradeCommand assembles the successor daemon's invocation.
 func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec.Cmd {
-	return exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+	cmd := exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+	// The successor takes the socket over from this daemon through the
+	// upgrade handoff. It did not win a bind race, so it must not report an
+	// outcome into the file the client that spawned this daemon is waiting
+	// on: the answer there is about the bind, not about a handoff (issue
+	// #170).
+	cmd.Env = ipc.EnvWithBindResult(os.Environ(), "")
+	return cmd
 }
 
 // ---------------------------------------------------------------------------
