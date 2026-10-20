@@ -15,7 +15,6 @@ import (
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
-	"github.com/elecnix/gh-monitor/internal/testrec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -696,7 +695,7 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 	// reading can change between polls. The service stub stays full: the
 	// store is what the guard consults first.
 	store := ghcli.NewRateLimitStore()
-	store.Observe("github.com", testrec.GraphQLHeaders(5000, 5000, now.Add(25*time.Minute)), now)
+	store.Observe("github.com", ghcli.GraphQLHeaders(5000, 5000, now.Add(25*time.Minute)), now)
 
 	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 5000, limit: 5000}}
 	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
@@ -728,7 +727,7 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 
 	// Now the budget drops: 2% remaining maps to TierNoReviews, so
 	// annotations, reviews and review threads are shed.
-	store.Observe("github.com", testrec.GraphQLHeaders(100, 5000, time.Now().Add(25*time.Minute)), time.Now())
+	store.Observe("github.com", ghcli.GraphQLHeaders(100, 5000, time.Now().Add(25*time.Minute)), time.Now())
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 
 	deadline := time.After(asyncDeadline)

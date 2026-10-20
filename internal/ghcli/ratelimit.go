@@ -30,6 +30,24 @@ type RateLimitStore struct {
 	readings map[string]RateLimitReading
 }
 
+// GraphQLHeaders builds the X-RateLimit-* headers a GraphQL response
+// carries, with the given remaining count against a limit, and a reset at
+// the given time.
+//
+// It is the inverse of what Observe parses, and it exists so a test that
+// drives a rate-limit reading does not spell out those five headers by
+// hand: several packages' test suites need them, and they are always the
+// same five.
+func GraphQLHeaders(remaining, limit int, reset time.Time) http.Header {
+	h := http.Header{}
+	h.Set("X-RateLimit-Resource", "graphql")
+	h.Set("X-RateLimit-Limit", strconv.Itoa(limit))
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	h.Set("X-RateLimit-Used", strconv.Itoa(limit-remaining))
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+	return h
+}
+
 // NewRateLimitStore returns an empty store.
 func NewRateLimitStore() *RateLimitStore {
 	return &RateLimitStore{readings: make(map[string]RateLimitReading)}
