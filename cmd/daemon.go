@@ -310,8 +310,17 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		shutdown:  func() { cancel(); _ = listener.Close() },
 	}
 
-	var wg sync.WaitGroup
+	// Two wait groups, because a WaitGroup requires every Add to precede the
+	// Wait that observes its counter reaching zero. The accept loop calls Add
+	// from inside itself, so waiting on that group directly could observe zero
+	// between two connections and return while a handler was still being
+	// registered. Waiting for the loop to finish first proves no further Add
+	// can happen; only then is it safe to wait on the handlers.
+	var accepting sync.WaitGroup
+	var handlers sync.WaitGroup
+	accepting.Add(1)
 	go func() {
+		defer accepting.Done()
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
@@ -321,9 +330,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor: accept: %v\n", err)
 				continue
 			}
-			wg.Add(1)
+			handlers.Add(1)
 			go func(c net.Conn) {
-				defer wg.Done()
+				defer handlers.Done()
 				defer func() { _ = c.Close() }()
 				serveClient(ctx, srv, c)
 			}(conn)
@@ -331,7 +340,8 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	}()
 
 	<-ctx.Done()
-	wg.Wait()
+	accepting.Wait()
+	handlers.Wait()
 	// Give the launcher a bounded window to signal and reap its children so a
 	// successor (upgrade handoff) or the operator is not left with orphans
 	// holding the private sockets. A child that ignores SIGINT for this long
