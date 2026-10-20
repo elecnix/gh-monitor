@@ -21,23 +21,13 @@ type failoverNote struct {
 
 // failoverRecorder collects the router's failover observations. It is safe
 // for concurrent use: several watches fail over at once.
-type failoverRecorder struct {
-	notes *testrec.Recorder[failoverNote]
-}
-
-// all returns the recorded failovers, oldest first.
-func (r *failoverRecorder) all() []failoverNote {
-	return r.notes.All()
-}
-
 // newFailoverRecorder returns a recorder and the callback that feeds it. The
 // callback has the shape the router's failover observer has, so the test
 // hands it straight to the router.
-func newFailoverRecorder() (*failoverRecorder, func(backend.Target, string, string, time.Time)) {
-	rec, feed := testrec.New(func(target backend.Target, from, reason string, at time.Time) failoverNote {
+func newFailoverRecorder() (*testrec.Recorder[failoverNote], func(backend.Target, string, string, time.Time)) {
+	return testrec.New(func(target backend.Target, from, reason string, at time.Time) failoverNote {
 		return failoverNote{target: target, from: from, reason: reason, at: at}
 	})
-	return &failoverRecorder{notes: rec}, feed
 }
 
 // TestRoutingSourceStampsSubdaemonUpdates proves that every update a
@@ -118,7 +108,7 @@ func TestRoutingSourceObservesFailover(t *testing.T) {
 		}
 	}
 sawNotice:
-	notes := rec.all()
+	notes := rec.All()
 	if len(notes) != 1 {
 		t.Fatalf("the failover must be observed exactly once, got %d", len(notes))
 	}
@@ -167,7 +157,7 @@ func TestRoutingSourceObservesDialFailure(t *testing.T) {
 	deadline := time.After(3 * time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
-	for len(rec.all()) == 0 {
+	for len(rec.All()) == 0 {
 		select {
 		case _, ok := <-ch:
 			if !ok {
@@ -178,7 +168,7 @@ func TestRoutingSourceObservesDialFailure(t *testing.T) {
 			t.Fatal("no fallback notice")
 		}
 	}
-	notes := rec.all()
+	notes := rec.All()
 	if len(notes) != 1 {
 		t.Fatalf("the dial failure must be observed exactly once, got %d", len(notes))
 	}

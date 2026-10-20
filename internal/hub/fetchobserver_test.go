@@ -25,23 +25,13 @@ type fetchObservation struct {
 
 // fetchRecorder collects the hub's fetch observations. It is safe for
 // concurrent use: several pollers fetch at once.
-type fetchRecorder struct {
-	seens *testrec.Recorder[fetchObservation]
-}
-
-// observations returns the recorded fetches, oldest first.
-func (r *fetchRecorder) observations() []fetchObservation {
-	return r.seens.All()
-}
-
 // newFetchRecorder returns a recorder and the callback that feeds it. The
 // callback has the shape the hub's fetch observer has, so the test hands it
 // straight to the hub.
-func newFetchRecorder() (*fetchRecorder, func(backend.Target, monitor.QueryTier, bool, time.Time)) {
-	rec, feed := testrec.New(func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) fetchObservation {
+func newFetchRecorder() (*testrec.Recorder[fetchObservation], func(backend.Target, monitor.QueryTier, bool, time.Time)) {
+	return testrec.New(func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) fetchObservation {
 		return fetchObservation{target: target, tier: tier, changed: changed, at: at}
 	})
-	return &fetchRecorder{seens: rec}, feed
 }
 
 // TestHub_FetchObserverReportsTargetTierAndChange is the acceptance test for
@@ -67,7 +57,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 
 	// The first fetch has no previous observation to compare against, so it
 	// counts as a change: the poller learned the target's state.
-	seens := rec.observations()
+	seens := rec.All()
 	require.Len(t, seens, 1, "one fetch, one observation")
 	assert.Equal(t, testHubTarget(), seens[0].target, "the observation names the target that was read")
 	assert.Equal(t, monitor.TierFull, seens[0].tier, "the observation names the tier the read ran at")
@@ -79,7 +69,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	collect(ch, 200*time.Millisecond)
 
-	seens = rec.observations()
+	seens = rec.All()
 	require.Len(t, seens, 2, "the second fetch is observed too")
 	assert.False(t, seens[1].changed, "an unchanged payload is not a change")
 	assert.Equal(t, seens[0].tier, seens[1].tier, "the tier is reported on every fetch")
@@ -90,7 +80,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	collect(ch, 200*time.Millisecond)
 
-	seens = rec.observations()
+	seens = rec.All()
 	require.Len(t, seens, 3, "the third fetch is observed too")
 	assert.True(t, seens[2].changed, "a changed payload is a change")
 }
@@ -116,7 +106,7 @@ func TestHub_FetchObserverReportsTheShedTier(t *testing.T) {
 	t.Cleanup(cancelSub)
 	collect(ch, 300*time.Millisecond)
 
-	seens := rec.observations()
+	seens := rec.All()
 	require.NotEmpty(t, seens, "the fetch is observed")
 	assert.Equal(t, monitor.TierNoReviews, seens[0].tier,
 		"the record names the shed tier the read ran at")
@@ -142,7 +132,7 @@ func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
 	out := h.Once(context.Background(), testHubTarget(), testHubOpts())
 	for range out {
 	}
-	seens := rec.observations()
+	seens := rec.All()
 	require.Len(t, seens, 1, "the one-shot read is observed")
 	assert.Equal(t, monitor.TierFull, seens[0].tier,
 		"a one-shot read ran at the full tier, and the record must say so")
@@ -167,7 +157,7 @@ func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
 	t.Cleanup(cancelSub)
 	collect(ch, 300*time.Millisecond)
 
-	seens = rec2.observations()
+	seens = rec2.All()
 	require.Len(t, seens, 1, "the retried poll is observed")
 	assert.Equal(t, monitor.TierNoAnnotations, seens[0].tier,
 		"the record names the tier that answered, not the one that failed")
