@@ -1,6 +1,10 @@
 package prefs
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -110,16 +114,50 @@ func TestValidPrefKeysAreAcceptedByUpdateFile(t *testing.T) {
 // updateFileKeys is every top-level key UpdateFile recognises, discovered by
 // probing it rather than by reading the switch, so the two lists in this file
 // cannot drift apart without the tests above noticing.
+//
+// The candidate set is the union of the keys UpdateFile's switch can match and
+// the keys validPrefKeys names, plus one key the switch does not know, so the
+// probe covers a key added to either side. A candidate set that was itself
+// hand-written would only ever prove the two lists agree about the keys it
+// already knew about, which is the drift this test exists to catch.
 func updateFileKeys(t *testing.T) []string {
 	t.Helper()
 	var keys []string
-	for _, candidate := range append([]string{"templates", "ignoredBots", "retriggerComments",
-		"selfUpdate", "pollInterval", "idlePollCeiling", "pollWhenBrokerHealthy",
-		"reactOnNotify", "eventLog", "notAKeyAtAll"}, []string{}...) {
+	for _, candidate := range append(updateFileSwitchKeys(t), validPrefKeys...) {
 		_, err := UpdateFile(t.TempDir(), []byte(`{"`+candidate+`": null}`))
 		if err == nil || !strings.Contains(err.Error(), "unknown preference key") {
 			keys = append(keys, candidate)
 		}
 	}
+	return keys
+}
+
+// updateFileSwitchKeys reads the case labels of UpdateFile's switch over the
+// override document, so a key added to the switch is probed without anyone
+// having to add it to a second list.
+func updateFileSwitchKeys(t *testing.T) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "update.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse update.go: %v", err)
+	}
+	var keys []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		switch stmt := n.(type) {
+		case *ast.CaseClause:
+			for _, expr := range stmt.List {
+				lit, ok := expr.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if key, err := strconv.Unquote(lit.Value); err == nil {
+					keys = append(keys, key)
+				}
+			}
+		}
+		return true
+	})
+	require.NotEmpty(t, keys, "no case labels found in update.go: the switch moved")
 	return keys
 }
