@@ -82,6 +82,28 @@ func drainAnnotations(t *testing.T, ch <-chan backend.Update, timeout time.Durat
 	}
 }
 
+// drainAnnotationEvent reads ch until an update carrying annotations arrives,
+// and returns the first of them. It returns nil when the stream goes quiet
+// without one.
+func drainAnnotationEvent(t *testing.T, ch <-chan backend.Update, timeout time.Duration) *backend.AnnotationSummary {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if u.Event.Type == backend.EventCheckAnnotations && len(u.Event.Annotations) > 0 {
+				a := u.Event.Annotations[0]
+				return &a
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
 // TestHub_AnnotationChecksFilterCrossesTheProcessBoundary confirms the
 // per-check-name filter survives the trip through WatchOptions — the wire
 // the daemon and an out-of-process backend see (issue #110).
@@ -129,16 +151,17 @@ func TestHub_AnnotationChecksFilterCrossesTheProcessBoundary(t *testing.T) {
 	t.Run("the one-shot read applies the filter too", func(t *testing.T) {
 		// The one-shot path is what an agent's probe uses, so a filter
 		// that only worked on the watch path would miss the case the
-		// issue names.
+		// issue names. The assertion is on the annotation's CONTENT rather
+		// than its check name, so it says something the watch-path
+		// assertion does not.
 		opts := testHubOpts()
 		opts.Once = true
 		opts.AnnotationChecks = []string{"dupdelta"}
 
 		ch := h.Once(ctx, testHubTarget(), opts)
-		names := drainAnnotations(t, ch, 2*time.Second)
-		require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
-		for _, n := range names {
-			assert.Equal(t, "dupdelta", n, "the one-shot read must apply the check-name filter")
-		}
+		got := drainAnnotationEvent(t, ch, 2*time.Second)
+		require.NotNil(t, got, "the one-shot read must deliver the named check's annotation")
+		assert.Equal(t, "clone of src/orig.go", got.Message)
+		assert.Equal(t, 12, got.Line)
 	})
 }

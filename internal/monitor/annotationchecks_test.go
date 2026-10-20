@@ -9,41 +9,39 @@ import (
 
 // TestAnnotationChecks_Allows exercises the predicate directly.
 //
-// Cases:
-//   - nil filter allows every check (the default).
-//   - a non-nil allowlist allows only the listed check names.
-//   - matching is case-insensitive and trims whitespace.
-//   - the match is on the WHOLE name, so a prefix of a check name does not
-//     pass: that is what keeps "lint" from matching "lint (node 20)".
+// The cases are table-driven: each row pairs an allowlist with the check
+// name it is asked about and the answer it must give.
 func TestAnnotationChecks_Allows(t *testing.T) {
-	// nil filter = every check.
+	cases := []struct {
+		name  string
+		allow []string
+		check string
+		want  bool
+	}{
+		{"a listed check passes", []string{"dupdelta"}, "dupdelta", true},
+		{"an unlisted check does not", []string{"dupdelta"}, "lint", false},
+		{"an empty check name does not", []string{"dupdelta"}, "", false},
+		{"matching ignores case", []string{"  DupDelta  "}, "DUPDELTA", true},
+		{"matching ignores case, the other way", []string{"  DupDelta  "}, "DupDelta", true},
+		{"the whole name has to match", []string{"lint"}, "lint (node 20)", false},
+		{"a listed name is matched whole too", []string{"lint (node 20)"}, "lint", false},
+		{"several names can be listed", []string{"dupdelta", "lint"}, "lint", true},
+		{"a third check is still refused", []string{"dupdelta", "lint"}, "build", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := NewAnnotationChecks(tc.allow...)
+			assert.Equal(t, tc.want, f.Allows(tc.check))
+		})
+	}
+}
+
+// TestAnnotationChecks_NilFilterAllowsEveryCheck confirms a nil filter — the
+// default — admits every check, whatever it is named.
+func TestAnnotationChecks_NilFilterAllowsEveryCheck(t *testing.T) {
 	var nilFilter *AnnotationChecks
 	assert.True(t, nilFilter.Allows("dupdelta"))
 	assert.True(t, nilFilter.Allows("anything at all"))
-
-	// non-nil allowlist: only the listed names pass.
-	f := NewAnnotationChecks("dupdelta")
-	assert.True(t, f.Allows("dupdelta"))
-	assert.False(t, f.Allows("lint"))
-	assert.False(t, f.Allows(""))
-
-	// case-insensitive + whitespace-trimmed.
-	mixed := NewAnnotationChecks("  DupDelta  ")
-	assert.True(t, mixed.Allows("DUPDELTA"))
-	assert.True(t, mixed.Allows("dupdelta"))
-	assert.True(t, mixed.Allows("DupDelta"))
-
-	// The whole name has to match: "lint" does not admit "lint (node 20)",
-	// and "lint (node 20)" does not admit "lint".
-	whole := NewAnnotationChecks("lint")
-	assert.True(t, whole.Allows("lint"))
-	assert.False(t, whole.Allows("lint (node 20)"))
-
-	// Several names at once.
-	multi := NewAnnotationChecks("dupdelta", "lint")
-	assert.True(t, multi.Allows("dupdelta"))
-	assert.True(t, multi.Allows("lint"))
-	assert.False(t, multi.Allows("build"))
 }
 
 // TestAnnotationChecks_None exercises the explicit "none" spelling: a
@@ -112,16 +110,14 @@ func TestParseAnnotationChecks_Valid(t *testing.T) {
 // preference file listed no checks would be the worst possible reading of a
 // missing setting.
 func TestParseAnnotationChecks_EmptyInputKeepsEveryCheck(t *testing.T) {
-	f, err := ParseAnnotationChecks("")
-	require.NoError(t, err)
-	assert.Nil(t, f)
-	assert.True(t, f.Allows("dupdelta"))
-
-	// A string of nothing but separators is the same case.
-	f, err = ParseAnnotationChecks("  , , ")
-	require.NoError(t, err)
-	assert.Nil(t, f)
-	assert.True(t, f.Allows("dupdelta"))
+	// Both spellings of "no check named": an empty string, and a string of
+	// nothing but separators.
+	for _, input := range []string{"", "  , , "} {
+		f, err := ParseAnnotationChecks(input)
+		require.NoError(t, err)
+		assert.Nil(t, f, "input %q must yield a nil filter", input)
+		assert.True(t, f.Allows("dupdelta"), "input %q must keep every check", input)
+	}
 }
 
 // TestAnnotationChecks_Names confirms the filter can cross a process
