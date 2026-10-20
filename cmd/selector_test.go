@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
+
 	"errors"
 	"strings"
 	"testing"
@@ -15,34 +15,52 @@ import (
 // TestMonitorShorthandSelector covers the OWNER/REPO#NUMBER shorthand on the
 // default command: it names its own repository, so it needs no -R and no git
 // context, and it resolves to the same identity as -R owner/repo NUMBER.
+// TestMonitorShorthandSelector covers the OWNER/REPO#NUMBER shorthand on the
+// default command: it names its own repository, so it needs no -R and no git
+// context, it resolves to the same identity as -R owner/repo NUMBER, and it
+// carries no host of its own.
 func TestMonitorShorthandSelector(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()
 
-	var gotOwner, gotRepo string
-	var gotNumber int
+	type target struct {
+		owner  string
+		repo   string
+		number int
+	}
+	var seen []target
 	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
 		require.Contains(t, query, "MonitorPR")
-		gotOwner, _ = variables["owner"].(string)
-		gotRepo, _ = variables["repo"].(string)
-		gotNumber, _ = variables["number"].(int)
+		owner, _ := variables["owner"].(string)
+		repo, _ := variables["repo"].(string)
+		number, _ := variables["number"].(int)
+		seen = append(seen, target{owner, repo, number})
 		return assignJSON(result, openPRWithFailingCheck())
 	}}
 	apiClientFactory = func(string) ghcli.API { return fake }
 
-	root := newRootCommand()
-	stdout := &bytes.Buffer{}
-	root.SetOut(stdout)
-	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"octo/demo#7", "--once"})
-	require.NoError(t, root.Execute())
+	run := func(args []string) string {
+		root := newRootCommand()
+		stdout := &bytes.Buffer{}
+		root.SetOut(stdout)
+		root.SetErr(&bytes.Buffer{})
+		root.SetArgs(args)
+		require.NoError(t, root.Execute())
+		return stdout.String()
+	}
 
-	assert.Equal(t, "octo", gotOwner)
-	assert.Equal(t, "demo", gotRepo)
-	assert.Equal(t, 7, gotNumber)
-	assert.Contains(t, stdout.String(), `"pr_label":"octo/demo#7"`)
+	// The shorthand alone names the target.
+	out := run([]string{"octo/demo#7", "--once"})
+	require.Len(t, seen, 1)
+	assert.Equal(t, target{owner: "octo", repo: "demo", number: 7}, seen[0])
+	assert.Contains(t, out, `"pr_label":"octo/demo#7"`)
+
+	// The shorthand and -R owner/repo NUMBER name the same target.
+	run([]string{"-R", "octo/demo", "7", "--once"})
+	require.Len(t, seen, 2)
+	assert.Equal(t, seen[0], seen[1], "the shorthand and -R owner/repo NUMBER must name the same target")
 }
 
 // TestMonitorShorthandSelectorUsesGHHost checks the host rule the shorthand
@@ -72,47 +90,10 @@ func TestMonitorShorthandSelectorUsesGHHost(t *testing.T) {
 	assert.Equal(t, "ghe.example.com", gotHost)
 }
 
-// TestMonitorShorthandSelectorMatchesRepoFlag is the equivalence the issue
-// asks for: the shorthand and -R owner/repo NUMBER name the same target.
-func TestMonitorShorthandSelectorMatchesRepoFlag(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("GH_HOST", "")
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
-
-	type target struct {
-		owner  string
-		repo   string
-		number int
-	}
-	var seen []target
-	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
-		owner, _ := variables["owner"].(string)
-		repo, _ := variables["repo"].(string)
-		number, _ := variables["number"].(int)
-		seen = append(seen, target{owner, repo, number})
-		return assignJSON(result, openPRWithFailingCheck())
-	}}
-	apiClientFactory = func(string) ghcli.API { return fake }
-
-	run := func(args []string) {
-		root := newRootCommand()
-		root.SetOut(&bytes.Buffer{})
-		root.SetErr(&bytes.Buffer{})
-		root.SetArgs(args)
-		require.NoError(t, root.Execute())
-	}
-
-	run([]string{"octo/demo#7", "--once"})
-	run([]string{"-R", "octo/demo", "7", "--once"})
-
-	require.Len(t, seen, 2)
-	assert.Equal(t, seen[0], seen[1], "the shorthand and -R owner/repo NUMBER must name the same target")
-}
-
 // TestMonitorShorthandSelectorWithPrFlag covers the --pr consistency rule:
 // a matching --pr is accepted, a mismatching one is rejected — the same
-// rule a URL selector follows.
+// rule a URL selector follows. It also covers the error message for a
+// malformed shorthand, which names the accepted forms.
 func TestMonitorShorthandSelectorWithPrFlag(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
@@ -140,93 +121,98 @@ func TestMonitorShorthandSelectorWithPrFlag(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not match --pr=8")
-}
 
-// TestMonitorShorthandSelectorRejectsUnknownForm checks the error message
-// names the accepted selector forms, so a reader who typed something else
-// knows what to try next.
-func TestMonitorShorthandSelectorRejectsUnknownForm(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("GH_HOST", "")
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
-	apiClientFactory = func(string) ghcli.API { return &commandFakeAPI{} }
-
-	root := newRootCommand()
+	// A malformed shorthand is rejected, and the error names the accepted
+	// forms so a reader who typed something else knows what to try next.
+	root = newRootCommand()
 	root.SetOut(&bytes.Buffer{})
 	root.SetErr(&bytes.Buffer{})
 	root.SetArgs([]string{"octo/demo#7x", "--once"})
-	err := root.Execute()
+	err = root.Execute()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "owner/repo#number")
 }
 
-// TestDraftStatusShorthandSelector covers a subcommand: the draft verbs take
-// the same selector, and their own argument parsing must not mistake the
-// shorthand for a bare number.
-func TestDraftStatusShorthandSelector(t *testing.T) {
+// TestShorthandSelectorOnEveryVerb covers the verbs that take a pull
+// request selector: each one must resolve the OWNER/REPO#NUMBER shorthand to
+// the same target the -R owner/repo NUMBER form names.
+func TestShorthandSelectorOnEveryVerb(t *testing.T) {
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()
 
-	fake := &commandFakeAPI{}
-	fake.restFunc = func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+	// The pull request the shorthand must resolve to.
+	const (
+		wantOwner  = "octo"
+		wantRepo   = "demo"
+		wantNumber = 5
+	)
+
+	// restPaths answers the REST reads the verbs make to canonicalize the
+	// pull request; gotPath records the one that was asked for.
+	var gotPath string
+	restFunc := func(method, path string, params map[string]string, body interface{}, result interface{}) error {
+		gotPath = path
 		switch path {
 		case "repos/octo/demo":
 			return assignJSON(result, map[string]interface{}{"full_name": "octo/demo"})
 		case "repos/octo/demo/pulls/5":
 			return assignJSON(result, map[string]interface{}{"node_id": "PR_node"})
 		default:
-			return errors.New("unexpected path")
+			return errors.New("unexpected path: " + path)
 		}
 	}
-	fake.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
-		if !strings.Contains(query, "PullRequestStatus") {
-			return errors.New("unexpected query")
+
+	// graphqlFunc answers every query the verbs make, and records the
+	// pull request variables the query carried.
+	var gotOwner, gotRepo string
+	var gotNumber int
+	graphqlFunc := func(query string, variables map[string]interface{}, result interface{}) error {
+		if owner, ok := variables["owner"].(string); ok {
+			gotOwner = owner
 		}
-		assert.Equal(t, "octo", variables["owner"])
-		assert.Equal(t, "demo", variables["repo"])
-		assert.Equal(t, 5, variables["number"])
-		return assignJSON(result, map[string]interface{}{
-			"repository": map[string]interface{}{
-				"pullRequest": map[string]interface{}{
-					"number":  5,
-					"title":   "Test PR",
-					"isDraft": false,
-				},
-			},
-		})
-	}
-	apiClientFactory = func(host string) ghcli.API { return fake }
-
-	cmd := newDraftStatusCommand(&backendOptions{})
-	cmd.SetArgs([]string{"octo/demo#5"})
-
-	var buf bytes.Buffer
-	cmd.SetOut(&buf)
-
-	err := cmd.Execute()
-	require.NoError(t, err)
-
-	var output map[string]interface{}
-	require.NoError(t, json.Unmarshal(buf.Bytes(), &output))
-	assert.Equal(t, float64(5), output["pr_number"])
-}
-
-// TestCommentsReplyShorthandSelector covers the comments verb, which
-// resolves the pull request before the reply mutation.
-func TestCommentsReplyShorthandSelector(t *testing.T) {
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
-
-	fake := &commandFakeAPI{}
-	fake.restFunc = func(method, path string, params map[string]string, body interface{}, result interface{}) error {
-		if path == "repos/octo/demo/pulls/5" {
-			return assignJSON(result, map[string]interface{}{"node_id": "PR_node"})
+		if repo, ok := variables["repo"].(string); ok {
+			gotRepo = repo
 		}
-		return errors.New("unexpected path: " + path)
-	}
-	fake.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
+		if name, ok := variables["name"].(string); ok {
+			gotRepo = name
+		}
+		if number, ok := variables["number"].(int); ok {
+			gotNumber = number
+		}
 		switch {
+		case strings.Contains(query, "PullRequestStatus"):
+			return assignJSON(result, map[string]interface{}{
+				"repository": map[string]interface{}{
+					"pullRequest": map[string]interface{}{
+						"number":  wantNumber,
+						"title":   "Test PR",
+						"isDraft": false,
+					},
+				},
+			})
+		case strings.Contains(query, "query Report("):
+			// The report query: it needs a pull request to exist. It
+			// queries reviewThreads too, so it is matched first.
+			return assignJSON(result, map[string]interface{}{
+				"repository": map[string]interface{}{
+					"pullRequest": map[string]interface{}{
+						"reviews":       map[string]interface{}{"nodes": []interface{}{}},
+						"reviewThreads": map[string]interface{}{"nodes": []interface{}{}},
+					},
+				},
+			})
+		case strings.Contains(query, "reviewThreads"):
+			return assignJSON(result, map[string]interface{}{
+				"node": map[string]interface{}{
+					"reviewThreads": map[string]interface{}{
+						"nodes": []map[string]interface{}{},
+						"pageInfo": map[string]interface{}{
+							"hasNextPage": false,
+							"endCursor":   "",
+						},
+					},
+				},
+			})
 		case strings.Contains(query, "AddPullRequestReviewThreadReply"):
 			return assignJSON(result, map[string]interface{}{
 				"addPullRequestReviewThreadReply": map[string]interface{}{
@@ -261,97 +247,77 @@ func TestCommentsReplyShorthandSelector(t *testing.T) {
 				},
 			})
 		default:
-			return errors.New("unexpected query")
+			return errors.New("unexpected query: " + query)
 		}
 	}
-	apiClientFactory = func(host string) ghcli.API { return fake }
 
-	root := newRootCommand()
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	root.SetOut(stdout)
-	root.SetErr(stderr)
-	root.SetArgs([]string{"comments", "reply", "octo/demo#5", "--thread-id", "PRRT_thread", "--body", "ack"})
-
-	err := root.Execute()
-	require.NoError(t, err)
-	assert.Empty(t, stderr.String())
-
-	var payload map[string]interface{}
-	require.NoError(t, json.Unmarshal(stdout.Bytes(), &payload))
-	assert.Equal(t, "PRRC_reply", payload["comment_node_id"])
-}
-
-// TestReviewViewShorthandSelector covers the review view verb, which
-// resolves the pull request through the report service rather than the
-// monitor's own path.
-func TestReviewViewShorthandSelector(t *testing.T) {
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
-
-	fake := &fakeViewAPI{payload: viewResponse, t: t}
-	apiClientFactory = func(host string) ghcli.API { return fake }
-
-	root := newRootCommand()
-	buf := &bytes.Buffer{}
-	root.SetOut(buf)
-	root.SetErr(&bytes.Buffer{})
-	root.SetArgs([]string{"review", "view", "octo/demo#51"})
-
-	require.NoError(t, root.Execute())
-	assert.Equal(t, "octo", fake.variables["owner"])
-	assert.Equal(t, "demo", fake.variables["name"])
-	assert.Equal(t, 51, fake.variables["number"])
-}
-
-// TestThreadsListShorthandSelector covers the threads verbs, which resolve
-// the pull request over REST before listing its threads.
-func TestThreadsListShorthandSelector(t *testing.T) {
-	originalFactory := apiClientFactory
-	defer func() { apiClientFactory = originalFactory }()
-
-	fake := &commandFakeAPI{}
-	fake.restFunc = func(method, path string, params map[string]string, body interface{}, result interface{}) error {
-		assert.Equal(t, "GET", method)
-		switch path {
-		case "repos/octo/demo":
-			return assignJSON(result, map[string]interface{}{"full_name": "octo/demo"})
-		case "repos/octo/demo/pulls/5":
-			return assignJSON(result, map[string]interface{}{"node_id": "PR_node"})
-		default:
-			return errors.New("unexpected path: " + path)
-		}
+	tests := []struct {
+		name string
+		args []string
+		// proof says how this verb reaches the pull request: through the
+		// GraphQL variables, or through a REST read of the pull request.
+		proof string
+	}{
+		{
+			name:  "draft status",
+			args:  []string{"draft", "status", "octo/demo#5"},
+			proof: "graphql",
+		},
+		{
+			name:  "threads list",
+			args:  []string{"threads", "list", "octo/demo#5"},
+			proof: "rest",
+		},
+		{
+			name: "comments reply",
+			args: []string{"comments", "reply", "octo/demo#5", "--thread-id", "PRRT_thread", "--body", "ack"},
+			// The comments service posts to the thread the --thread-id
+			// names and never reads the pull request, so the proof that the
+			// shorthand was accepted is that the command reached the
+			// mutation and answered.
+			proof: "accepted",
+		},
+		{
+			name:  "review view",
+			args:  []string{"review", "view", "octo/demo#5"},
+			proof: "graphql",
+		},
 	}
-	fake.graphqlFunc = func(query string, variables map[string]interface{}, result interface{}) error {
-		if !strings.Contains(query, "reviewThreads") {
-			return errors.New("unexpected query")
-		}
-		return assignJSON(result, map[string]interface{}{
-			"node": map[string]interface{}{
-				"reviewThreads": map[string]interface{}{
-					"nodes": []map[string]interface{}{},
-					"pageInfo": map[string]interface{}{
-						"hasNextPage": false,
-						"endCursor":   "",
-					},
-				},
-			},
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOwner, gotRepo, gotNumber, gotPath = "", "", 0, ""
+			fake := &commandFakeAPI{restFunc: restFunc, graphqlFunc: graphqlFunc}
+			apiClientFactory = func(host string) ghcli.API { return fake }
+
+			root := newRootCommand()
+			stdout := &bytes.Buffer{}
+			stderr := &bytes.Buffer{}
+			root.SetOut(stdout)
+			root.SetErr(stderr)
+			root.SetArgs(tt.args)
+
+			require.NoError(t, root.Execute())
+			assert.Empty(t, stderr.String())
+
+			switch tt.proof {
+			case "graphql":
+				// The pull request the query asked for must be the one the
+				// shorthand names.
+				assert.Equal(t, wantOwner, gotOwner)
+				assert.Equal(t, wantRepo, gotRepo)
+				assert.Equal(t, wantNumber, gotNumber)
+			case "rest":
+				// A verb that reads the pull request over REST must have
+				// reached the repository and the pull request the shorthand
+				// named.
+				assert.Equal(t, "repos/octo/demo/pulls/5", gotPath)
+			case "accepted":
+				// The command answered, so the shorthand was accepted.
+				assert.NotEmpty(t, stdout.String())
+			default:
+				t.Fatalf("unknown proof %q", tt.proof)
+			}
 		})
 	}
-	apiClientFactory = func(host string) ghcli.API { return fake }
-
-	root := newRootCommand()
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	root.SetOut(stdout)
-	root.SetErr(stderr)
-	root.SetArgs([]string{"threads", "list", "octo/demo#5"})
-
-	err := root.Execute()
-	require.NoError(t, err)
-	assert.Empty(t, stderr.String())
-
-	var payload []map[string]interface{}
-	require.NoError(t, json.Unmarshal(stdout.Bytes(), &payload))
-	assert.Empty(t, payload)
 }

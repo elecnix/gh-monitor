@@ -22,9 +22,6 @@ func TestNormalizeSelector(t *testing.T) {
 
 	_, err = NormalizeSelector("https://github.com/octo/demo/pull/7", 8)
 	require.Error(t, err)
-
-	_, err = NormalizeSelector("octo/demo#7", 0)
-	require.NoError(t, err)
 }
 
 func TestNormalizeSelectorShorthand(t *testing.T) {
@@ -42,17 +39,17 @@ func TestNormalizeSelectorShorthand(t *testing.T) {
 	_, err = NormalizeSelector("octo/demo#7", 8)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not match --pr=8")
-}
 
-func TestNormalizeSelectorRejectsUnknownForm(t *testing.T) {
-	// The error message names the accepted forms, so a reader who typed the
-	// shorthand before this change knows what to try.
-	_, err := NormalizeSelector("octo/demo#7x", 0)
+	// A malformed shorthand is rejected, and the error names the accepted
+	// forms so a reader who typed the shorthand knows what to try next.
+	_, err = NormalizeSelector("octo/demo#7x", 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "owner/repo#number")
 }
 
 func TestResolveShorthand(t *testing.T) {
+	// The whole point of the shorthand: no -R, no git context, no error, and
+	// the same identity -R owner/repo 9 would name.
 	id, err := Resolve("octo/demo#9", "", "")
 	require.NoError(t, err)
 	assert.Equal(t, Identity{Owner: "octo", Repo: "demo", Host: "github.com", Number: 9, Target: "pr"}, id)
@@ -76,14 +73,6 @@ func TestResolveShorthandOverridesRepoFlag(t *testing.T) {
 	id, err := Resolve("octo/demo#9", "other/repo", "github.com")
 	require.NoError(t, err)
 	assert.Equal(t, Identity{Owner: "octo", Repo: "demo", Host: "github.com", Number: 9, Target: "pr"}, id)
-}
-
-func TestResolveShorthandNeedsNoRepoFlag(t *testing.T) {
-	// The whole point of the shorthand: no -R, no git context, no error.
-	id, err := Resolve("octo/demo#9", "", "")
-	require.NoError(t, err)
-	assert.Equal(t, "octo", id.Owner)
-	assert.Equal(t, "demo", id.Repo)
 }
 
 func TestResolveShorthandRejectsMalformed(t *testing.T) {
