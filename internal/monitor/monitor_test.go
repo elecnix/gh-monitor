@@ -470,12 +470,14 @@ func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
 		// "dup" is a prefix of the check name, not the name itself: a
 		// prefix match would also admit "dupdelta (rebase)".
 		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dup")})
-		assert.Empty(t, s.CheckAnnotations)
+		assert.Empty(t, s.CheckAnnotations, "a prefix must not match a check name")
 	})
 
 	t.Run("none drops every check", func(t *testing.T) {
-		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("none")})
-		assert.Empty(t, s.CheckAnnotations)
+		// The "none" spelling is the explicit "report nothing", and it wins
+		// over any other name in the list.
+		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("none", "dupdelta")})
+		assert.Empty(t, s.CheckAnnotations, "\"none\" must drop every check")
 	})
 
 	t.Run("the level filter still applies alongside the name filter", func(t *testing.T) {
