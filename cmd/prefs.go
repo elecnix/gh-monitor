@@ -32,6 +32,7 @@ The document shape:
   {
     "templates":            { "<event-kind>": "<template>" | null, ... },
     "ignoredBots":          ["login", ...],
+    "annotationChecks":     ["check", ...],
     "retriggerComments":    false,
     "selfUpdate":           "30m" | "1" | "" | null,
     "pollInterval":         "10m" | "" | null,
@@ -41,6 +42,13 @@ The document shape:
     "reactOnNotify":        true | false | null,
     "eventLog":             { "dir": "/path", "keepDays": 10 } | null
   }
+
+annotationChecks is the allowlist of check names whose check-run annotations
+are reported (issue #110). An empty list means every check, and the
+--annotation-checks flag overrides the stored value when it is set. It is
+what makes the check-annotations event usable as a wake trigger: a pull
+request that runs the same job six times posts the same warning six times,
+and a consumer that only wants one check's findings can say so.
 
 selfUpdate is a global-only setting (issue #82): a Go duration for the
 resident daemon's release-check cadence, "1"/"true" for the default (hourly),

@@ -29,8 +29,8 @@ type Provider struct {
 	API func(host string) ghcli.API
 
 	// Base carries the read configuration the CLI resolved from flags and
-	// preferences — ignored bots and annotation levels. Identity is filled
-	// per read from the Target.
+	// preferences — ignored bots, annotation levels and annotation checks.
+	// Identity is filled per read from the Target.
 	Base monitor.RunOptions
 }
 
@@ -211,6 +211,7 @@ func (p *Provider) read(ctx context.Context, t backend.Target) (backend.Status, 
 		snapOpts := monitor.SnapshotOptions{
 			IgnoredBots:      p.Base.Prefs.IgnoredBots,
 			AnnotationLevels: p.Base.AnnotationLevels,
+			AnnotationChecks: p.Base.AnnotationChecks,
 		}
 		// A ruleset that cannot be read must not silently become "nothing is
 		// required", so the error rides along on the snapshot rather than

@@ -259,6 +259,12 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 			snapOpts.AnnotationLevels = levels
 		}
 	}
+	if len(opts.AnnotationChecks) > 0 {
+		// Parsed, so "none" keeps meaning "report no annotations".
+		if checks, err := monitor.ParseAnnotationChecks(strings.Join(opts.AnnotationChecks, ",")); err == nil {
+			snapOpts.AnnotationChecks = checks
+		}
+	}
 
 	sub := &sub{
 		distill:    traits.distill(t, opts),
@@ -418,6 +424,11 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 	if len(opts.AnnotationLevels) > 0 {
 		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
 			snapOpts.AnnotationLevels = levels
+		}
+	}
+	if len(opts.AnnotationChecks) > 0 {
+		if checks, err := monitor.ParseAnnotationChecks(strings.Join(opts.AnnotationChecks, ",")); err == nil {
+			snapOpts.AnnotationChecks = checks
 		}
 	}
 	if h.rulesetFn != nil && keyOf(identity).kind == backend.KindPR {

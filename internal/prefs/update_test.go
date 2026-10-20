@@ -93,6 +93,91 @@ func TestUpdateFileSetsIgnoredBotsReplacing(t *testing.T) {
 	assert.Equal(t, []string{}, eff.IgnoredBots)
 }
 
+// TestUpdateFileSetsAnnotationChecks covers the annotationChecks key: the
+// allowlist of checks whose check-run annotations are reported (issue #110).
+func TestUpdateFileSetsAnnotationChecks(t *testing.T) {
+	base := t.TempDir()
+
+	// Absent: every check (the default).
+	eff, err := UpdateFile(base, []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+
+	// A list replaces the stored list.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta"]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta"}, eff.AnnotationChecks)
+
+	// Persisted to the file, visible to a fresh Load.
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta"}, got.AnnotationChecks)
+
+	// A second set replaces the value.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta","lint"]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta", "lint"}, eff.AnnotationChecks)
+
+	// An empty array clears the list, which means "every check".
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":[]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+
+	// null also clears it.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta"]}`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"dupdelta"}, eff.AnnotationChecks)
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+}
+
+// TestUpdateFileRejectsBlankAnnotationCheck confirms a blank check name is
+// rejected at set time: it would never match a check, so accepting it would
+// narrow the allowlist to nothing while looking configured.
+func TestUpdateFileRejectsBlankAnnotationCheck(t *testing.T) {
+	base := t.TempDir()
+	_, err := UpdateFile(base, []byte(`{"annotationChecks":["dupdelta","  "]}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "annotationChecks")
+
+	// Nothing was written by the failed attempt.
+	_, statErr := os.Stat(mustPath(t, base))
+	assert.True(t, os.IsNotExist(statErr))
+}
+
+// TestUpdateFileRejectsNonListAnnotationChecks confirms a value that is not
+// a list of strings is rejected.
+func TestUpdateFileRejectsNonListAnnotationChecks(t *testing.T) {
+	base := t.TempDir()
+	_, err := UpdateFile(base, []byte(`{"annotationChecks":"dupdelta"}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "annotationChecks")
+}
+
+// TestLoadAnnotationChecks confirms the stored list is read back, and that
+// an absent key keeps the default.
+func TestLoadAnnotationChecks(t *testing.T) {
+	base := t.TempDir()
+
+	// Missing file: every check (the default).
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, got.AnnotationChecks)
+
+	writeStored(t, base, `{"annotationChecks": ["dupdelta", "lint"]}`)
+	got, err = Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta", "lint"}, got.AnnotationChecks)
+
+	// An absent key keeps the default even alongside other stored config.
+	writeStored(t, base, `{"ignoredBots": ["dependabot"]}`)
+	got, err = Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, got.AnnotationChecks)
+	assert.Equal(t, []string{"dependabot"}, got.IgnoredBots)
+}
+
 func TestUpdateFileSetsRetriggerComments(t *testing.T) {
 	base := t.TempDir()
 	eff, err := UpdateFile(base, []byte(`{"retriggerComments":true}`))
