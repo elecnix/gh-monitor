@@ -156,7 +156,12 @@ func TestShorthandSelectorOnEveryVerb(t *testing.T) {
 		case "repos/octo/demo":
 			return assignJSON(result, map[string]interface{}{"full_name": "octo/demo"})
 		case "repos/octo/demo/pulls/5":
-			return assignJSON(result, map[string]interface{}{"node_id": "PR_node"})
+			// The pull request lookup hands out two identifiers, and
+			// refuses a half-filled one, so the fixture carries both.
+			return assignJSON(result, map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha5"},
+			})
 		default:
 			return errors.New("unexpected path: " + path)
 		}
