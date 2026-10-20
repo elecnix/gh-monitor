@@ -260,6 +260,51 @@ func boundAdopt(t *testing.T, socket string) (time.Duration, error) {
 	return time.Since(start), err
 }
 
+// TestAdoptBoundedWhenPredecessorNeverGreets covers the hello itself, the
+// one step that happens inside remote.Dial — before the exchange bound is
+// ever set on the connection, because the bound is applied by the Conn the
+// dial returns. A predecessor that accepts the connection and never writes a
+// hello must not park the successor, and the caller's context is not enough:
+// context.Background() carries no deadline, and a context deadline does not
+// interrupt a blocking socket read anyway.
+//
+// The hello read is bounded by remote.HandshakeTimeout inside the shared
+// codec, so this asserts the bound is reached rather than assuming where it
+// comes from — the point of the test is that Adopt returns, not that a
+// particular package owns the timeout.
+func TestAdoptBoundedWhenPredecessorNeverGreets(t *testing.T) {
+	socket := shortPath(t, "ghmon-nogreet-*.d")
+
+	// A predecessor that accepts and says nothing at all.
+	ln, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Never write a hello; hold the connection open until the
+			// test tears the listener down.
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+
+	// context.Background() carries no deadline, which is the finding's
+	// precondition.
+	start := time.Now()
+	listener, _, err := Adopt(context.Background(), socket)
+	elapsed := time.Since(start)
+	if listener != nil {
+		_ = listener.Close()
+	}
+
+	require.Error(t, err, "a predecessor that never greets must not hang the successor")
+	assert.Contains(t, err.Error(), "no protocol hello")
+	assert.Less(t, elapsed, 30*time.Second, "the hello read must give up on its own")
+}
+
 // TestAdoptBoundedWhenPredecessorNeverAnswers covers the wait for the
 // predecessor's state response. The exchange bound is set on the context, but
 // a context deadline does not interrupt a blocking socket read — so without a
