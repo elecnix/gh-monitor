@@ -535,7 +535,9 @@ func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
 	t.Run("the rest of the snapshot is untouched", func(t *testing.T) {
 		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
 		// The check outcomes are not annotations, so the filter must not
-		// touch them.
+		// touch them: both checks ran and passed, and both must still be
+		// reported as successful.
+		assert.Equal(t, []string{"dupdelta", "lint"}, s.SuccessfulChecks)
 		assert.Empty(t, s.FailingChecks)
 		assert.Empty(t, s.PendingChecks)
 	})
