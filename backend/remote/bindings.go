@@ -89,4 +89,13 @@ var providerBindings = map[backend.Capability]providerBinding{
 			r.RegisterReactions(n, k, i.(backend.ReactionActor))
 		},
 	},
+	backend.CapCoverage: {
+		server: func(c ServerConfig) any { return c.Coverage },
+		// The client side of coverage is the provider itself: it opens the
+		// coverage stream on demand. Nothing is registered for it in the
+		// registry — the daemon asks the provider directly — so the register
+		// hook is a no-op rather than a silent skip.
+		client:   clientSelf,
+		register: func(*backend.Registry, string, []backend.Kind, any) {},
+	},
 }
