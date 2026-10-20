@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -65,7 +66,11 @@ func openPRWithTwoAnnotatedChecks() obj {
 }
 
 // annotationCheckNames returns the check names of the annotations in the
-// emitted NDJSON, in order.
+// emitted NDJSON.
+//
+// The result is SORTED: the annotations reach the snapshot in whatever order
+// the check runs were walked, so an ordered comparison would fail on some
+// runs and not others.
 func annotationCheckNames(t *testing.T, stdout string) []string {
 	t.Helper()
 	var names []string
@@ -86,6 +91,7 @@ func annotationCheckNames(t *testing.T, stdout string) []string {
 			names = append(names, strings.Fields(line)[0])
 		}
 	}
+	sort.Strings(names)
 	return names
 }
 
@@ -123,7 +129,7 @@ func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 	t.Setenv("GH_HOST", "")
 
 	t.Run("without the filter every check is reported", func(t *testing.T) {
-		// The two checks, in the order the snapshot lists them.
+		// The two checks, in sorted order.
 		assert.Equal(t, []string{"dupdelta", "lint"}, annotationCheckNames(t, runMonitorOnceWith(t)))
 	})
 
