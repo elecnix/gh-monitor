@@ -32,6 +32,7 @@ func (r *failoverRecorder) record(target backend.Target, from, reason string, at
 	r.notes = append(r.notes, failoverNote{target: target, from: from, reason: reason, at: at})
 }
 
+// all returns the recorded failovers, oldest first.
 func (r *failoverRecorder) all() []failoverNote {
 	r.mu.Lock()
 	defer r.mu.Unlock()

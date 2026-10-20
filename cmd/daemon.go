@@ -467,65 +467,68 @@ func openDaemonEventLog(cmd *cobra.Command, p prefs.Preferences) *eventlog.Write
 	return w
 }
 
+// eventLogSink writes records to the daemon's event log, and reports a write
+// failure once before giving up.
+//
+// Logging is a witness: a daemon that keeps failing to write is a daemon
+// that keeps paying for the attempt, so the first failure disables the log
+// with one loud line and the watch goes on.
+type eventLogSink struct {
+	w *eventlog.Writer
+
+	mu     sync.Mutex
+	failed bool
+}
+
+// log writes one record, unless a previous write already failed.
+func (s *eventLogSink) log(record any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed {
+		return
+	}
+	if err := s.w.Log(record); err != nil {
+		s.failed = true
+		_, _ = fmt.Fprintf(os.Stderr,
+			"gh-monitor daemon: event log write failed (%v); logging disabled for this daemon\n", err)
+	}
+}
+
 // daemonFetchObserver records every hub fetch in the daemon's event log
 // (issue #122): the target, the tier it was read at, and whether the read
 // changed anything. A poll that found nothing changed delivers no update, so
 // only the hub can say that it looked and found nothing.
-//
-// A write failure is reported once and then disables the log: a daemon that
-// keeps failing to write is a daemon that keeps paying for the attempt.
 func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
-	var failed bool
-	var mu sync.Mutex
+	if w == nil {
+		return nil
+	}
+	sink := &eventLogSink{w: w}
 	return func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-		mu.Lock()
-		defer mu.Unlock()
-		if failed {
-			return
-		}
-		err := w.Log(eventlog.FetchRecord{
+		sink.log(eventlog.FetchRecord{
 			Kind:    eventlog.KindHubFetch,
 			Target:  target,
 			Tier:    tier.String(),
 			Changed: changed,
 			At:      at,
 		})
-		if err != nil {
-			failed = true
-			_, _ = fmt.Fprintf(os.Stderr,
-				"gh-monitor daemon: event log write failed (%v); logging disabled for this daemon\n", err)
-		}
 	}
 }
 
 // daemonFailoverObserver records every failover from a sub-daemon to the hub
 // in the daemon's event log (issue #122).
-//
-// A write failure is reported once and then disables the log, as above.
 func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
 	if w == nil {
 		return nil
 	}
-	var failed bool
-	var mu sync.Mutex
+	sink := &eventLogSink{w: w}
 	return func(target backend.Target, from, reason string, at time.Time) {
-		mu.Lock()
-		defer mu.Unlock()
-		if failed {
-			return
-		}
-		err := w.Log(eventlog.FailoverRecord{
+		sink.log(eventlog.FailoverRecord{
 			Kind:   eventlog.KindHubFailover,
 			Target: target,
 			From:   from,
 			Reason: reason,
 			At:     at,
 		})
-		if err != nil {
-			failed = true
-			_, _ = fmt.Fprintf(os.Stderr,
-				"gh-monitor daemon: event log write failed (%v); logging disabled for this daemon\n", err)
-		}
 	}
 }
 
