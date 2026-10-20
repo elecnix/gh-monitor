@@ -304,6 +304,46 @@ loop:
 	}
 }
 
+func TestCoverageWatchPassesCallerBaselineToFirstFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	rig := newCovRig(t, ctx, 0, func(m *CoverageMap) {
+		m.Apply("fakebroker", remote.CoverageEntry{Repo: "o/r", Covered: true, LastEvent: time.Now()})
+	})
+
+	const wantBaseline = `{"note":"prior-state"}`
+	ch, err := rig.rs.Watch(ctx, covTarget, backend.WatchOptions{
+		ResumeID: "w1",
+		Baseline: wantBaseline,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for range ch {
+		}
+	}()
+
+	eventually(t, "served by the sub-daemon", func() bool { return rig.sub.watchCalls() == 1 })
+
+	// fetchOnce runs before the sub-daemon stream starts. It must pass the
+	// caller's baseline so the hub diffs against the known-good snapshot
+	// rather than an empty one.
+	rig.hub.mu.Lock()
+	var gotBaseline string
+	for _, o := range rig.hub.opts {
+		if o.Once {
+			gotBaseline = o.Baseline
+			break
+		}
+	}
+	rig.hub.mu.Unlock()
+	if gotBaseline != wantBaseline {
+		t.Fatalf("fetchOnce must pass the caller's Baseline to the hub on the first call;\ngot  %q\nwant %q",
+			gotBaseline, wantBaseline)
+	}
+}
+
 func TestPersistedCoverageRoutesToSubdaemonAfterRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "coverage.json")
 	first := NewCoverageMap(time.Hour, time.Minute)
