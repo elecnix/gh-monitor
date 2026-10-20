@@ -21,6 +21,7 @@ registers only what it actually has.
 | `draft`     | `backend.DraftActor`    | Reads and changes draft status                                          | `gh monitor draft`                    |
 | `reactions` | `backend.ReactionActor` | Adds a reaction to a node                                               | `gh monitor react`                    |
 | `coverage`  | `remote.CoverageSource` | Reports, per repository, whether the backend is receiving events for it | daemon routing by repository coverage |
+| `report`    | `backend.ReportActor`   | Produces a pull request's reviews with their thread comments            | `gh monitor review view`              |
 
 <!-- END generated: capability-table -->
 
@@ -282,6 +283,7 @@ server → {"result":{"thread_node_id":"PRRT_1","is_resolved":true}}
 | `comments`  | `comments.reply`                                                                                     |
 | `draft`     | `draft.status`, `draft.set`, `draft.list`                                                            |
 | `reactions` | `reactions.react`                                                                                    |
+| `report`    | `report.view`                                                                                        |
 
 <!-- END generated: ops-table -->
 
