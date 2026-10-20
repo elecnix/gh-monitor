@@ -18,9 +18,9 @@ func newRootCommand() *cobra.Command {
 	monitorOpts := &monitorOptions{}
 
 	cmd := &cobra.Command{
-		Use:           "gh monitor [<number> | <url>]",
+		Use:           "gh monitor [<number> | <url> | <owner/repo#number>]",
 		Short:         "Watch GitHub PRs, issues, workflow runs, refs, and repos",
-		Long:          "Default command: continuously watch a pull request, emitting one event per genuinely-new change.\n\nWith --repo alone, watches the entire repository for new PRs and issues.\n\nRun 'gh monitor --help' for subcommands.",
+		Long:          "Default command: continuously watch a pull request, emitting one event per genuinely-new change.\n\nThe pull request selector is a number (with --repo), a pull request URL, or the owner/repo#number shorthand. The shorthand carries no host: it names a repository on the host the command is already talking to (GH_HOST, github.com by default), while a URL carries its own host.\n\nWith --repo alone, watches the entire repository for new PRs and issues.\n\nRun 'gh monitor --help' for subcommands.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		// Setting Version is what wires up --version (and -v, which is free).

@@ -42,7 +42,7 @@ func newDraftMarkCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "mark [<number>]",
+		Use:   "mark [<number> | <url> | <owner/repo#number>]",
 		Short: "Mark a pull request as draft",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -68,7 +68,7 @@ func newDraftReadyCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "ready [<number>]",
+		Use:   "ready [<number> | <url> | <owner/repo#number>]",
 		Short: "Mark a pull request as ready for review",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -94,7 +94,7 @@ func newDraftStatusCommand(bo *backendOptions) *cobra.Command {
 	opts := &draftActionOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "status [<number>]",
+		Use:   "status [<number> | <url> | <owner/repo#number>]",
 		Short: "Check if a pull request is a draft",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
