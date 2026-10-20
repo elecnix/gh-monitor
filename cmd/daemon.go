@@ -503,13 +503,7 @@ func daemonFetchObserver(w *eventlog.Writer) hub.FetchObserver {
 		return nil
 	}
 	return func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-		sink.log(eventlog.FetchRecord{
-			Kind:    eventlog.KindHubFetch,
-			Target:  target,
-			Tier:    tier.String(),
-			Changed: changed,
-			At:      at,
-		})
+		sink.log(eventlog.FetchRecordFor(target, tier.String(), changed, at))
 	}
 }
 
@@ -521,13 +515,7 @@ func daemonFailoverObserver(w *eventlog.Writer) mux.FailoverObserver {
 		return nil
 	}
 	return func(target backend.Target, from, reason string, at time.Time) {
-		sink.log(eventlog.FailoverRecord{
-			Kind:   eventlog.KindHubFailover,
-			Target: target,
-			From:   from,
-			Reason: reason,
-			At:     at,
-		})
+		sink.log(eventlog.FailoverRecordFor(target, from, reason, at))
 	}
 }
 
