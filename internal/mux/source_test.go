@@ -25,14 +25,20 @@ type failoverRecorder struct {
 	notes testrec.Recorder[failoverNote]
 }
 
-// record notes one failover.
-func (r *failoverRecorder) record(target backend.Target, from, reason string, at time.Time) {
-	r.notes.Add(failoverNote{target: target, from: from, reason: reason, at: at})
-}
-
 // all returns the recorded failovers, oldest first.
 func (r *failoverRecorder) all() []failoverNote {
 	return r.notes.All()
+}
+
+// newFailoverRecorder returns a recorder and the callback that feeds it. The
+// callback has the shape the router's failover observer has, so the test
+// hands it straight to the router.
+func newFailoverRecorder() (*failoverRecorder, func(backend.Target, string, string, time.Time)) {
+	r := &failoverRecorder{}
+	feed := func(target backend.Target, from, reason string, at time.Time) {
+		r.notes.Add(failoverNote{target: target, from: from, reason: reason, at: at})
+	}
+	return r, feed
 }
 
 // TestRoutingSourceStampsSubdaemonUpdates proves that every update a
@@ -89,9 +95,9 @@ func TestRoutingSourceObservesFailover(t *testing.T) {
 	// update, which is the failover case.
 	reg := probedRegistry(t, ctx, shortSock(t, "fails.sock"), []backend.Kind{backend.KindPR}, &recordingSource{})
 
-	rec := &failoverRecorder{}
+	rec, feed := newFailoverRecorder()
 	fallback := &recordingSource{hold: true}
-	rs := RoutingSource{Reg: reg, Fallback: fallback, OnFailover: rec.record}
+	rs := RoutingSource{Reg: reg, Fallback: fallback, OnFailover: feed}
 	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 5},
 		backend.WatchOptions{ResumeID: "abc"})
 	if err != nil {
@@ -145,9 +151,9 @@ func TestRoutingSourceObservesDialFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec := &failoverRecorder{}
+	rec, feed := newFailoverRecorder()
 	fallback := &recordingSource{hold: true}
-	rs := RoutingSource{Reg: reg, Fallback: fallback, OnFailover: rec.record}
+	rs := RoutingSource{Reg: reg, Fallback: fallback, OnFailover: feed}
 	ch, err := rs.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 4},
 		backend.WatchOptions{ResumeID: "abc"})
 	if err != nil {

@@ -116,6 +116,32 @@ type FetchRecord struct {
 	At time.Time `json:"at"`
 }
 
+// FetchRecordFor builds the record of one hub fetch. The tier is the query
+// tier the read ran at; changed reports whether the read found anything
+// different from the previous observation of the target.
+func FetchRecordFor(target backend.Target, tier string, changed bool, at time.Time) FetchRecord {
+	return FetchRecord{
+		Kind:    KindHubFetch,
+		Target:  target,
+		Tier:    tier,
+		Changed: changed,
+		At:      at,
+	}
+}
+
+// FailoverRecordFor builds the record of one watch that fell back from a
+// sub-daemon to the hub. from is the sub-daemon that stopped serving the
+// watch, and reason says why the watch moved.
+func FailoverRecordFor(target backend.Target, from, reason string, at time.Time) FailoverRecord {
+	return FailoverRecord{
+		Kind:   KindHubFailover,
+		Target: target,
+		From:   from,
+		Reason: reason,
+		At:     at,
+	}
+}
+
 // FailoverRecord is one watch that fell back from a sub-daemon to the hub
 // (issue #122).
 //

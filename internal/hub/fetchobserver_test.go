@@ -29,14 +29,20 @@ type fetchRecorder struct {
 	seens testrec.Recorder[fetchObservation]
 }
 
-// record notes one fetch.
-func (r *fetchRecorder) record(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-	r.seens.Add(fetchObservation{target: target, tier: tier, changed: changed, at: at})
-}
-
 // observations returns the recorded fetches, oldest first.
 func (r *fetchRecorder) observations() []fetchObservation {
 	return r.seens.All()
+}
+
+// newFetchRecorder returns a recorder and the callback that feeds it. The
+// callback has the shape the hub's fetch observer has, so the test hands it
+// straight to the hub.
+func newFetchRecorder() (*fetchRecorder, func(backend.Target, monitor.QueryTier, bool, time.Time)) {
+	r := &fetchRecorder{}
+	feed := func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
+		r.seens.Add(fetchObservation{target: target, tier: tier, changed: changed, at: at})
+	}
+	return r, feed
 }
 
 // TestHub_FetchObserverReportsTargetTierAndChange is the acceptance test for
@@ -47,11 +53,11 @@ func (r *fetchRecorder) observations() []fetchObservation {
 // poll that finds nothing changed delivers no update at all, so the hub is
 // the only place that knows it looked.
 func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
-	rec := &fetchRecorder{}
+	rec, feed := newFetchRecorder()
 	current := prFixture([]string{"ci-build"})
 	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
 		return current, nil
-	}, nil, time.Hour, nil, WithFetchObserver(rec.record))
+	}, nil, time.Hour, nil, WithFetchObserver(feed))
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -95,14 +101,14 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 // GraphQL budget runs at a shed tier, and the record says which one — so a
 // reader knows what the poll could and could not see.
 func TestHub_FetchObserverReportsTheShedTier(t *testing.T) {
-	rec := &fetchRecorder{}
+	rec, feed := newFetchRecorder()
 	// 2% remaining maps to TierNoReviews: annotations and reviews are shed.
 	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 100, limit: 5000}}
 	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
 
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
-	}, nil, time.Hour, budget, WithFetchObserver(rec.record))
+	}, nil, time.Hour, budget, WithFetchObserver(feed))
 	t.Cleanup(h.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,10 +134,10 @@ func TestHub_FetchObserverReportsTheShedTier(t *testing.T) {
 // the one that failed.
 func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
 	// A one-shot read runs at the full tier.
-	rec := &fetchRecorder{}
+	rec, feed := newFetchRecorder()
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
-	}, nil, time.Hour, nil, WithFetchObserver(rec.record))
+	}, nil, time.Hour, nil, WithFetchObserver(feed))
 	t.Cleanup(h.Stop)
 
 	out := h.Once(context.Background(), testHubTarget(), testHubOpts())
@@ -144,7 +150,7 @@ func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
 
 	// A poll whose full-tier fetch hits a query-cost error retries one tier
 	// down, and the record names the tier that answered.
-	rec2 := &fetchRecorder{}
+	rec2, feed2 := newFetchRecorder()
 	var calls int64
 	h2 := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
 		if atomic.AddInt64(&calls, 1) == 1 {
@@ -153,7 +159,7 @@ func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
 			}}
 		}
 		return prFixture(nil), nil
-	}, nil, time.Hour, nil, WithFetchObserver(rec2.record))
+	}, nil, time.Hour, nil, WithFetchObserver(feed2))
 	t.Cleanup(h2.Stop)
 
 	ctx, cancel := context.WithCancel(context.Background())

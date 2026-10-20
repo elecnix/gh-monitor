@@ -10,7 +10,12 @@
 // without an import cycle, the same reason internal/mux/muxtest exists.
 package testrec
 
-import "sync"
+import (
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+)
 
 // Recorder collects observations in the order they arrive. It is safe for
 // concurrent use: several pollers or several watches report at once.
@@ -39,4 +44,22 @@ func (r *Recorder[T]) Len() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.items)
+}
+
+// GraphQLHeaders builds the X-RateLimit-* headers a GraphQL response
+// carries, with the given remaining count against a limit, and a reset that
+// far in the future.
+//
+// It exists because a test that drives a rate-limit reading writes these
+// five headers by hand, and two packages' test suites do it: one for a
+// budget guard, one for a hub poller. The spelling is identical, so it
+// lives here rather than twice.
+func GraphQLHeaders(remaining, limit int, reset time.Time) http.Header {
+	h := http.Header{}
+	h.Set("X-RateLimit-Resource", "graphql")
+	h.Set("X-RateLimit-Limit", strconv.Itoa(limit))
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+	h.Set("X-RateLimit-Used", strconv.Itoa(limit-remaining))
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
+	return h
 }
