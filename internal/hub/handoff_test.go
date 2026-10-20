@@ -2,10 +2,12 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -181,4 +183,46 @@ func TestExportWhileRunning(t *testing.T) {
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 	assert.NotEmpty(t, collect(ch, 200*time.Millisecond))
+}
+
+// TestRestoreRoundTripsRunLatestAsAStatus covers the shape change issue #140
+// makes for one kind: a run poller's carried Latest is now the distilled
+// status rather than the REST payload, because that is what its fetch
+// produces. The decode must restore it as that status — the type the poller's
+// fingerprint and pass-through distillation expect — or the successor would
+// serve a watch from a value it cannot read.
+func TestRestoreRoundTripsRunLatestAsAStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	fetched := runFixture("in_progress", "")
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return fetched, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h1.Stop)
+
+	ch1, cancel1 := h1.Subscribe(ctx, targetOf(backend.KindRun), testHubOpts())
+	t.Cleanup(cancel1)
+	collect(ch1, 200*time.Millisecond) // let the poller's first fetch land
+
+	state := h1.ExportState()
+	require.Len(t, state.Pollers, 1)
+	require.NotEmpty(t, state.Pollers[0].Latest, "the last observation must travel")
+
+	var decoded monitor.RunStatus
+	require.NoError(t, json.Unmarshal(state.Pollers[0].Latest, &decoded),
+		"a run's carried Latest must be the status, not the REST payload")
+	assert.Equal(t, 30433642, decoded.RunID)
+	assert.Equal(t, "in_progress", decoded.Status)
+
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return fetched, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h2.Stop)
+	require.NoError(t, h2.RestoreState(state))
+
+	restored := h2.pollers[keyOf(monitor.IdentityOf(targetOf(backend.KindRun)))].latest
+	require.NotNil(t, restored, "the successor must adopt the carried observation")
+	assert.Equal(t, fetched, restored,
+		"restored as the status the run fetch produced, byte-for-byte")
 }
