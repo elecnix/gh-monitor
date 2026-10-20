@@ -24,7 +24,7 @@ import (
 // reported twice.
 func (s RoutingSource) coverageWatch(ctx context.Context, t backend.Target, opts backend.WatchOptions) <-chan backend.Update {
 	out := make(chan backend.Update, 16)
-	w := &coverWatch{s: s, ctx: ctx, t: t, opts: opts, out: out}
+	w := &coverWatch{s: s, ctx: ctx, t: t, opts: opts, out: out, baseline: opts.Baseline}
 	go func() {
 		defer close(out)
 		w.run()
