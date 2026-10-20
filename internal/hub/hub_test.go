@@ -775,19 +775,6 @@ func TestRestModeNoticeListsShedSurfacesAsACommaSeparatedList(t *testing.T) {
 		"the degraded-surfaces field carries the same surfaces, one per entry")
 }
 
-// rateLimitHeaders builds the X-RateLimit-* headers a GraphQL response
-// carries, with the given remaining count and a reset that far in the
-// future.
-func rateLimitHeaders(remaining int, reset time.Time) http.Header {
-	hdr := http.Header{}
-	hdr.Set("X-RateLimit-Resource", "graphql")
-	hdr.Set("X-RateLimit-Limit", "5000")
-	hdr.Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-	hdr.Set("X-RateLimit-Used", strconv.Itoa(5000-remaining))
-	hdr.Set("X-RateLimit-Reset", strconv.FormatInt(reset.Unix(), 10))
-	return hdr
-}
-
 // waitDegradedUpdate is waitDegraded returning the whole update, for tests
 // that need the structured degraded fields rather than just the event type.
 func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) backend.Update {
