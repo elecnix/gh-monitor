@@ -133,27 +133,33 @@ func TestUpdateFileSetsAnnotationChecks(t *testing.T) {
 	assert.Equal(t, []string{}, eff.AnnotationChecks)
 }
 
-// TestUpdateFileRejectsBlankAnnotationCheck confirms a blank check name is
-// rejected at set time: it would never match a check, so accepting it would
-// narrow the allowlist to nothing while looking configured.
-func TestUpdateFileRejectsBlankAnnotationCheck(t *testing.T) {
-	base := t.TempDir()
-	_, err := UpdateFile(base, []byte(`{"annotationChecks":["dupdelta","  "]}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "annotationChecks")
+// TestUpdateFileRejectsInvalidAnnotationChecks confirms a malformed
+// annotationChecks value is rejected at set time.
+//
+// A blank name would never match a check, so accepting it would narrow the
+// allowlist to nothing while looking configured. A value that is not a list
+// of strings is not the shape at all.
+func TestUpdateFileRejectsInvalidAnnotationChecks(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		wantMsg string
+	}{
+		{"a blank check name", `{"annotationChecks":["dupdelta","  "]}`, "annotationChecks"},
+		{"a value that is not a list", `{"annotationChecks":"dupdelta"}`, "annotationChecks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			_, err := UpdateFile(base, []byte(tc.payload))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
 
-	// Nothing was written by the failed attempt.
-	_, statErr := os.Stat(mustPath(t, base))
-	assert.True(t, os.IsNotExist(statErr))
-}
-
-// TestUpdateFileRejectsNonListAnnotationChecks confirms a value that is not
-// a list of strings is rejected.
-func TestUpdateFileRejectsNonListAnnotationChecks(t *testing.T) {
-	base := t.TempDir()
-	_, err := UpdateFile(base, []byte(`{"annotationChecks":"dupdelta"}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "annotationChecks")
+			// Nothing was written by the failed attempt.
+			_, statErr := os.Stat(mustPath(t, base))
+			assert.True(t, os.IsNotExist(statErr))
+		})
+	}
 }
 
 func TestUpdateFileSetsRetriggerComments(t *testing.T) {
