@@ -22,7 +22,7 @@ type failoverNote struct {
 // failoverRecorder collects the router's failover observations. It is safe
 // for concurrent use: several watches fail over at once.
 type failoverRecorder struct {
-	notes testrec.Recorder[failoverNote]
+	notes *testrec.Recorder[failoverNote]
 }
 
 // all returns the recorded failovers, oldest first.
@@ -34,11 +34,10 @@ func (r *failoverRecorder) all() []failoverNote {
 // callback has the shape the router's failover observer has, so the test
 // hands it straight to the router.
 func newFailoverRecorder() (*failoverRecorder, func(backend.Target, string, string, time.Time)) {
-	r := &failoverRecorder{}
-	feed := func(target backend.Target, from, reason string, at time.Time) {
-		r.notes.Add(failoverNote{target: target, from: from, reason: reason, at: at})
-	}
-	return r, feed
+	rec, feed := testrec.New(func(target backend.Target, from, reason string, at time.Time) failoverNote {
+		return failoverNote{target: target, from: from, reason: reason, at: at}
+	})
+	return &failoverRecorder{notes: rec}, feed
 }
 
 // TestRoutingSourceStampsSubdaemonUpdates proves that every update a

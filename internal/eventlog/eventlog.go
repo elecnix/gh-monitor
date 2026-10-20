@@ -101,7 +101,7 @@ const (
 // often it looked — which is the number that decides whether the polling is
 // worth its API cost.
 type FetchRecord struct {
-	// Kind names the record: backend.SourceHubFetch.
+	// Kind names the record: KindHubFetch.
 	Kind string `json:"kind"`
 	// Target is what was read.
 	Target backend.Target `json:"target"`
@@ -114,6 +114,22 @@ type FetchRecord struct {
 	Changed bool `json:"changed"`
 	// At is when the read happened.
 	At time.Time `json:"at"`
+}
+
+// NewFetchRecord builds the record of one hub fetch. The tier is the query
+// tier the read ran at; changed reports whether the read found anything
+// different from the previous observation of the target.
+//
+// The record's kind is set here, so a record cannot be written under the
+// wrong kind.
+func NewFetchRecord(target backend.Target, tier string, changed bool, at time.Time) FetchRecord {
+	return FetchRecord{
+		Kind:    KindHubFetch,
+		Target:  target,
+		Tier:    tier,
+		Changed: changed,
+		At:      at,
+	}
 }
 
 // FetchRecordFor builds the record of one hub fetch. The tier is the query
@@ -129,10 +145,13 @@ func FetchRecordFor(target backend.Target, tier string, changed bool, at time.Ti
 	}
 }
 
-// FailoverRecordFor builds the record of one watch that fell back from a
+// NewFailoverRecord builds the record of one watch that fell back from a
 // sub-daemon to the hub. from is the sub-daemon that stopped serving the
 // watch, and reason says why the watch moved.
-func FailoverRecordFor(target backend.Target, from, reason string, at time.Time) FailoverRecord {
+//
+// The record's kind is set here, so a record cannot be written under the
+// wrong kind.
+func NewFailoverRecord(target backend.Target, from, reason string, at time.Time) FailoverRecord {
 	return FailoverRecord{
 		Kind:   KindHubFailover,
 		Target: target,

@@ -26,7 +26,7 @@ type fetchObservation struct {
 // fetchRecorder collects the hub's fetch observations. It is safe for
 // concurrent use: several pollers fetch at once.
 type fetchRecorder struct {
-	seens testrec.Recorder[fetchObservation]
+	seens *testrec.Recorder[fetchObservation]
 }
 
 // observations returns the recorded fetches, oldest first.
@@ -38,11 +38,10 @@ func (r *fetchRecorder) observations() []fetchObservation {
 // callback has the shape the hub's fetch observer has, so the test hands it
 // straight to the hub.
 func newFetchRecorder() (*fetchRecorder, func(backend.Target, monitor.QueryTier, bool, time.Time)) {
-	r := &fetchRecorder{}
-	feed := func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-		r.seens.Add(fetchObservation{target: target, tier: tier, changed: changed, at: at})
-	}
-	return r, feed
+	rec, feed := testrec.New(func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) fetchObservation {
+		return fetchObservation{target: target, tier: tier, changed: changed, at: at}
+	})
+	return &fetchRecorder{seens: rec}, feed
 }
 
 // TestHub_FetchObserverReportsTargetTierAndChange is the acceptance test for
