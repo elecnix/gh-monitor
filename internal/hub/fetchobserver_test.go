@@ -2,7 +2,6 @@ package hub
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
+	"github.com/elecnix/gh-monitor/internal/testrec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -26,21 +26,17 @@ type fetchObservation struct {
 // fetchRecorder collects the hub's fetch observations. It is safe for
 // concurrent use: several pollers fetch at once.
 type fetchRecorder struct {
-	mu    sync.Mutex
-	seens []fetchObservation
+	seens testrec.Recorder[fetchObservation]
 }
 
+// record notes one fetch.
 func (r *fetchRecorder) record(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.seens = append(r.seens, fetchObservation{target: target, tier: tier, changed: changed, at: at})
+	r.seens.Add(fetchObservation{target: target, tier: tier, changed: changed, at: at})
 }
 
 // observations returns the recorded fetches, oldest first.
 func (r *fetchRecorder) observations() []fetchObservation {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]fetchObservation(nil), r.seens...)
+	return r.seens.All()
 }
 
 // TestHub_FetchObserverReportsTargetTierAndChange is the acceptance test for
