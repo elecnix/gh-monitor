@@ -452,7 +452,10 @@ func TestDraftPositionalAgreesWithPrFlag(t *testing.T) {
 		case "repos/octo/demo":
 			return assignJSON(result, map[string]interface{}{"full_name": "octo/demo"})
 		case "repos/octo/demo/pulls/7":
-			return assignJSON(result, map[string]interface{}{"node_id": "PR_node"})
+			return assignJSON(result, map[string]interface{}{
+				"node_id": "PR_node",
+				"head":    map[string]interface{}{"sha": "sha7"},
+			})
 		default:
 			return errors.New("unexpected path " + path)
 		}
