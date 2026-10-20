@@ -743,6 +743,12 @@ type SnapshotOptions struct {
 	// failure). An empty filter ("none") drops all annotations.
 	AnnotationLevels *AnnotationLevels
 
+	// AnnotationChecks controls which check runs' annotations are included
+	// in the snapshot. A nil value includes every check. A non-nil filter
+	// keeps only the annotations whose check name it allows, matched
+	// case-insensitively on the whole name.
+	AnnotationChecks *AnnotationChecks
+
 	// RulesetChecks is the result of FetchRequiredChecks for the repo.
 	// When nil, AwaitingChecks is not computed (the ruleset was not
 	// fetched — e.g. ref/commit targets that lack a PR context).
@@ -772,6 +778,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 	// degrades loudly via RulesetError rather than assuming nothing is required.
 	var requiredChecks []string
 	rulesetErr := ""
+
 	if opts.RulesetChecks != nil {
 		rulesetErr = opts.RulesetChecks.Error
 		if rulesetErr == "" {
@@ -782,6 +789,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 	// CI is judged in one place, over the head commit's suites and statuses.
 	ci := JudgeCI(HeadCommitViewOf(pr), CIVerdictOptions{
 		AnnotationLevels: opts.AnnotationLevels,
+		AnnotationChecks: opts.AnnotationChecks,
 		RequiredChecks:   requiredChecks,
 	})
 
@@ -874,6 +882,7 @@ func lastComment(nodes []Comment) *Comment {
 	}
 	return &nodes[len(nodes)-1]
 }
+
 
 var nonDecisiveReviewStates = map[string]bool{"PENDING": true, "COMMENTED": true}
 
