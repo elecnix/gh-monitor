@@ -67,31 +67,35 @@ func TestAnnotationChecks_None(t *testing.T) {
 }
 
 // TestParseAnnotationChecks_Valid exercises the parser with valid inputs.
+//
+// The cases are table-driven rather than a run of near-identical blocks: the
+// parser's job is to turn a string into a filter, so the interesting
+// property of each input is the set of check names it admits.
 func TestParseAnnotationChecks_Valid(t *testing.T) {
-	// Single value.
-	f, err := ParseAnnotationChecks("dupdelta")
-	require.NoError(t, err)
-	require.NotNil(t, f)
-	assert.True(t, f.Allows("dupdelta"))
-	assert.False(t, f.Allows("lint"))
-
-	// Comma-separated list with whitespace and empties.
-	f, err = ParseAnnotationChecks(" dupdelta , lint ,, CI / test ")
-	require.NoError(t, err)
-	require.NotNil(t, f)
-	assert.True(t, f.Allows("dupdelta"))
-	assert.True(t, f.Allows("lint"))
-	assert.True(t, f.Allows("ci / test"))
-
-	// Mixed case.
-	f, err = ParseAnnotationChecks("DupDelta,Lint")
-	require.NoError(t, err)
-	require.NotNil(t, f)
-	assert.True(t, f.Allows("DUPDELTA"))
-	assert.True(t, f.Allows("lint"))
+	cases := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"single value", "dupdelta", []string{"dupdelta"}},
+		{"several values", "dupdelta,lint", []string{"dupdelta", "lint"}}, {"whitespace and empties are dropped", " dupdelta , lint ,, CI / test ", []string{"ci / test", "dupdelta", "lint"}},
+		{"mixed case is folded", "DupDelta,Lint", []string{"dupdelta", "lint"}},
+		{"a check name keeps its spaces", "CI / test", []string{"ci / test"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, err := ParseAnnotationChecks(tc.input)
+			require.NoError(t, err)
+			require.NotNil(t, f)
+			assert.Equal(t, tc.want, f.Names())
+			for _, n := range tc.want {
+				assert.True(t, f.Allows(n), "%q must be allowed", n)
+			}
+		})
+	}
 
 	// "none" is a valid value that allows nothing.
-	f, err = ParseAnnotationChecks("none")
+	f, err := ParseAnnotationChecks("none")
 	require.NoError(t, err)
 	require.NotNil(t, f)
 	assert.False(t, f.Allows("dupdelta"))
