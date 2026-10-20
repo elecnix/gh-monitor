@@ -11,15 +11,16 @@ registers only what it actually has.
 
 <!-- BEGIN generated: capability-table -->
 
-| Capability  | Interface               | What it does                                           | Used by               |
-| ----------- | ----------------------- | ------------------------------------------------------ | --------------------- |
-| `source`    | `backend.Source`        | Delivers `Update`s describing what changed on a target | continuous watching   |
-| `reader`    | `backend.Reader`        | Returns a target's current `Status`                    | `--once`              |
-| `threads`   | `backend.ThreadActor`   | Lists, views, resolves review threads                  | `gh monitor threads`  |
-| `review`    | `backend.ReviewActor`   | Drives a pending review                                | `gh monitor review`   |
-| `comments`  | `backend.CommentActor`  | Replies to review threads                              | `gh monitor comments` |
-| `draft`     | `backend.DraftActor`    | Reads and changes draft status                         | `gh monitor draft`    |
-| `reactions` | `backend.ReactionActor` | Adds a reaction to a node                              | `gh monitor react`    |
+| Capability  | Interface               | What it does                                                            | Used by                               |
+| ----------- | ----------------------- | ----------------------------------------------------------------------- | ------------------------------------- |
+| `source`    | `backend.Source`        | Delivers `Update`s describing what changed on a target                  | continuous watching                   |
+| `reader`    | `backend.Reader`        | Returns a target's current `Status`                                     | `--once`                              |
+| `threads`   | `backend.ThreadActor`   | Lists, views, resolves review threads                                   | `gh monitor threads`                  |
+| `review`    | `backend.ReviewActor`   | Drives a pending review                                                 | `gh monitor review`                   |
+| `comments`  | `backend.CommentActor`  | Replies to review threads                                               | `gh monitor comments`                 |
+| `draft`     | `backend.DraftActor`    | Reads and changes draft status                                          | `gh monitor draft`                    |
+| `reactions` | `backend.ReactionActor` | Adds a reaction to a node                                               | `gh monitor react`                    |
+| `coverage`  | `remote.CoverageSource` | Reports, per repository, whether the backend is receiving events for it | daemon routing by repository coverage |
 
 <!-- END generated: capability-table -->
 

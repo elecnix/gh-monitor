@@ -86,6 +86,8 @@ func setServerActor(t *testing.T, cfg *ServerConfig, c backend.Capability) {
 		cfg.Draft = &fakeActors{}
 	case backend.CapReactions:
 		cfg.Reactions = &fakeActors{}
+	case backend.CapCoverage:
+		cfg.Coverage = fixedCoverage{}
 	default:
 		t.Fatalf("no ServerConfig field for capability %q", c)
 	}
@@ -118,7 +120,7 @@ func TestCapabilityBindingsCoverEveryCapability(t *testing.T) {
 		}
 	}
 	for c := range providerBindings {
-		if !backend.IsMutation(c) && c != backend.CapSource && c != backend.CapReader {
+		if !backend.IsMutation(c) && c != backend.CapSource && c != backend.CapReader && c != backend.CapCoverage {
 			t.Errorf("providerBindings declares %q, which no capability does", c)
 		}
 	}
@@ -164,6 +166,7 @@ func TestServerConfigCapabilitiesFollowsTheDescriptor(t *testing.T) {
 		Comments:  &fakeActors{},
 		Draft:     &fakeActors{},
 		Reactions: &fakeActors{},
+		Coverage:  fixedCoverage{},
 	}
 	got, err := full.capabilities()
 	if err != nil {

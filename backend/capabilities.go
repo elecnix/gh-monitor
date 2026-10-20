@@ -162,6 +162,21 @@ var capabilityInfos = []CapabilityInfo{
 			return resolveActor[ReactionActor](r, t.Kind, CapReactions)
 		},
 	},
+	{
+		Name:      CapCoverage,
+		Interface: "remote.CoverageSource",
+		Summary:   "Reports, per repository, whether the backend is receiving events for it",
+		UsedBy:    "daemon routing by repository coverage",
+		// Coverage is advertised in the hello and served over the wire, but
+		// it registers nothing: the daemon asks the provider for a coverage
+		// stream directly, so there is no registry capability to resolve it
+		// against. The row is here because the capability set is the one
+		// thing every layer reads, not because the registry holds it.
+		register: func(*Registry, string, []Kind, any) {},
+		resolve: func(*Registry, Target) (any, string, error) {
+			return nil, "", fmt.Errorf("the %s capability is not a registry capability", CapCoverage)
+		},
+	},
 }
 
 // LookupCapability returns the descriptor for c. The second result is false
