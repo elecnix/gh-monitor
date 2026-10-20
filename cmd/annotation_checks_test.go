@@ -111,38 +111,34 @@ func runMonitorOnce(t *testing.T, extraArgs ...string) string {
 	return stdout.String()
 }
 
-// TestMonitorOnceAnnotationChecksFlagFiltersByCheckName confirms the
-// --annotation-checks flag narrows the reported annotations to the named
-// checks (issue #110).
+// TestMonitorOnceAnnotationChecksFilter confirms the --annotation-checks flag
+// narrows the reported annotations to the named checks (issue #110).
 //
 // The case it exists for: a PR carries the same deprecation warning from
 // every workflow job plus one finding from the check the consumer actually
 // watches. Without the filter the warning buries the finding.
-func TestMonitorOnceAnnotationChecksFlagFiltersByCheckName(t *testing.T) {
+func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
 
-	// Without the filter, both checks' annotations are reported.
-	names := annotationCheckNames(t, runMonitorOnce(t))
-	assert.Contains(t, names, "dupdelta")
-	assert.Contains(t, names, "lint")
+	t.Run("without the filter every check is reported", func(t *testing.T) {
+		names := annotationCheckNames(t, runMonitorOnce(t))
+		assert.Contains(t, names, "dupdelta")
+		assert.Contains(t, names, "lint")
+	})
 
-	// With the filter, only the named check's annotations are reported.
-	names = annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "dupdelta"))
-	require.NotEmpty(t, names, "the named check's annotation must be reported")
-	for _, n := range names {
-		assert.Equal(t, "dupdelta", n, "--annotation-checks must drop the other checks' annotations")
-	}
-}
+	t.Run("the flag keeps only the named check", func(t *testing.T) {
+		names := annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "dupdelta"))
+		require.NotEmpty(t, names, "the named check's annotation must be reported")
+		for _, n := range names {
+			assert.Equal(t, "dupdelta", n, "--annotation-checks must drop the other checks' annotations")
+		}
+	})
 
-// TestMonitorOnceAnnotationChecksNoneDropsAll confirms the "none" spelling
-// drops every annotation.
-func TestMonitorOnceAnnotationChecksNoneDropsAll(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("GH_HOST", "")
-
-	names := annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "none"))
-	assert.Empty(t, names, "\"none\" must drop every annotation")
+	t.Run("none drops every annotation", func(t *testing.T) {
+		names := annotationCheckNames(t, runMonitorOnce(t, "--annotation-checks", "none"))
+		assert.Empty(t, names, "\"none\" must drop every annotation")
+	})
 }
 
 // TestMonitorOnceAnnotationChecksReadsPreferences confirms the annotationChecks

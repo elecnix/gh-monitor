@@ -50,9 +50,9 @@ func annotatedPRFixture() *monitor.PullRequest {
 	}
 }
 
-// annotationNames collects the check names of the annotations an update
+// annotationCheckNames collects the check names of the annotations an update
 // carries.
-func annotationNames(u backend.Update) []string {
+func annotationCheckNames(u backend.Update) []string {
 	var out []string
 	for _, a := range u.Event.Annotations {
 		out = append(out, a.CheckName)
@@ -60,9 +60,11 @@ func annotationNames(u backend.Update) []string {
 	return out
 }
 
-// waitForAnnotations reads from ch until an update carrying annotations
-// arrives, or the timeout expires. It returns the annotations' check names.
-func waitForAnnotations(t *testing.T, ch <-chan backend.Update, timeout time.Duration) []string {
+// drainAnnotations reads ch until an update carrying annotations arrives, and
+// returns the check names it names. It returns nil when the stream goes quiet
+// without one, which is how the "none" case is observed: no annotation event
+// ever arrives.
+func drainAnnotations(t *testing.T, ch <-chan backend.Update, timeout time.Duration) []string {
 	t.Helper()
 	deadline := time.After(timeout)
 	for {
@@ -72,7 +74,7 @@ func waitForAnnotations(t *testing.T, ch <-chan backend.Update, timeout time.Dur
 				return nil
 			}
 			if u.Event.Type == backend.EventCheckAnnotations {
-				return annotationNames(u)
+				return annotationCheckNames(u)
 			}
 		case <-deadline:
 			return nil
@@ -97,75 +99,46 @@ func TestHub_AnnotationChecksFilterCrossesTheProcessBoundary(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	opts := testHubOpts()
-	opts.AnnotationChecks = []string{"dupdelta"}
+	t.Run("a named check reaches the consumer, the other does not", func(t *testing.T) {
+		opts := testHubOpts()
+		opts.AnnotationChecks = []string{"dupdelta"}
 
-	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
-	t.Cleanup(cancelSub)
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
+		t.Cleanup(cancelSub)
 
-	names := waitForAnnotations(t, ch, 2*time.Second)
-	require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
-	for _, n := range names {
-		assert.Equal(t, "dupdelta", n, "the check-name filter must cross the WatchOptions boundary")
-	}
-}
-
-// TestHub_AnnotationChecksNoneDropsEveryAnnotation confirms the "none"
-// spelling survives the trip too.
-func TestHub_AnnotationChecksNoneDropsEveryAnnotation(t *testing.T) {
-	snap := annotatedPRFixture()
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
-		return snap, nil
-	}, nil, time.Hour, nil)
-	t.Cleanup(h.Stop)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
-	opts := testHubOpts()
-	opts.AnnotationChecks = []string{"none"}
-
-	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
-	t.Cleanup(cancelSub)
-
-	// No annotation event may arrive. The first-poll notice still does, so
-	// the channel is read until it goes quiet.
-	deadline := time.After(500 * time.Millisecond)
-	for {
-		select {
-		case u, ok := <-ch:
-			if !ok {
-				return
-			}
-			assert.NotEqual(t, backend.EventCheckAnnotations, u.Event.Type,
-				"\"none\" must drop every annotation")
-		case <-deadline:
-			return
+		names := drainAnnotations(t, ch, 2*time.Second)
+		require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
+		for _, n := range names {
+			assert.Equal(t, "dupdelta", n, "the check-name filter must cross the WatchOptions boundary")
 		}
-	}
-}
+	})
 
-// TestHub_OnceHonoursAnnotationChecks confirms the one-shot read applies the
-// same filter. The one-shot path is what an agent's probe uses, so a filter
-// that only worked on the watch path would miss the case the issue names.
-func TestHub_OnceHonoursAnnotationChecks(t *testing.T) {
-	snap := annotatedPRFixture()
-	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
-		return snap, nil
-	}, nil, time.Hour, nil)
-	t.Cleanup(h.Stop)
+	t.Run("none drops every annotation", func(t *testing.T) {
+		opts := testHubOpts()
+		opts.AnnotationChecks = []string{"none"}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
+		t.Cleanup(cancelSub)
 
-	opts := testHubOpts()
-	opts.Once = true
-	opts.AnnotationChecks = []string{"dupdelta"}
+		// The first-poll notice still arrives, so the stream is not silent;
+		// what must never arrive is an annotation event.
+		assert.Nil(t, drainAnnotations(t, ch, 500*time.Millisecond),
+			"\"none\" must drop every annotation")
+	})
 
-	ch := h.Once(ctx, testHubTarget(), opts)
-	names := waitForAnnotations(t, ch, 2*time.Second)
-	require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
-	for _, n := range names {
-		assert.Equal(t, "dupdelta", n, "the one-shot read must apply the check-name filter")
-	}
+	t.Run("the one-shot read applies the filter too", func(t *testing.T) {
+		// The one-shot path is what an agent's probe uses, so a filter
+		// that only worked on the watch path would miss the case the
+		// issue names.
+		opts := testHubOpts()
+		opts.Once = true
+		opts.AnnotationChecks = []string{"dupdelta"}
+
+		ch := h.Once(ctx, testHubTarget(), opts)
+		names := drainAnnotations(t, ch, 2*time.Second)
+		require.NotEmpty(t, names, "the named check's annotation must reach the consumer")
+		for _, n := range names {
+			assert.Equal(t, "dupdelta", n, "the one-shot read must apply the check-name filter")
+		}
+	})
 }
