@@ -481,6 +481,13 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		fetch := h.fetch
 		h.mu.Unlock()
 
+		// fetchTier is the tier the read actually ran at. It is tracked
+		// separately from snapOpts.Tier (the tier the snapshot is distilled
+		// at) because the two differ: a read that falls back to REST ran at
+		// the status tier, and a read that succeeded on the first try ran at
+		// the full tier. The observer must be told the tier that was paid
+		// for, not the zero value of the snapshot's tier field.
+		fetchTier := monitor.TierFull
 		raw, err := fetch(ctx, identity, monitor.TierFull)
 		if err != nil && monitor.IsRateLimitError(err) && keyOf(identity).kind == backend.KindPR && h.restFallback != nil {
 			// GraphQL is rate limited: answer from REST, as a poller would,
@@ -492,6 +499,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			if restRaw, restErr := h.restFallback(ctx, identity, nil); restErr == nil && restRaw != nil {
 				raw, err = restRaw, nil
 				snapOpts.Tier = monitor.TierStatus
+				fetchTier = monitor.TierStatus
 				out <- backend.Update{
 					Target: monitor.TargetOf(identity),
 					Event:  restModeNotice(labelFor(keyOf(identity), identity), resetAt, time.Time{}),
@@ -529,7 +537,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		onFetch := h.onFetch
 		h.mu.Unlock()
 		if onFetch != nil {
-			onFetch(monitor.TargetOf(identity), snapOpts.Tier, true, time.Now())
+			onFetch(monitor.TargetOf(identity), fetchTier, true, time.Now())
 		}
 
 		distill := traits.distill(t, opts)
@@ -1299,6 +1307,10 @@ func (p *poller) fetchOnce() {
 		// kinds fall through to the degraded broadcast.
 		if monitor.IsQueryCostError(err) && tier > monitor.TierStatus {
 			curr, err = fetch(ctx, p.identity, tier-1)
+			// The retry is the read that answered, at one tier down: the
+			// record must name the tier that was paid for, not the one
+			// that failed (issue #122).
+			tier = tier - 1
 		}
 		if err != nil && monitor.IsRateLimitError(err) && p.canUseREST() {
 			resetAt, _ := p.budget.GraphQLExhausted(p.identity.Host, time.Now())

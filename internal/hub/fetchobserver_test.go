@@ -3,10 +3,12 @@ package hub
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -34,7 +36,8 @@ func (r *fetchRecorder) record(target backend.Target, tier monitor.QueryTier, ch
 	r.seens = append(r.seens, fetchObservation{target: target, tier: tier, changed: changed, at: at})
 }
 
-func (r *fetchRecorder) all() []fetchObservation {
+// observations returns the recorded fetches, oldest first.
+func (r *fetchRecorder) observations() []fetchObservation {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]fetchObservation(nil), r.seens...)
@@ -63,7 +66,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 
 	// The first fetch has no previous observation to compare against, so it
 	// counts as a change: the poller learned the target's state.
-	seens := rec.all()
+	seens := rec.observations()
 	require.Len(t, seens, 1, "one fetch, one observation")
 	assert.Equal(t, testHubTarget(), seens[0].target, "the observation names the target that was read")
 	assert.Equal(t, monitor.TierFull, seens[0].tier, "the observation names the tier the read ran at")
@@ -75,7 +78,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	collect(ch, 200*time.Millisecond)
 
-	seens = rec.all()
+	seens = rec.observations()
 	require.Len(t, seens, 2, "the second fetch is observed too")
 	assert.False(t, seens[1].changed, "an unchanged payload is not a change")
 	assert.Equal(t, seens[0].tier, seens[1].tier, "the tier is reported on every fetch")
@@ -86,7 +89,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	collect(ch, 200*time.Millisecond)
 
-	seens = rec.all()
+	seens = rec.observations()
 	require.Len(t, seens, 3, "the third fetch is observed too")
 	assert.True(t, seens[2].changed, "a changed payload is a change")
 }
@@ -112,10 +115,61 @@ func TestHub_FetchObserverReportsTheShedTier(t *testing.T) {
 	t.Cleanup(cancelSub)
 	collect(ch, 300*time.Millisecond)
 
-	seens := rec.all()
+	seens := rec.observations()
 	require.NotEmpty(t, seens, "the fetch is observed")
 	assert.Equal(t, monitor.TierNoReviews, seens[0].tier,
 		"the record names the shed tier the read ran at")
+}
+
+// TestHub_FetchObserverReportsTheTierTheReadRanAt proves the record names
+// the tier the read actually ran at.
+//
+// Two cases make the difference visible. A one-shot read fetches at the full
+// tier; the snapshot it distills carries a tier field of its own, whose zero
+// value is the status tier, so reporting that field would understate the
+// cost of every ordinary read. And a poll that hits a query-cost error
+// retries one tier down: the record must name the tier that answered, not
+// the one that failed.
+func TestHub_FetchObserverReportsTheTierTheReadRanAt(t *testing.T) {
+	// A one-shot read runs at the full tier.
+	rec := &fetchRecorder{}
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil, WithFetchObserver(rec.record))
+	t.Cleanup(h.Stop)
+
+	out := h.Once(context.Background(), testHubTarget(), testHubOpts())
+	for range out {
+	}
+	seens := rec.observations()
+	require.Len(t, seens, 1, "the one-shot read is observed")
+	assert.Equal(t, monitor.TierFull, seens[0].tier,
+		"a one-shot read ran at the full tier, and the record must say so")
+
+	// A poll whose full-tier fetch hits a query-cost error retries one tier
+	// down, and the record names the tier that answered.
+	rec2 := &fetchRecorder{}
+	var calls int64
+	h2 := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return nil, &ghcli.GraphQLError{Errors: []ghcli.GraphQLErrorEntry{
+				{Message: "Something went wrong while executing your query. Your query exceeded the resource limits"},
+			}}
+		}
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil, WithFetchObserver(rec2.record))
+	t.Cleanup(h2.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h2.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+	collect(ch, 300*time.Millisecond)
+
+	seens = rec2.observations()
+	require.Len(t, seens, 1, "the retried poll is observed")
+	assert.Equal(t, monitor.TierNoAnnotations, seens[0].tier,
+		"the record names the tier that answered, not the one that failed")
 }
 
 // TestHub_UpdatesCarryTheHubSource proves every update the hub delivers says
