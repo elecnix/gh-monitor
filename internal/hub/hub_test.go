@@ -657,6 +657,33 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 	}
 }
 
+// TestRestModeNoticeListsShedSurfacesAsACommaSeparatedList pins how the REST
+// -mode notice renders the shed list. The notice prints the Surfaces value
+// with %s and no explicit join, so the rendering comes from
+// monitor.Surfaces.String — and a reader cannot tell a comma-separated list
+// from Go's slice syntax by looking at the format string.
+//
+// The trap is the []string projection: shed.Names() hands fmt a []string, and
+// fmt prints THAT in slice syntax ("[annotations reviews]"). Passing it here
+// instead of shed would produce the exact defect this test forbids, so the
+// assertion below is what keeps the notice site honest.
+func TestRestModeNoticeListsShedSurfacesAsACommaSeparatedList(t *testing.T) {
+	ev := restModeNotice("elecnix/gh-monitor#158", time.Time{}, time.Time{})
+
+	assert.Contains(t, ev.Notice, "annotations, reviews, review threads, comments",
+		"the notice must list the shed surfaces as a comma-separated list")
+	assert.NotContains(t, ev.Notice, "[annotations",
+		"the notice must not carry Go slice syntax")
+	assert.NotContains(t, ev.Notice, "are not watched]",
+		"the shed list must not end in a closing bracket")
+
+	// The structured field is a []string, so it needs the projection — and it
+	// must not acquire slice syntax either.
+	assert.Equal(t, []string{"annotations", "reviews", "review threads", "comments"},
+		ev.DegradedSurfaces,
+		"the degraded-surfaces field carries the same surfaces, one per entry")
+}
+
 // waitDegradedUpdate is waitDegraded returning the whole update, for tests
 // that need the structured degraded fields rather than just the event type.
 func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) backend.Update {
