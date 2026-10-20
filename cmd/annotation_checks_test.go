@@ -122,9 +122,8 @@ func TestMonitorOnceAnnotationChecksFilter(t *testing.T) {
 	t.Setenv("GH_HOST", "")
 
 	t.Run("without the filter every check is reported", func(t *testing.T) {
-		names := annotationCheckNames(t, runMonitorOnce(t))
-		assert.Contains(t, names, "dupdelta")
-		assert.Contains(t, names, "lint")
+		// The two checks, in the order the snapshot lists them.
+		assert.Equal(t, []string{"dupdelta", "lint"}, annotationCheckNames(t, runMonitorOnce(t)))
 	})
 
 	t.Run("the flag keeps only the named check", func(t *testing.T) {
