@@ -1537,7 +1537,7 @@ func (p *poller) deliver(curr any, tier monitor.QueryTier) {
 	fn := p.hub.onFetch
 	p.hub.mu.Unlock()
 	if fn != nil {
-		fn(monitor.TargetOf(p.identity), tier, changed, p.lastSuccess)
+		fn(monitor.TargetOf(p.identity), tier, changed, p.degradation.lastSuccess())
 	}
 }
 
