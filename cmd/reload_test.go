@@ -19,7 +19,7 @@ func TestReload_NoDaemonReportsAndDoesNotSpawn(t *testing.T) {
 
 	var spawned int64
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(string, time.Duration) error {
+	spawnDaemonFn = func(string, time.Duration, string) error {
 		atomic.AddInt64(&spawned, 1)
 		return nil
 	}
@@ -66,7 +66,7 @@ func TestReload_SpawnsSuccessorWhenDaemonLive(t *testing.T) {
 	var spawned int64
 	var spawnedAt string
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(socket string, _ time.Duration) error {
+	spawnDaemonFn = func(socket string, _ time.Duration, _ string) error {
 		atomic.AddInt64(&spawned, 1)
 		spawnedAt = socket
 		return nil

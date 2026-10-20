@@ -69,8 +69,10 @@ with its current settings until it is stopped by hand.`,
 
 			// Spawn the successor detached (same path autostart uses). Its
 			// listenOrAdopt performs the handoff against the live daemon;
-			// this process needs no further involvement.
-			if err := spawnDaemonFn(socket, 300); err != nil {
+			// this process needs no further involvement. The bind result is
+			// not requested: a reload does not hand a cadence to the
+			// successor, it restarts the one that is already running.
+			if err := spawnDaemonFn(socket, 300, ""); err != nil {
 				return fmt.Errorf("spawn successor daemon: %w", err)
 			}
 			if err := ipc.WaitReady(context.Background(), socket, reloadWaitReadyTimeout); err != nil {
