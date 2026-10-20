@@ -29,6 +29,9 @@ type draftSetPayload struct {
 	Draft bool             `json:"draft"`
 }
 
+// reactPayload is the wire shape of a reactions.react request. Reaction
+// carries the protocol's own name — backend.ReactionNames — not any API's
+// token, and it is passed through verbatim in both directions.
 type reactPayload struct {
 	SubjectID string `json:"subject_id"`
 	Reaction  string `json:"reaction"`
@@ -148,7 +151,9 @@ func (p *Provider) ListDrafts(ctx context.Context, t backend.Target) ([]backend.
 	return call[[]backend.DraftInfo](ctx, p, backend.OpDraftList, t, nil)
 }
 
-// React implements backend.ReactionActor.
+// React implements backend.ReactionActor. The reaction is a protocol name
+// (backend.ReactionNames); mapping it to whatever the far side calls the thing
+// happens on the far side.
 func (p *Provider) React(ctx context.Context, t backend.Target, subjectID, reaction string) error {
 	_, err := call[struct{}](ctx, p, backend.OpReactionsReact, t, reactPayload{SubjectID: subjectID, Reaction: reaction})
 	return err
