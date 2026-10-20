@@ -43,9 +43,16 @@ func newFetchRecorder() (*testrec.Recorder[fetchObservation], func(backend.Targe
 // the only place that knows it looked.
 func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 	rec, feed := newFetchRecorder()
-	current := prFixture([]string{"ci-build"})
+	// The fetch closure runs on the poller's goroutine while the test
+	// goroutine swaps the payload, so the payload is held in an atomic
+	// pointer: a plain variable would be a data race between the two, and
+	// `go test -race` would report it. atomic.Pointer also gives the read
+	// in the closure the same happens-before edge the write has, so the
+	// closure can never see a half-published payload.
+	var current atomic.Pointer[monitor.PullRequest]
+	current.Store(prFixture([]string{"ci-build"}))
 	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
-		return current, nil
+		return current.Load(), nil
 	}, nil, time.Hour, nil, WithFetchObserver(feed))
 	t.Cleanup(h.Stop)
 
@@ -76,7 +83,7 @@ func TestHub_FetchObserverReportsTargetTierAndChange(t *testing.T) {
 
 	// A third fetch of a different payload changes something, and the
 	// observation says so.
-	current = prFixture(nil) // CI went green
+	current.Store(prFixture(nil)) // CI went green
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 	collect(ch, 200*time.Millisecond)
 
