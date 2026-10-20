@@ -6,8 +6,8 @@ import (
 )
 
 // AnnotationChecks is a per-check-name allowlist for check-run annotations.
-// A nil filter means "every check" (the default); a filter that allows
-// nothing is the "none" case.
+// A nil filter means "every check" (the default); a filter that holds no
+// names allows nothing.
 //
 // Matching is exact and case-insensitive on the whole check name, because a
 // check name is an opaque label ("dupdelta", "lint", "CI / test (node 20)")
@@ -15,31 +15,28 @@ import (
 // same deprecation warning — the noise this filter exists to remove.
 type AnnotationChecks struct {
 	allowed map[string]bool
-	// none records the explicit "none" spelling, which wins over every
-	// other name in the list.
-	none bool
 }
 
 // NewAnnotationChecks builds an allowlist from the given check names. With no
 // arguments it returns a non-nil filter that allows nothing (the "none"
 // case). The names are trimmed and lower-cased, but NOT validated — use
 // ParseAnnotationChecks for caller-facing input.
+//
+// The "none" spelling means "allow nothing", whichever other names
+// accompany it: it is the explicit way to say so, and dropping it in
+// favour of the other names would turn a deliberate mute back on.
 func NewAnnotationChecks(names ...string) *AnnotationChecks {
 	f := &AnnotationChecks{allowed: make(map[string]bool, len(names))}
 	for _, n := range names {
 		n = strings.ToLower(strings.TrimSpace(n))
-		if n == "" {
+		switch n {
+		case "":
 			continue
-		}
-		if n == "none" {
-			f.none = true
-			continue
+		case "none":
+			f.allowed = map[string]bool{}
+			return f
 		}
 		f.allowed[n] = true
-	}
-	if f.none {
-		// "none" means allow nothing, regardless of the other values.
-		f.allowed = map[string]bool{}
 	}
 	return f
 }
@@ -57,29 +54,18 @@ func ParseAnnotationChecks(s string) (*AnnotationChecks, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, nil
 	}
-	f := &AnnotationChecks{allowed: make(map[string]bool)}
+	names := make([]string, 0, 4)
 	for _, raw := range strings.Split(s, ",") {
-		n := strings.ToLower(strings.TrimSpace(raw))
-		if n == "" {
-			continue
+		if n := strings.ToLower(strings.TrimSpace(raw)); n != "" {
+			names = append(names, n)
 		}
-		if n == "none" {
-			f.none = true
-			continue
-		}
-		f.allowed[n] = true
 	}
-	if f.none {
-		// "none" means allow nothing, regardless of the other values.
-		f.allowed = map[string]bool{}
-		return f, nil
-	}
-	if len(f.allowed) == 0 {
+	if len(names) == 0 {
 		// The input held nothing but separators: that names no check, so
 		// it means "every check" rather than "no check at all".
 		return nil, nil
 	}
-	return f, nil
+	return NewAnnotationChecks(names...), nil
 }
 
 // Allows reports whether a check name passes the filter. A nil filter allows
@@ -87,9 +73,6 @@ func ParseAnnotationChecks(s string) (*AnnotationChecks, error) {
 func (f *AnnotationChecks) Allows(checkName string) bool {
 	if f == nil {
 		return true
-	}
-	if f.none {
-		return false
 	}
 	return f.allowed[strings.ToLower(strings.TrimSpace(checkName))]
 }
@@ -106,7 +89,7 @@ func (a *AnnotationChecks) Names() []string {
 	if a == nil {
 		return nil
 	}
-	if a.none || len(a.allowed) == 0 {
+	if len(a.allowed) == 0 {
 		return []string{"none"}
 	}
 	out := make([]string, 0, len(a.allowed))
@@ -121,10 +104,7 @@ func (a *AnnotationChecks) Names() []string {
 // built with the "none" spelling, or because it holds no names at all. A nil
 // filter is not "none": it allows every check.
 func (a *AnnotationChecks) IsNone() bool {
-	if a == nil {
-		return false
-	}
-	return a.none || len(a.allowed) == 0
+	return a != nil && len(a.allowed) == 0
 }
 
 // String renders the allowlist for logs and help text.
