@@ -66,6 +66,12 @@ type CIVerdictOptions struct {
 	// filter ("none") drops all annotations.
 	AnnotationLevels *AnnotationLevels
 
+	// AnnotationChecks filters which check runs' annotations are collected.
+	// A nil value collects every check; a non-nil filter keeps only the
+	// annotations whose check name it allows, matched case-insensitively on
+	// the whole name.
+	AnnotationChecks *AnnotationChecks
+
 	// RequiredChecks are the branch-ruleset contexts that must exist for
 	// CI to be green. Empty means the ruleset was not available to this
 	// reader and no awaiting set is computed.
@@ -94,7 +100,7 @@ type CIVerdict struct {
 // entry point: every classifier below is reached only from here, so no reader
 // can apply a different version of "is CI green".
 func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
-	anns, truncated, url := extractAnnotations(v, opts.AnnotationLevels)
+	anns, truncated, url := extractAnnotations(v, opts.AnnotationLevels, opts.AnnotationChecks)
 	return CIVerdict{
 		Failing:              failingChecks(v),
 		Pending:              pendingChecks(v),
@@ -482,11 +488,17 @@ func awaitingChecks(v HeadCommitView, required []string) []string {
 }
 
 // extractAnnotations collects annotations from all check runs across all
-// check suites of the head commit, filtered by levels. It also detects
-// truncation: when any check run has totalCount >= 10 (the per-step GitHub
-// cap) or totalCount > len(nodes) (our first: 50 page is full), the returned
-// truncated flag is true and the URL points to the first such run's permalink.
-func extractAnnotations(v HeadCommitView, levels *AnnotationLevels) (annotations []AnnotationSummary, truncated bool, url string) {
+// check suites of the head commit, filtered by levels and by check name. It
+// also detects truncation: when any check run has totalCount >= 10 (the
+// per-step GitHub cap) or totalCount > len(nodes) (our first: 50 page is
+// full), the returned truncated flag is true and the URL points to the first
+// such run's permalink.
+//
+// The check-name filter runs next to the level filter because both are
+// snapshot-time decisions: an annotation the operator does not want must
+// never reach the snapshot, or it would show up as a "new" annotation in the
+// diff on every poll.
+func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *AnnotationChecks) (annotations []AnnotationSummary, truncated bool, url string) {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
 	for _, c := range v.Commits {
@@ -503,6 +515,9 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels) (annotations
 					if url == "" {
 						url = run.Permalink
 					}
+				}
+				if !checks.Allows(run.Name) {
+					continue
 				}
 				for _, ann := range runAnns.Nodes {
 					if !levels.Allows(ann.Level) {
