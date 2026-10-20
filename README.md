@@ -629,6 +629,19 @@ gh monitor prefs path
 
 The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
+#### Optional template segments
+
+A template clause may be wrapped in `[[…]]` to make it optional. The segment is dropped when every `{token}` inside it renders empty, and kept otherwise. That is how the built-in `new-commit` message names the commit's co-authors without ever rendering a dangling clause:
+
+```
+📝 New commit abc1234 pushed to owner/repo#42 by alice, co-authored by bob. Review the PR description to ensure it still reflects the latest changes.
+📝 New commit abc1234 pushed to owner/repo#42 by alice. Review the PR description to ensure it still reflects the latest changes.
+```
+
+The `by <author>` clause and the `, co-authored by <names>` clause are both optional: the first is dropped when the author is unknown, the second when the commit carries no `Co-authored-by:` trailer.
+
+The `[[…]]` markers only mean anything around a recognized `{token}`. A `[[…]]` holding no recognized token is literal text, markers included, so a template that merely mentions brackets keeps reading the way its author wrote it. A segment holding an unknown token is kept, so a typo stays visible instead of silently vanishing, and a segment that is opened but never closed is rejected when the preferences file is read.
+
 #### Event log
 
 Every backend event a watch consumes — from the built-in `gh` backend, the shared daemon, or an out-of-process broker sub-daemon — can be recorded to daily append-only JSONL files ([#86](https://github.com/elecnix/gh-monitor/issues/86)). Logging happens above the backend layer: each line is the raw update envelope exactly as the backend delivered it, before rendering and before notification preferences apply.
