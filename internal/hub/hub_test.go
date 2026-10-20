@@ -83,6 +83,56 @@ func swapFetcher(h *Hub, f func(context.Context, resolver.Identity, monitor.Quer
 	h.mu.Unlock()
 }
 
+// collectAnnotations reads ch until an update carrying annotations arrives,
+// and returns the check names it names. It returns nil when the stream goes
+// quiet without one, which is how "no annotation event arrived" is observed.
+//
+// It sits next to collect because it is the same read with a different
+// payload: the hub's event TYPES say that an annotation event happened, and
+// the check names say WHICH check posted it.
+func collectAnnotations(ch <-chan backend.Update, timeout time.Duration) []string {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if u.Event.Type != backend.EventCheckAnnotations {
+				continue
+			}
+			names := make([]string, 0, len(u.Event.Annotations))
+			for _, a := range u.Event.Annotations {
+				names = append(names, a.CheckName)
+			}
+			return names
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
+// collectAnnotation reads ch until an update carrying annotations arrives, and
+// returns the first of them. It returns nil when the stream goes quiet without
+// one.
+func collectAnnotation(ch <-chan backend.Update, timeout time.Duration) *backend.AnnotationSummary {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if u.Event.Type == backend.EventCheckAnnotations && len(u.Event.Annotations) > 0 {
+				a := u.Event.Annotations[0]
+				return &a
+			}
+		case <-deadline:
+			return nil
+		}
+	}
+}
+
 // TestHub_SingleFetchFansOutToMultipleConsumers is the core acceptance test for
 // issue #34: two consumers watching the same PR must share one fetch loop, not
 // each poll GitHub independently. A single fetch must feed both consumers.
