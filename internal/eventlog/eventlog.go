@@ -132,19 +132,6 @@ func NewFetchRecord(target backend.Target, tier string, changed bool, at time.Ti
 	}
 }
 
-// FetchRecordFor builds the record of one hub fetch. The tier is the query
-// tier the read ran at; changed reports whether the read found anything
-// different from the previous observation of the target.
-func FetchRecordFor(target backend.Target, tier string, changed bool, at time.Time) FetchRecord {
-	return FetchRecord{
-		Kind:    KindHubFetch,
-		Target:  target,
-		Tier:    tier,
-		Changed: changed,
-		At:      at,
-	}
-}
-
 // NewFailoverRecord builds the record of one watch that fell back from a
 // sub-daemon to the hub. from is the sub-daemon that stopped serving the
 // watch, and reason says why the watch moved.
