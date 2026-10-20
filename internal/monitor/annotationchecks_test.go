@@ -87,6 +87,9 @@ func TestParseAnnotationChecks_Valid(t *testing.T) {
 			for _, n := range tc.want {
 				assert.True(t, f.Allows(n), "%q must be allowed", n)
 			}
+			// A name the input did not mention is not allowed: the parse
+			// must not widen the list it was given.
+			assert.False(t, f.Allows("not-mentioned"), "the parse must not admit an unlisted name")
 		})
 	}
 

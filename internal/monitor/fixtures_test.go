@@ -54,18 +54,11 @@ func mkAnnotation(path, level, title, message string, line int) Annotation {
 // It is the fixture the check-name filter is about: one check a consumer
 // watches, and one that posts the same warning from every workflow job.
 func mkAnnotatedPR(runs ...CheckRun) *PullRequest {
-	suite := CheckSuite{
-		Status:     "COMPLETED",
-		Conclusion: "SUCCESS",
-		App:        AppInfo{Name: "CI"},
-		CheckRuns:  RunNodes{Nodes: runs},
-	}
+	commit := mkCommit("abc", nil)
+	commit.Commit.CheckSuites.Nodes[0].CheckRuns = RunNodes{Nodes: runs}
 	return &PullRequest{
-		State: "OPEN",
-		Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
-			Oid:         "abc",
-			CheckSuites: SuiteNodes{Nodes: []CheckSuite{suite}},
-		}}}},
+		State:   "OPEN",
+		Commits: CommitNodes{Nodes: []Commit{commit}},
 	}
 }
 
