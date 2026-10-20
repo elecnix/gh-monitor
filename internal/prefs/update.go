@@ -13,7 +13,7 @@ import (
 // validation; this slice exists so the error message and DaemonReadKeys cannot
 // name a key the switch would reject.
 var validPrefKeys = []string{
-	"templates", "ignoredBots", "retriggerComments", "selfUpdate",
+	"templates", "ignoredBots", "annotationChecks", "retriggerComments", "selfUpdate",
 	"pollInterval", "idlePollCeiling", "coveredSafetyInterval", "pollWhenBrokerHealthy",
 	"reactOnNotify", "eventLog",
 }
@@ -57,6 +57,11 @@ func IsDaemonReadKey(key string) bool {
 //     file so the built-in default applies). Unknown kinds are rejected.
 //   - "ignoredBots": array of strings. Present (even empty) replaces the stored
 //     list; null clears it to an empty list. Absent leaves it untouched.
+//   - "annotationChecks": array of strings (issue #110) — the checks whose
+//     check-run annotations are reported. Present (even empty) replaces the
+//     stored list; null clears it to an empty list, which means "every
+//     check". Absent leaves it untouched. A blank name is rejected so a
+//     typo cannot narrow the allowlist to nothing.
 //   - "retriggerComments": bool. Present sets it; null resets it to the default
 //     (false) and removes it from the file. Absent leaves it untouched.
 //   - "selfUpdate": string (issue #82) — a Go duration ("30m"), "1"/"true"
@@ -137,6 +142,24 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 					return Preferences{}, fmt.Errorf("parse ignoredBots: %w", err)
 				}
 				stored.IgnoredBots = bots
+			}
+		case "annotationChecks":
+			if string(v) == "null" {
+				stored.AnnotationChecks = []string{}
+			} else {
+				var checks []string
+				if err := json.Unmarshal(v, &checks); err != nil {
+					return Preferences{}, fmt.Errorf("parse annotationChecks: %w", err)
+				}
+				// A blank name would never match a check, so it is rejected
+				// here rather than silently narrowing the allowlist to
+				// nothing.
+				for _, c := range checks {
+					if strings.TrimSpace(c) == "" {
+						return Preferences{}, fmt.Errorf("invalid annotationChecks entry %q: a check name cannot be blank", c)
+					}
+				}
+				stored.AnnotationChecks = checks
 			}
 		case "retriggerComments":
 			if string(v) == "null" {
@@ -318,6 +341,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.IgnoredBots != nil {
 		prefs.IgnoredBots = stored.IgnoredBots
+	}
+	if stored.AnnotationChecks != nil {
+		prefs.AnnotationChecks = stored.AnnotationChecks
 	}
 	if stored.RetriggerComments != nil {
 		prefs.RetriggerComments = *stored.RetriggerComments

@@ -118,6 +118,13 @@ type WatchOptions struct {
 	// (for example "warning", "failure"). Empty means the backend's default.
 	AnnotationLevels []string `json:"annotation_levels,omitempty"`
 
+	// AnnotationChecks limits which check runs' annotations are reported
+	// (for example "dupdelta"). Empty means every check. It is the
+	// per-check-name counterpart of AnnotationLevels, and the two apply
+	// together: an annotation survives only when its level AND its check
+	// name pass.
+	AnnotationChecks []string `json:"annotation_checks,omitempty"`
+
 	// RepeatUnresolved asks for still-open items to be re-reported on every
 	// observation rather than only when they first appear.
 	RepeatUnresolved bool `json:"repeat_unresolved,omitempty"`

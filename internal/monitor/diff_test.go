@@ -322,6 +322,61 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		assert.Nil(t, findEvent(events, EventNewFailingChecks), "should not fire failing-checks for annotations")
 	})
 
+	t.Run("a filtered-out check never reaches the diff, so it never re-fires", func(t *testing.T) {
+		// The check-name filter runs at snapshot time, so a check the
+		// operator did not ask for is absent from CheckAnnotations
+		// altogether. That is what keeps the noise from re-firing on every
+		// poll: the diff only ever sees the annotations the filter kept.
+		//
+		// The snapshot below is what Snapshot produces for a PR carrying
+		// both checks under a "dupdelta"-only filter.
+		prev := &PRStatus{}
+		curr := Snapshot(&PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{
+							{
+								Name:       "dupdelta",
+								Conclusion: "SUCCESS",
+								Status:     "COMPLETED",
+								Annotations: AnnotationNodes{Nodes: []Annotation{{
+									Path: "src/dup.go", Level: "WARNING", Title: "duplication", Message: "clone",
+								}}},
+							},
+							{
+								Name:       "lint",
+								Conclusion: "SUCCESS",
+								Status:     "COMPLETED",
+								Annotations: AnnotationNodes{Nodes: []Annotation{{
+									Path: "src/x.go", Level: "WARNING", Title: "deprecated", Message: "Foo is deprecated",
+								}}},
+							},
+						}},
+					}}},
+				},
+			}}},
+		}, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+
+		// The lint annotation never reached the snapshot.
+		require.Len(t, curr.CheckAnnotations, 1)
+		assert.Equal(t, "dupdelta", curr.CheckAnnotations[0].CheckName)
+
+		// So the first diff fires on the duplication finding alone.
+		e := findEvent(Diff(prev, curr), EventCheckAnnotations)
+		require.NotNil(t, e)
+		require.Len(t, e.Annotations, 1)
+		assert.Equal(t, "dupdelta", e.Annotations[0].CheckName)
+
+		// And the next poll, with the same annotations, fires nothing: the
+		// lint annotation is not in the snapshot to be "new" again.
+		assert.Nil(t, findEvent(Diff(curr, curr), EventCheckAnnotations))
+	})
+
 	t.Run("notice-level annotations reach diff unchanged (filtering is at snapshot time)", func(t *testing.T) {
 		prev := &PRStatus{}
 		curr := &PRStatus{

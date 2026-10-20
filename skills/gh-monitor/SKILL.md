@@ -85,7 +85,15 @@ gh monitor --text -R owner/repo <pr>     # Human-readable
 gh monitor --once -R owner/repo <pr>     # One-shot, then exit
 ```
 
-Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever; a hard deadline — see the `timeout` event below), `--ignored-bots <a,b>`.
+Flags: `--interval` (default 300s, min 10), `--timeout` (default 0 = forever; a hard deadline — see the `timeout` event below), `--ignored-bots <a,b>`, `--events <kind,kind>` (emit only these kinds), `--until <kind,kind>` (exit 0 the first time one fires, 2 if the watch ends first), `--annotation-levels <a,b>` and `--annotation-checks <a,b>` (which check-run annotations to surface — see below).
+
+**Annotation filters:** the `check-annotations` event reports the annotations a PR's check runs posted. Two filters narrow it, and they apply together: `--annotation-levels` (`notice`, `warning`, `failure`, `none`; default `warning,failure`) by severity, and `--annotation-checks` by check name (default: every check). The check name is matched on the whole name, case-insensitively. Use them to make `check-annotations` a usable wake trigger: a PR that runs the same job six times posts the same warning six times, and a consumer that only wants one check's findings says so.
+
+```sh
+gh monitor -R owner/repo <pr> --annotation-checks dupdelta --annotation-levels warning
+```
+
+The same allowlist can be stored as a standing preference with `gh monitor prefs set '{"annotationChecks": ["dupdelta"]}'`; the flag overrides the stored value when it is set.
 
 **Eyes-on-notify (default on):** every comment a delivered notification is about gets a 👀 reaction — the thread's first comment, general PR comments, and issue comments — so humans on the PR can see the notification was received. It is evidence of delivery, not of action. Turn it off with `gh monitor prefs set '{"reactOnNotify": false}'`. A failed reaction costs one stderr line; the watch continues.
 
