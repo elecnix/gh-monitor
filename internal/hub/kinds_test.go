@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -368,9 +369,10 @@ func TestHub_OnceDoesNotStartPoller(t *testing.T) {
 func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	// A PR and an issue in the same repository are different identities: each
 	// gets its own poller, and a fetch for one never feeds the other.
-	fetches := 0
+	// Two pollers fetch concurrently and both increment this, so it is atomic.
+	var fetches atomic.Int32
 	h := New(func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (any, error) {
-		fetches++
+		fetches.Add(1)
 		if id.Target == "issue" {
 			return issueFixture("OPEN", "c1"), nil
 		}
@@ -395,7 +397,11 @@ func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	n := len(h.pollers)
 	h.mu.Unlock()
 	assert.Equal(t, 2, n, "each kind gets its own poller")
-	assert.GreaterOrEqual(t, fetches, 2, "each poller fetched independently")
+	// Wait for the condition, not a stopwatch: a fixed window races the
+	// scheduler and fails on a loaded runner.
+	assert.Eventually(t, func() bool { return fetches.Load() >= 2 },
+		5*time.Second, 10*time.Millisecond,
+		"each poller fetched independently (saw %d of 2)", fetches.Load())
 }
 
 func TestPoller_ErrorBackoff(t *testing.T) {

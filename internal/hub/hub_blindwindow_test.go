@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,14 +48,16 @@ func waitDegradedDeadline(t *testing.T, ch <-chan backend.Update, timeout time.D
 // DegradedFrom to land within the success window and before the failure —
 // with the bug it equals the failure time and fails the assertion.
 func TestPoller_BlindWindowStartsAtLastSuccess(t *testing.T) {
-	var successAt, failAt time.Time
+	// Written by the fetch goroutine and polled by the assertions, so
+	// both are atomic: the zero value means "has not run yet".
+	var successAt, failAt atomic.Int64
 	calls := 0
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		calls++
 		switch calls {
 		case 1:
 			time.Sleep(20 * time.Millisecond) // widen the success/failure gap so the timestamps cannot collide
-			successAt = time.Now()
+			successAt.Store(time.Now().UnixNano())
 			return prFixture(nil), nil
 		case 2:
 			// Stay in the failing fetch for over two seconds past the success.
@@ -64,7 +67,7 @@ func TestPoller_BlindWindowStartsAtLastSuccess(t *testing.T) {
 			// not separate the two behaviours. Two seconds guarantees the buggy
 			// value fails the assertions below.
 			time.Sleep(2100 * time.Millisecond)
-			failAt = time.Now()
+			failAt.Store(time.Now().UnixNano())
 			return nil, errors.New("gh api failed: exit status 1")
 		default:
 			return prFixture(nil), nil
@@ -80,7 +83,7 @@ func TestPoller_BlindWindowStartsAtLastSuccess(t *testing.T) {
 
 	// Wait for the first (successful) fetch to complete before forcing the
 	// failing one, so the two observations are ordered and timestamped.
-	require.Eventually(t, func() bool { return !successAt.IsZero() },
+	require.Eventually(t, func() bool { return successAt.Load() != 0 },
 		2*time.Second, 5*time.Millisecond, "the first fetch must succeed")
 
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
@@ -107,16 +110,17 @@ func TestPoller_BlindWindowStartsAtLastSuccess(t *testing.T) {
 		}
 	}
 done:
-	require.False(t, successAt.IsZero() || failAt.IsZero(), "test bookkeeping: both fetches must have run")
+	require.NotZero(t, successAt.Load(), "test bookkeeping: both fetches must have run")
+	require.NotZero(t, failAt.Load(), "test bookkeeping: both fetches must have run")
 	// Fixed: DegradedFrom is the success timestamp truncated to the second —
 	// within one second of successAt, and over a second before the failure.
 	// Buggy (DegradedFrom = failure time): it sits over a second after the
 	// success and at/after the failure stamp, failing both assertions.
-	assert.WithinDuration(t, successAt, from, time.Second,
-		"DegradedFrom (%s) must be the last successful observation (%s), not the failure time", from, successAt)
-	assert.Greater(t, failAt.Sub(from), time.Second,
+	assert.WithinDuration(t, time.Unix(0, successAt.Load()), from, time.Second,
+		"DegradedFrom (%s) must be the last successful observation (%s), not the failure time", from, successAt.Load())
+	assert.Greater(t, time.Unix(0, failAt.Load()).Sub(from), time.Second,
 		"DegradedFrom (%s) must precede the failure (%s) by more than a second: the window opens at the last success, not its discovery",
-		from, failAt)
+		from, failAt.Load())
 }
 
 // TestPoller_FirstFetchFailureDeclaresNoWindow verifies the no-prior-success

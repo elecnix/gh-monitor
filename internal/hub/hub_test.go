@@ -631,10 +631,10 @@ func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) back
 // successful fetch — so without the declaration, whatever happened during
 // the window is missed forever and the recovery notice reads as an all-clear.
 func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
-	calls := 0
+	// Incremented on the fetch goroutine and polled below, so it is atomic.
+	var calls atomic.Int32
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
-		calls++
-		if calls == 2 {
+		if calls.Add(1) == 2 {
 			return nil, errors.New("gh api failed: exit status 1")
 		}
 		return prFixture(nil), nil
@@ -650,7 +650,7 @@ func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
 	// The first fetch must succeed (an honest blind window opens at the last
 	// success) before the second, forced one fails.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	require.Eventually(t, func() bool { return calls >= 2 },
+	require.Eventually(t, func() bool { return calls.Load() >= 2 },
 		2*time.Second, 5*time.Millisecond, "the failing fetch must run")
 
 	waitDegraded(t, ch, "the failure must broadcast")
