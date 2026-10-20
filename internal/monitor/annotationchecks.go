@@ -74,7 +74,7 @@ func (f *AnnotationChecks) Allows(checkName string) bool {
 	if f == nil {
 		return true
 	}
-	return f.allowed[strings.ToLower(strings.TrimSpace(checkName))]
+	return allowlisted(f.allowed, checkName)
 }
 
 // Names returns the check names this filter allows, so the filter can cross
