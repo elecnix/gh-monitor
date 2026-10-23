@@ -17,7 +17,27 @@ import (
 type Provider struct {
 	transport Transport
 	hello     Hello
+	// revive, when set, is asked to restart the server once reconnect
+	// attempts stop making progress. It is how a watch survives the daemon
+	// being restarted or killed rather than handed off: without it the
+	// watcher retries a socket nobody holds, forever, in silence.
+	revive ReviveFunc
 }
+
+// ReviveFunc restarts the server a Provider talks to. It returns an error when
+// it could not, which is reported and retried on the next attempt.
+type ReviveFunc func(ctx context.Context) error
+
+// SetRevive installs the restart hook used when reconnecting stops making
+// progress. A Provider without one only ever reconnects, which is right for a
+// server somebody else supervises.
+func (p *Provider) SetRevive(f ReviveFunc) { p.revive = f }
+
+// reviveAfterAttempts is how many consecutive failed reconnects mean the
+// server is not coming back on its own. The first failures cover a handoff
+// (the successor is already serving); this many cover a daemon that was
+// stopped or crashed.
+const reviveAfterAttempts = 5
 
 // Connect opens a probe connection, reads the server's hello, and returns a
 // Provider describing what that server covers. The probe is closed
@@ -177,6 +197,7 @@ func (p *Provider) pumpWatch(ctx context.Context, t backend.Target, opts backend
 		// reappears without a word would look like silence; a watcher that
 		// says nothing once it is back would look broken.
 		degrade(fmt.Errorf("connection lost (%v); reconnecting", err))
+		attempts := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -186,8 +207,19 @@ func (p *Provider) pumpWatch(ctx context.Context, t backend.Target, opts backend
 			backoff = min(2*backoff, reconnectCap)
 			reconn, rbr, oerr := p.openWatch(ctx, t, opts)
 			if oerr != nil {
+				attempts++
+				if p.revive != nil && attempts == reviveAfterAttempts {
+					// Loud, and only once per streak: a watcher must never
+					// look quiet while it is failing to reach anybody.
+					if rerr := p.revive(ctx); rerr != nil {
+						degrade(fmt.Errorf("could not restart %s (%v); still retrying", p.hello.Name, rerr))
+					} else {
+						degrade(fmt.Errorf("%s was not running; restarting it", p.hello.Name))
+					}
+				}
 				continue
 			}
+			attempts = 0
 			emit(backend.Update{
 				Target: t,
 				Event: backend.Event{

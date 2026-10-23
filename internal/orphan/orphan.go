@@ -9,8 +9,11 @@
 //
 // The visible signature of a launcher that exited is a changed parent pid:
 // the OS reassigns the child to a new parent (init, launchd, or the user
-// service manager) when the old parent exits. A goroutine polls os.Getppid()
-// and closes Done when it differs from the pid captured at start. Polling
+// service manager) when the old parent exits. A goroutine polls the launcher
+// pid and closes Done when it differs from the pid captured at start. The
+// launcher is resolved past wrapper processes — `gh` forks the extension and
+// waits, so the watch's own parent never changes and watching os.Getppid()
+// alone missed every watch started through the CLI (see launcher.go). Polling
 // rather than prctl(PR_SET_PDEATHSIG, SIGTERM) is deliberate: PDEATHSIG
 // observes the parent's main thread, which a multi-threaded launcher (Node,
 // .NET) exits long before its process ends, so it would stop healthy watches.
@@ -71,9 +74,20 @@ func New(interval time.Duration, ppidFn func() int) *Guard {
 	}
 }
 
-// Start polls this process's real parent pid for its change.
+// Start polls the launcher pid for its change: the first non-wrapper ancestor
+// of this process, or the immediate parent when the walk cannot be done.
 func Start(interval time.Duration) *Guard {
-	return New(interval, os.Getppid).Start()
+	return New(interval, LauncherPID).Start()
+}
+
+// LauncherPID is the pid whose exit means the launcher that started this
+// watch is gone. It falls back to the immediate parent whenever the process
+// tree cannot be inspected, which is the guard's behaviour without the walk.
+func LauncherPID() int {
+	if pid := ResolveLauncher(os.Getpid(), procParentOf); pid > 0 {
+		return pid
+	}
+	return os.Getppid()
 }
 
 // Start captures the parent pid and launches the poll loop. The first read

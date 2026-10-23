@@ -69,12 +69,46 @@ func request(ctx context.Context, socket, op string) (remote.Frame, error) {
 	return frame, nil
 }
 
+// Options tune the successor side of the handoff. Both hooks are optional.
+type Options struct {
+	// BeforeFD receives the predecessor's Info once its state has been read
+	// and before the listening socket is asked for. Returning an error
+	// abandons the handoff while the predecessor is still serving — which is
+	// what makes a supervised takeover safe: the successor announces itself
+	// as the service's main process here, and a refusal costs nothing.
+	BeforeFD func(DaemonInfo) error
+	// AbortFD runs when the socket could not be adopted after BeforeFD
+	// succeeded. The predecessor is still serving (its fd pass never
+	// completed), so whatever BeforeFD announced must be undone: it is the
+	// only chance to leave the service pointing at the process that is
+	// actually answering.
+	AbortFD func(DaemonInfo)
+}
+
 // Adopt performs the successor side of the handoff against the daemon
 // currently holding socket. It returns the adopted listener — on Unix, the
 // very socket the predecessor served on — and the predecessor's watching
 // state for hub.RestoreState. Any error means the handoff did not happen;
 // the caller falls back to its ordinary behaviour.
-func Adopt(ctx context.Context, socket string) (net.Listener, hub.State, error) {
+//
+// The conversation is deliberately ordered: info, then state, then the
+// listening socket. Each step leaves the predecessor serving, so a successor
+// that changes its mind — or is refused — leaves one daemon on the socket
+// rather than two or none.
+func Adopt(ctx context.Context, socket string, opts Options) (net.Listener, hub.State, error) {
+	info, ierr := Info(ctx, socket)
+	if opts.BeforeFD != nil {
+		if ierr != nil {
+			// A daemon that predates OpInfo cannot be described, but it can
+			// still be handed off from. Announce with an empty Info rather
+			// than losing the takeover to a missing diagnostic op.
+			info = DaemonInfo{Socket: socket}
+		}
+		if err := opts.BeforeFD(info); err != nil {
+			return nil, hub.State{}, err
+		}
+	}
+
 	f, err := request(ctx, socket, OpHandoff)
 	if err != nil {
 		return nil, hub.State{}, err
@@ -89,6 +123,9 @@ func Adopt(ctx context.Context, socket string) (net.Listener, hub.State, error) 
 
 	listener, err := adoptSocket(ctx, socket)
 	if err != nil {
+		if opts.AbortFD != nil {
+			opts.AbortFD(info)
+		}
 		return nil, hub.State{}, err
 	}
 	return listener, state, nil

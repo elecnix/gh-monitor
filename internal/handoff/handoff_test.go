@@ -100,6 +100,12 @@ func startPredecessor(t *testing.T, ctx context.Context, socket string, h *hub.H
 				if stateful {
 					cfg.HandleOp = func(ctx context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
 						switch req.Op {
+						case OpInfo:
+							raw, err := json.Marshal(DaemonInfo{PID: os.Getpid(), Socket: socket})
+							if err != nil {
+								return true, remote.WriteFrame(conn, remote.Frame{Error: err.Error()})
+							}
+							return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
 						case OpHandoff:
 							raw, err := json.Marshal(h.ExportState())
 							if err != nil {
@@ -158,7 +164,7 @@ func TestAdoptTransfersStateAndSocket(t *testing.T) {
 	h := handoffHub(t)
 	startPredecessor(t, ctx, socket, h, true)
 
-	listener, state, err := Adopt(ctx, socket)
+	listener, state, err := Adopt(ctx, socket, Options{})
 	require.NoError(t, err)
 	require.NotNil(t, listener)
 	t.Cleanup(func() { _ = listener.Close() })
@@ -253,7 +259,7 @@ func boundAdopt(t *testing.T, socket string) (time.Duration, error) {
 	t.Cleanup(cancel)
 
 	start := time.Now()
-	listener, _, err := Adopt(ctx, socket)
+	listener, _, err := Adopt(ctx, socket, Options{})
 	if listener != nil {
 		_ = listener.Close()
 	}
@@ -294,7 +300,7 @@ func TestAdoptBoundedWhenPredecessorNeverGreets(t *testing.T) {
 	// context.Background() carries no deadline, which is the finding's
 	// precondition.
 	start := time.Now()
-	listener, _, err := Adopt(context.Background(), socket)
+	listener, _, err := Adopt(context.Background(), socket, Options{})
 	elapsed := time.Since(start)
 	if listener != nil {
 		_ = listener.Close()
@@ -349,7 +355,7 @@ func TestAdoptRefusedByOldDaemon(t *testing.T) {
 	h := handoffHub(t)
 	startPredecessor(t, ctx, socket, h, false)
 
-	_, _, err := Adopt(ctx, socket)
+	_, _, err := Adopt(ctx, socket, Options{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported op")
 }

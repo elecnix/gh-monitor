@@ -87,6 +87,42 @@ Practical consequences when debugging or extending the daemon:
   sub-daemon to the hub. A log of delivered updates alone cannot show how
   often the hub polls, or which watches gave up a sub-daemon's free serving.
 
+## Supervision and the daemon handoff
+
+A watched target is served by the daemon or by nobody: no client polls on its
+own. A handoff moves watching state between daemons over the socket
+(`internal/handoff`), and under a service manager it must also move the
+service's identity, or systemd kills the successor with the predecessor's
+cgroup. The rules that follow from that:
+
+- **`MAINPID` goes before the fd pass** (`cmd/daemon_supervision.go`). The
+  successor announces itself while the predecessor still serves; a notification
+  sent after the socket changed hands races systemd's `SIGCHLD` handling, and
+  losing that race is the cgroup kill ([#193](https://github.com/elecnix/gh-monitor/issues/193)).
+  If the fd pass then fails, `AbortFD` sends the predecessor's pid back.
+- **A successor from another service instance is refused.** Same-empty
+  `INVOCATION_ID` on both sides means "no service manager in play" and hands off
+  as before; a predecessor that has one and a successor that does not is the
+  cgroup case, so it refuses and the predecessor keeps serving.
+- **`gh monitor reload` asks the daemon to spawn its successor** (`OpReload`).
+  A client-spawned successor lands in the client's cgroup. The client falls back
+  to spawning only for a daemon too old to answer.
+- **Socket activation outranks binding** (`internal/activation`). An activated
+  socket's path belongs to the service manager: the daemon must not unlink it.
+  A connect on an activated path succeeds even with no daemon running, so
+  liveness is an answered hello, never a successful `connect()`.
+- **Runtime copies are content-addressed** (`internal/reexec`). A shared
+  "current copy" path let one launch rewrite the file another was about to
+  exec; a two-day-old watcher reported a build two weeks older than itself.
+  Never reintroduce a fixed copy path.
+- **The orphan guard resolves past wrappers** (`internal/orphan/launcher.go`).
+  `gh` forks the extension and waits, so the watch's own parent never changes
+  when the session exits — watching `os.Getppid()` alone missed every watch
+  started through the CLI.
+- **`gh monitor doctor` is the fleet's source of truth.** A daemon's log can
+  only describe its own pollers; anything polling outside them is invisible
+  everywhere else.
+
 ## Releasing
 
 Read [`.github/workflows/release.yml`](.github/workflows/release.yml) before

@@ -70,6 +70,7 @@ npx skills add elecnix/gh-monitor
 | `prefs`                         | View and edit notification preference templates (get/set/set from file/reset/path)   |
 | `daemon`                        | Run a shared-poller daemon so multiple `monitor` processes share one fetch           |
 | `reload`                        | Restart the resident daemon so it re-reads preferences (watching state carries over) |
+| `doctor`                        | Report the daemon and every running watcher, and flag any polling outside it         |
 | `instances list`                | List all named instance cursors                                                      |
 | `instances reset <name>`        | Reset a cursor so the next run replays from the beginning                            |
 | `backends`                      | List the monitoring backends and the target kinds they cover                         |
@@ -499,13 +500,45 @@ gh monitor prefs set '{"reactOnNotify": false}'
 
 `gh extension upgrade` rewrites the installed binary in place, which Linux refuses with "text file busy" while any process has it mapped — and the daemon's whole job is to stay resident. Upgrades are therefore seamless end to end ([#73](https://github.com/elecnix/gh-monitor/issues/73)):
 
-- **The installed file is never busy.** A resident command — the daemon, or a continuous `monitor` watch — launches from a runtime copy of the binary (`$XDG_RUNTIME_DIR/gh-monitor/gh-monitor`, falling back to the user cache dir) instead of the installed file, so the installed file is only ever exec'd for the instant of launch and the upgrade can rewrite it in place. Set `GH_MONITOR_REEXEC=0` to disable the relaunch and run from the installed path (the pre-#73 behaviour; upgrades then require stopping the daemon first).
+- **The installed file is never busy.** A resident command — the daemon, or a continuous `monitor` watch — launches from a runtime copy of the binary (`$XDG_RUNTIME_DIR/gh-monitor/`, falling back to the user cache dir) instead of the installed file, so the installed file is only ever exec'd for the instant of launch and the upgrade can rewrite it in place. The copy's name is derived from the binary's identity (`gh-monitor-<key>`), so two builds launched at the same time can never overwrite each other's copy — a shared "current copy" path made a launch able to exec a different build than its own. Copies are written once and pruned after a day when unused. Set `GH_MONITOR_REEXEC=0` to disable the relaunch and run from the installed path (the pre-#73 behaviour; upgrades then require stopping the daemon first).
 - **The daemon adopts the new version by itself.** A resident daemon watches the installed binary; when an upgrade lands, it spawns the new binary, which performs an **in-memory handoff**: over the existing socket it receives the old daemon's watching state — every watched PR's last snapshot, backoff state, query tier, cached ruleset, and each connected watcher's baseline — and then the listening socket itself (passed as a file descriptor, so the socket path is never unbound). The old daemon exits cleanly; the new one serves in its place. No state file is written, and the takeover is seamless by construction:
   - **Watchers survive.** A connected `monitor` process sees its stream break, says so loudly once, reconnects to the same socket, and resumes from the baseline it was last shown — no second first-poll, no replay of what it already reported. Only what actually changed during the switchover is delivered.
   - **No polling state is lost.** The successor continues each PR's poll continuity instead of starting cold, so an upgrade does not re-fetch storm GitHub or re-notify watchers.
   - **No gap.** The successor serves on the adopted listening socket before the predecessor exits, so clients that probe the socket during the upgrade always find a daemon. A successor that fails to take over is announced loudly, and the old daemon keeps serving.
 
 If the running daemon predates the handoff protocol, the new start fails with the ordinary "socket in use" error and clients keep using the old daemon — stop it by hand to complete that one upgrade. Watchers running a build older than the reconnect support still end their watch on a daemon change, as they always did.
+
+#### Running under a service manager
+
+A service manager that supervises the daemon (`Type=simple`, `Restart=always`, `KillMode=control-group`) used to make the choice above impossible: with the relaunch enabled the handoff _lost a race_ — the successor adopted the socket inside the unit's cgroup, the predecessor exited, systemd read that as the service exiting and killed the successor too, and `Restart=always` started a cold daemon. Every upgrade was then a restart that discarded watchers and state. Running with `GH_MONITOR_REEXEC=0` avoided that but kept the installed file mapped, so upgrades failed with `text file busy` instead.
+
+That is fixed ([#193](https://github.com/elecnix/gh-monitor/issues/193)). Ship [`contrib/systemd/gh-monitor-daemon.service`](contrib/systemd/gh-monitor-daemon.service) and [`contrib/systemd/gh-monitor.socket`](contrib/systemd/gh-monitor.socket):
+
+```sh
+install -Dm0644 contrib/systemd/gh-monitor.socket contrib/systemd/gh-monitor-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now gh-monitor.socket gh-monitor-daemon.service
+```
+
+What each piece does:
+
+- **`Type=notify` + `NotifyAccess=all`.** The daemon reports `READY=1` once it serves, and an upgrade successor sends `MAINPID=<itself>` _before_ it asks for the listening socket, so systemd already knows the service's main process when the predecessor exits. A `STOPPING=1` is sent on SIGTERM, so `systemctl --user stop` reports a stop instead of a disappearance. Nothing is sent when `$NOTIFY_SOCKET` is unset, so an unsupervised daemon behaves exactly as before.
+- **Socket activation.** With `gh-monitor.socket`, systemd holds the listening socket for the whole session. A restart, crash, or upgrade no longer has to move the socket, and a client's `connect()` never finds it missing. The daemon adopts the passed descriptor and never unlinks that path. Without the socket unit it binds the path itself, as before.
+- **Reload spawns from inside the daemon.** `gh monitor reload` (and `systemctl --user reload`) asks the _daemon_ to start its successor, so the successor inherits the unit's cgroup and `INVOCATION_ID`. A successor started by a client would land outside the unit and be killed with it, so a daemon reports that it is being asked to hand off to a process from a different service instance and **refuses** — one healthy daemon keeps serving instead of two daemons taking turns dying.
+- **The relaunch stays on.** `GH_MONITOR_REEXEC` is not set in the unit: the daemon runs from its content-addressed copy, so the installed file is writable and self-update works under systemd.
+
+#### Watching the fleet: `gh monitor doctor`
+
+Polling belongs to the daemon alone. A `monitor` process that cannot reach its daemon reports an error and asks for the daemon to be restarted — it never falls back to polling by itself, because a watcher outside the daemon is invisible to the daemon's log, unaffected by broker coverage, immune to upgrades, and spending the same GitHub quota as everybody else. Enough of them exhaust the account's GraphQL budget and break unrelated `gh` commands.
+
+`gh monitor doctor` makes that state visible:
+
+```sh
+gh monitor doctor            # report; exit non-zero if any watcher polls alone
+gh monitor doctor --reap     # also stop unattached watchers older than --min-age (default 5m)
+```
+
+It lists the resident daemon (pid, socket, whether it is supervised or socket-activated, and every connected client with the targets it watches), scans the machine for every running `gh-monitor` watcher, and says which ones the daemon is not serving. A watcher younger than `--min-age` is reported as _just started_, not as an orphan, so reaping never races a client that is still connecting. The process scan needs Linux `/proc`; the daemon's own report works everywhere.
 
 #### Broker transport (optional)
 

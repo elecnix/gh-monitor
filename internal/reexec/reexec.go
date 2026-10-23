@@ -16,10 +16,14 @@
 package reexec
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 // OptOutEnv disables the relaunch-into-runtime-copy behaviour when set to "0".
@@ -31,18 +35,76 @@ const OptOutEnv = "GH_MONITOR_REEXEC"
 // can watch the installed binary for upgrades and hand off to it (issue #73).
 const InstalledBinEnv = "GH_MONITOR_INSTALLED_BIN"
 
-// RuntimePath returns the path the resident copy of the binary lives at:
-// $XDG_RUNTIME_DIR/gh-monitor/gh-monitor, falling back to the user cache dir
-// (the same precedence the daemon socket uses). The directory need not exist.
-func RuntimePath() (string, error) {
+// copyPattern is the name a runtime copy is stored under. The key in it makes
+// the path a function of the binary's identity, never of the time it was
+// written (see CopyPathFor).
+const copyPattern = "gh-monitor-"
+
+// staleCopyAge is how old an unused runtime copy must be before it is pruned.
+// Copies are content-addressed and small in number — one per build actually
+// launched — but a rebuild on every `make build` would otherwise leave one
+// 13 MB file per build behind in a tmpfs.
+const staleCopyAge = 24 * time.Hour
+
+// RuntimeDir returns the directory runtime copies live in:
+// $XDG_RUNTIME_DIR/gh-monitor, falling back to the user cache dir (the same
+// precedence the daemon socket uses). The directory need not exist.
+func RuntimeDir() (string, error) {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "gh-monitor", "gh-monitor"), nil
+		return filepath.Join(dir, "gh-monitor"), nil
 	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve runtime copy location: %w", err)
 	}
-	return filepath.Join(cache, "gh-monitor", "gh-monitor"), nil
+	return filepath.Join(cache, "gh-monitor"), nil
+}
+
+// RuntimePath returns the path of the runtime copy for the running
+// executable — the path a resident process runs from.
+func RuntimePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
+	}
+	return CopyPathFor(exe)
+}
+
+// CopyPathFor returns the runtime copy path for the binary at exe.
+//
+// The name is derived from the file's identity — device, inode, size and
+// modification time — not from its path. That is what makes launching two
+// different builds concurrently safe: a shared "current copy" path was
+// rewritten by every launch, so a process could exec a copy of a binary
+// other than its own between its rename and its exec (and did: a two-day-old
+// watcher reported features from a build two weeks older than its own).
+// Content-addressed copies are written once and never rewritten, so the
+// window is gone rather than narrowed.
+func CopyPathFor(exe string) (string, error) {
+	dir, err := RuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	key, err := identityKey(exe)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, copyPattern+key), nil
+}
+
+// identityKey is a short, stable fingerprint of one binary file. It must
+// change whenever the file's contents do, and must not require reading 13 MB
+// on every launch: size, mtime (nanosecond resolution), device and inode are
+// enough for that, and the inode changes on any atomic replace.
+func identityKey(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	inode, device := identityFields(fi)
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device)
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
 // MaybeReexec copies the running executable to RuntimePath and, on success,
@@ -63,20 +125,81 @@ func MaybeReexec() error {
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
 	}
-	rt, err := RuntimePath()
+	rt, err := CopyPathFor(exe)
 	if err != nil {
 		return err
 	}
-	if sameFile(exe, rt) {
+	// Already the runtime copy, either at the path this identity maps to or
+	// at another copy path (a rebuild's copy, a hard-link in a test). Asking
+	// *where the file lives*, never only what it contains, is what stops a
+	// copy being copied again forever: a copy's identity differs from the
+	// binary it was made from.
+	if isRuntimeCopy(exe) || sameFile(exe, rt) {
 		return nil
 	}
-	if err := copyExecutable(exe, rt); err != nil {
-		return err
+	// An existing copy for this identity is by construction the same file, so
+	// there is nothing to write. This is the common path: every watch of a
+	// long-lived session relaunches into the same copy.
+	if !copyUsable(rt, exe) {
+		if err := copyExecutable(exe, rt); err != nil {
+			return err
+		}
 	}
+	pruneCopies(filepath.Dir(rt), rt)
 	// Remember where we came from: the resident daemon watches that file for
 	// upgrades and hands off to it.
 	_ = os.Setenv(InstalledBinEnv, exe)
 	return reexecTo(rt)
+}
+
+// copyUsable reports whether an existing runtime copy can be exec'd in place
+// of exe: same size, still executable, and no partial write left behind.
+func copyUsable(rt, exe string) bool {
+	rf, err := os.Stat(rt)
+	if err != nil {
+		return false
+	}
+	ef, err := os.Stat(exe)
+	if err != nil {
+		return false
+	}
+	return rf.Size() == ef.Size() && rf.Mode().IsRegular() && rf.Mode()&0o111 != 0
+}
+
+// pruneCopies removes runtime copies in dir that no longer correspond to the
+// one this process uses, once they are older than staleCopyAge. Unlinking a
+// copy another process is running from is safe on Unix: the running image
+// keeps the inode alive, and nothing re-reads the path.
+func pruneCopies(dir, keep string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleCopyAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), copyPattern) {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		if full == keep {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(full)
+	}
+}
+
+// isRuntimeCopy reports whether path is a runtime copy: a file directly in
+// the runtime directory under the copy-name pattern.
+func isRuntimeCopy(path string) bool {
+	dir, err := RuntimeDir()
+	if err != nil {
+		return false
+	}
+	return filepath.Dir(path) == dir && strings.HasPrefix(filepath.Base(path), copyPattern)
 }
 
 // sameFile reports whether path and the runtime copy are the same file. A
