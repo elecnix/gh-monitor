@@ -23,6 +23,7 @@ package handoff
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 
@@ -64,6 +65,13 @@ func request(ctx context.Context, socket, op string) (remote.Frame, error) {
 
 	frame, err := c.Call(ctx, remote.Request{Op: op})
 	if err != nil {
+		// A daemon that predates the op answers with an error frame, which the
+		// protocol surfaces as a plain error. Translate it here so callers can
+		// tell "too old for this" from "failed to do it" — the first is a
+		// fallback, the second is a fault.
+		if isUnsupported(err.Error()) {
+			return remote.Frame{}, fmt.Errorf("%w: %s", ErrUnsupported, op)
+		}
 		return remote.Frame{}, fmt.Errorf("handoff: %s: %w", op, err)
 	}
 	return frame, nil
@@ -97,12 +105,17 @@ type Options struct {
 // rather than two or none.
 func Adopt(ctx context.Context, socket string, opts Options) (net.Listener, hub.State, error) {
 	info, ierr := Info(ctx, socket)
+	// A daemon that predates OpInfo cannot be described, but it can still be
+	// handed off from: announce with an empty Info rather than losing the
+	// takeover to a missing diagnostic op. Any other failure means there is
+	// nothing to hand off from, and announcing for it would name a successor
+	// for a daemon that does not exist.
+	if ierr != nil && !errors.Is(ierr, ErrUnsupported) {
+		return nil, hub.State{}, ierr
+	}
 	announced := false
 	if opts.BeforeFD != nil {
 		if ierr != nil {
-			// A daemon that predates OpInfo cannot be described, but it can
-			// still be handed off from. Announce with an empty Info rather
-			// than losing the takeover to a missing diagnostic op.
 			info = DaemonInfo{Socket: socket}
 		}
 		if err := opts.BeforeFD(info); err != nil {
