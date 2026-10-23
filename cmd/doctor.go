@@ -193,6 +193,11 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 					continue
 				}
 				if err := p.Stop(); err != nil {
+					if errors.Is(err, errProcessGone) {
+						_, _ = fmt.Fprintf(out, "pid %d exited before it could be stopped\n", p.PID)
+						gone++
+						continue
+					}
 					// A stop that fails is not a stop that came too early: the
 					// age gate above already let this one through. Counting it
 					// as "younger than --min-age" would send the operator back
@@ -227,6 +232,10 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 	cmd.Flags().DurationVar(&minAge, "min-age", doctorMinAge, "How old an unattached watcher must be before --reap stops it")
 	return cmd
 }
+
+// errProcessGone reports that the process a scan saw is no longer there under
+// that pid, so a signal must not be sent to whatever now holds it.
+var errProcessGone = errors.New("process exited before it could be stopped")
 
 // removeProc drops the process with pid from procs.
 func removeProc(procs []watcherProcess, pid int) []watcherProcess {

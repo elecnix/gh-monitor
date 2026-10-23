@@ -283,3 +283,30 @@ func TestDoctor_ClassificationHonoursMinAge(t *testing.T) {
 		"with --min-age 1m a three-minute watcher is old enough to stop")
 	assert.NotContains(t, out, "just started")
 }
+
+// TestDoctor_StopThatFindsTheProcessGoneIsNotAFailure: the identity check now
+// lives inside Stop as well as in Alive, because the signal is the
+// irreversible part and a caller may have checked a moment earlier. Finding
+// the process gone is an outcome, not an error to fix.
+func TestDoctor_StopThatFindsTheProcessGoneIsNotAFailure(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{PID: 100, StartedAt: time.Now()}, nil
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 200, Age: time.Hour, Describe: "-R o/r 7",
+			Alive: func() bool { return true }, // alive at classification time
+			Stop:  func() error { return errProcessGone },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--reap")
+	require.NoError(t, err, "a process that exited between the check and the signal is not a failure")
+	assert.Contains(t, out, "exited before it could be stopped")
+	assert.NotContains(t, out, "could not be stopped")
+}
