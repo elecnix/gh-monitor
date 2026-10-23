@@ -198,3 +198,58 @@ func TestDoctor_FailedStopIsNotReportedAsTooYoung(t *testing.T) {
 	assert.Contains(t, out, "could not be stopped")
 	assert.Contains(t, out, "operation not permitted")
 }
+
+// TestDoctor_ReapNeverKillsARecycledPID: a pid can be reused between the scan
+// and the signal, and --reap must not kill whatever inherited the number.
+func TestDoctor_ReapNeverKillsARecycledPID(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{PID: 100, StartedAt: time.Now()}, nil
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	stopped := 0
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 200, Age: time.Hour, Describe: "-R o/r 7",
+			Alive: func() bool { return false }, // exited, pid possibly reused
+			Stop:  func() error { stopped++; return nil },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--reap")
+	require.NoError(t, err, "a watcher that exited on its own is not a failure to reap")
+	assert.Zero(t, stopped, "a recycled pid must never be signalled")
+	assert.Contains(t, out, "exited before it could be stopped")
+}
+
+// TestDoctor_DaemonIsExcludedByPIDNotByItsArgv: the daemon's pid comes from its
+// own report, so a daemon whose command line lacks the `daemon` token is still
+// recognised — and never reported as an unattached watcher that --reap would
+// stop.
+func TestDoctor_DaemonIsExcludedByPIDNotByItsArgv(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{PID: 300, StartedAt: time.Now()}, nil
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	stopped := 0
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 300, Age: time.Hour, Describe: "daemon (argv without the token)",
+			Stop: func() error { stopped++; return nil },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--reap")
+	require.NoError(t, err)
+	assert.Zero(t, stopped, "the daemon's own pid must never be stopped")
+	assert.NotContains(t, out, "NOT ATTACHED",
+		"the daemon is not a watcher, whatever its command line looks like")
+	assert.Contains(t, out, "every watcher is served")
+}

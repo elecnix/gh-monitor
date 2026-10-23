@@ -120,6 +120,19 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				attached[c.PID] = true
 			}
 
+			// Identify the daemon by the pid it reported, not only by the
+			// literal `daemon` token in its command line: a daemon launched in
+			// another shape would otherwise be reported as an unattached
+			// watcher and stopped by --reap.
+			if infoErr == nil {
+				for _, p := range procs {
+					if p.PID == info.PID {
+						procs = removeProc(procs, p.PID)
+						break
+					}
+				}
+			}
+
 			var unlinked []watcherProcess
 			_, _ = fmt.Fprintf(out, "processes: %d gh-monitor watcher(s) running\n", len(procs))
 			for _, p := range procs {
@@ -162,10 +175,17 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 					len(unlinked), minAge)
 				return fmt.Errorf("%d watcher(s) are polling outside the daemon", len(unlinked))
 			}
-			reaped, failed, tooYoung := 0, 0, 0
+			reaped, failed, tooYoung, gone := 0, 0, 0, 0
 			for _, p := range unlinked {
 				if p.Age < minAge {
 					tooYoung++
+					continue
+				}
+				if p.Alive != nil && !p.Alive() {
+					// The watcher exited between the scan and now, and its pid
+					// may already belong to someone else.
+					_, _ = fmt.Fprintf(out, "pid %d exited before it could be stopped\n", p.PID)
+					gone++
 					continue
 				}
 				if err := p.Stop(); err != nil {
@@ -181,6 +201,9 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				reaped++
 			}
 			_, _ = fmt.Fprintf(out, "reaped %d of %d unattached watcher(s)\n", reaped, len(unlinked))
+			if gone > 0 {
+				_, _ = fmt.Fprintf(out, "%d watcher(s) exited on their own before they could be stopped\n", gone)
+			}
 			if failed > 0 {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 					"%d watcher(s) could not be stopped (see the errors above); they are still polling outside the daemon\n", failed)
@@ -199,6 +222,17 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 	cmd.Flags().BoolVar(&reap, "reap", false, "Stop unattached watchers older than --min-age")
 	cmd.Flags().DurationVar(&minAge, "min-age", doctorMinAge, "How old an unattached watcher must be before --reap stops it")
 	return cmd
+}
+
+// removeProc drops the process with pid from procs.
+func removeProc(procs []watcherProcess, pid int) []watcherProcess {
+	out := procs[:0]
+	for _, p := range procs {
+		if p.PID != pid {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // describeTargets renders what a connected client asked for.
@@ -225,7 +259,12 @@ type watcherProcess struct {
 	PID      int
 	Age      time.Duration
 	Describe string
-	// stop terminates the process; a package-level field so tests need no
+	// Alive reports whether this is still the process the scan saw. A pid can
+	// be recycled between the scan and the signal, and --reap must never kill
+	// an innocent process that inherited the number (nil means "assume alive",
+	// which is what a test that fabricates a process wants).
+	Alive func() bool
+	// Stop terminates the process; a field rather than a call so tests need no
 	// real signals.
 	Stop func() error
 }
