@@ -40,7 +40,16 @@ func listWatchers(self int) ([]watcherProcess, error) {
 				again, err := procStartTicks(pid)
 				return err == nil && again == started
 			},
-			Stop: func() error { return syscall.Kill(pid, syscall.SIGTERM) },
+			// The identity is re-read here, not only by Alive: a caller that
+			// checked a moment ago has left a window in which the pid can be
+			// recycled, and the signal is the irreversible part.
+			Stop: func() error {
+				again, err := procStartTicks(pid)
+				if err != nil || again != started {
+					return errProcessGone
+				}
+				return syscall.Kill(pid, syscall.SIGTERM)
+			},
 		})
 	}
 	return out, nil

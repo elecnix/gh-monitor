@@ -840,3 +840,21 @@ func TestDaemon_ActivatedSocketIsUsedAndKept(t *testing.T) {
 	assert.True(t, d.socketActivated)
 	assert.Equal(t, path, d.socket, "the path must come from the listener, not the flag")
 }
+
+// TestAutostart_RespectsOptOut is the policy a review found could be bypassed:
+// the client's revive hook called autostartDaemon directly, so a crash of the
+// daemon let a client spawn a replacement even with auto-start forbidden. The
+// check lives in autostartDaemon now, so every caller inherits it.
+func TestAutostart_RespectsOptOut(t *testing.T) {
+	t.Setenv("GH_MONITOR_AUTOSTART", "0")
+
+	origSpawn := spawnDaemonFn
+	t.Cleanup(func() { spawnDaemonFn = origSpawn })
+	spawned := 0
+	spawnDaemonFn = func(string, time.Duration) error { spawned++; return nil }
+
+	err := autostartDaemon(context.Background(), shortSocket(t, "ghmon-noauto-*.d"), time.Minute)
+	require.Error(t, err, "auto-start is forbidden by the environment")
+	assert.Contains(t, err.Error(), "GH_MONITOR_AUTOSTART")
+	assert.Zero(t, spawned, "nothing may be spawned when auto-start is off")
+}

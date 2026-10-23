@@ -804,10 +804,13 @@ func isDisconnect(err error) bool {
 // the real binary.
 var spawnDaemonFn = spawnDaemon
 
+// autostartEnv names the variable that turns daemon auto-start off.
+const autostartEnv = "GH_MONITOR_AUTOSTART"
+
 // daemonAutostart reports whether `gh monitor` clients should spawn a daemon
 // when none is running. Default true; opt out with GH_MONITOR_AUTOSTART=0.
 func daemonAutostart() bool {
-	return os.Getenv("GH_MONITOR_AUTOSTART") != "0"
+	return os.Getenv(autostartEnv) != "0"
 }
 
 // autostartDaemon spawns a daemon (if none is listening) and waits for it to
@@ -815,6 +818,13 @@ func daemonAutostart() bool {
 // ipc.Listen's liveness probe ensures only one daemon binds the socket, and
 // every client's WaitReady still succeeds against the winner.
 func autostartDaemon(ctx context.Context, socket string, interval time.Duration) error {
+	// The policy lives here rather than at each caller: this function starts a
+	// daemon without being asked to, which is exactly what
+	// GH_MONITOR_AUTOSTART=0 forbids — including when the daemon a watch was
+	// riding on has crashed and the client is the only thing left to notice.
+	if !daemonAutostart() {
+		return fmt.Errorf("%s=0: not starting a daemon on %s", autostartEnv, socket)
+	}
 	if err := spawnDaemonFn(socket, interval); err != nil {
 		return err
 	}
