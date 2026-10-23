@@ -335,3 +335,50 @@ func TestTakeResumeTakesItsOwnLock(t *testing.T) {
 		t.Fatal("takeResume never returned after h.mu was released")
 	}
 }
+
+// TestSubscribe_ResumePathDoesNotDeadlock guards the other direction of the
+// same contract, and it is the failure mode that does not announce itself: if
+// a caller ever locks h.mu around takeResume again — because it is "obvious"
+// that a function touching a map wants the caller to hold the lock — the
+// second lock blocks on a mutex Go will not let it re-take, and the daemon
+// stops serving with no crash and no stack trace.
+//
+// A deadlock shows up here as nothing at all, which is why the assertion is a
+// deadline rather than a value.
+func TestSubscribe_ResumePathDoesNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	// No t.Cleanup(h.Stop) here on purpose: if the deadlock ever returns, Stop
+	// wants h.mu too and the cleanup would hang the whole binary instead of
+	// failing this one test promptly.
+
+	// Seed a live baseline, so Subscribe takes the takeResume path rather than
+	// skipping it for want of an entry.
+	h.mu.Lock()
+	h.resumes["w1"] = resumeEntry{
+		state:   ResumeState{ResumeID: "w1", Baseline: json.RawMessage(`{"state":"OPEN"}`)},
+		expires: time.Now().Add(time.Minute),
+	}
+	h.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		opts := testHubOpts()
+		opts.ResumeID = "w1"
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
+		defer cancelSub()
+		collect(ch, 50*time.Millisecond)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Subscribe never returned: the resume path deadlocked, which is what a " +
+			"call-site lock around takeResume looks like now that it locks itself")
+	}
+}
