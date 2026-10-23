@@ -97,6 +97,7 @@ type Options struct {
 // rather than two or none.
 func Adopt(ctx context.Context, socket string, opts Options) (net.Listener, hub.State, error) {
 	info, ierr := Info(ctx, socket)
+	announced := false
 	if opts.BeforeFD != nil {
 		if ierr != nil {
 			// A daemon that predates OpInfo cannot be described, but it can
@@ -107,25 +108,38 @@ func Adopt(ctx context.Context, socket string, opts Options) (net.Listener, hub.
 		if err := opts.BeforeFD(info); err != nil {
 			return nil, hub.State{}, err
 		}
+		announced = true
+	}
+
+	// abort undoes an announcement. Every failure after this point leaves the
+	// predecessor serving, so the service must be pointed back at it — a
+	// MAINPID naming a successor that never took over is how a healthy daemon
+	// gets killed on the next restart. Wiring it to the fd pass alone was not
+	// enough: the state read can fail too.
+	abort := func() {
+		if announced && opts.AbortFD != nil {
+			opts.AbortFD(info)
+		}
 	}
 
 	f, err := request(ctx, socket, OpHandoff)
 	if err != nil {
+		abort()
 		return nil, hub.State{}, err
 	}
 	if len(f.Result) == 0 {
+		abort()
 		return nil, hub.State{}, fmt.Errorf("handoff: empty state response")
 	}
 	var state hub.State
 	if err := json.Unmarshal(f.Result, &state); err != nil {
+		abort()
 		return nil, hub.State{}, fmt.Errorf("handoff: decode state: %w", err)
 	}
 
 	listener, err := adoptSocket(ctx, socket)
 	if err != nil {
-		if opts.AbortFD != nil {
-			opts.AbortFD(info)
-		}
+		abort()
 		return nil, hub.State{}, err
 	}
 	return listener, state, nil

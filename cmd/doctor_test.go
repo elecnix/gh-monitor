@@ -125,3 +125,49 @@ func TestDoctor_ReapReportsAFailedStop(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, out, "no such process")
 }
+
+// TestDoctor_NoWarningWhenTheDaemonSaidNothing is the logic inversion cite
+// found: with no answer, Info is its zero value, so "not supervised" was being
+// read out of silence rather than out of a report.
+func TestDoctor_NoWarningWhenTheDaemonSaidNothing(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{}, errors.New("no daemon answered")
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	scanWatchers = func() ([]watcherProcess, error) { return nil, nil }
+	t.Cleanup(func() { scanWatchers = origScan })
+
+	t.Setenv("NOTIFY_SOCKET", "/run/notify/1")
+	out, _ := runDoctor(t)
+	assert.NotContains(t, out, "reports no service manager",
+		"a daemon that did not answer has reported nothing, least of all its supervision")
+}
+
+// TestDoctor_NeverReapsWithoutTheDaemonsClientList is the other half of the
+// same mistake: an unanswering daemon makes every watcher look unattached, so
+// --reap must refuse rather than stop a healthy fleet.
+func TestDoctor_NeverReapsWithoutTheDaemonsClientList(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{}, errors.New("listening but did not answer")
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	stopped := 0
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 200, Age: time.Hour, Describe: "-R o/r 7",
+			Stop: func() error { stopped++; return nil },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--reap")
+	require.Error(t, err)
+	assert.Zero(t, stopped, "without the daemon's client list, nothing may be stopped")
+	assert.Contains(t, out, "did not report its clients")
+}

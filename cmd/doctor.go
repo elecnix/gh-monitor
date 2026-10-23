@@ -96,8 +96,13 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 					_, _ = fmt.Fprintf(out, "daemon: listening on %s but did not answer (%v)\n", socket, infoErr)
 				}
 			}
-			if sdnotify.Enabled() && !info.Supervised {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: this shell has NOTIFY_SOCKET set but the resident daemon reports no service manager\n")
+			// Only a daemon that answered can be compared: an unanswered
+			// query leaves Info at its zero value, and warning from that would
+			// mean "the daemon said nothing" was read as "the daemon is not
+			// supervised".
+			if infoErr == nil && sdnotify.Enabled() && !info.Supervised {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: this shell has NOTIFY_SOCKET set but the resident daemon reports no service manager\n")
 			}
 
 			procs, scanErr := scanWatchers()
@@ -105,6 +110,11 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				_, _ = fmt.Fprintf(out, "processes: %v\n", scanErr)
 				return nil
 			}
+			// The daemon's client list is the only evidence a watcher is
+			// attached. Without it — no daemon, an old daemon, one that did not
+			// answer — every watcher would look unattached, and --reap would
+			// stop a healthy fleet. So the comparison, and the killing, need
+			// an answer; their absence is reported, never guessed.
 			attached := map[int]bool{}
 			for _, c := range info.Clients {
 				attached[c.PID] = true
@@ -116,6 +126,10 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				state := "attached to the daemon"
 				switch {
 				case attached[p.PID]:
+				case infoErr != nil:
+					// No client list to compare against, so this is unknown,
+					// not unattached — and it is not reaped.
+					state = "attached? the daemon did not report its clients"
 				case p.Age < doctorMinAge:
 					state = "just started (not attached yet)"
 				default:
@@ -126,6 +140,18 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				_, _ = fmt.Fprintf(out, "    %s\n", p.Describe)
 			}
 
+			// Nothing to compare against is not the same as nothing wrong. A
+			// silent daemon leaves every watcher unverified, and saying "ok"
+			// from that would be the reassurance this command exists to
+			// replace.
+			if infoErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"cannot verify which watcher(s) the daemon serves (%v); nothing was stopped\n", infoErr)
+				if len(procs) == 0 {
+					return nil // no watchers to verify either: genuinely nothing to check
+				}
+				return fmt.Errorf("%d watcher(s) could not be verified against the daemon", len(procs))
+			}
 			if len(unlinked) == 0 {
 				_, _ = fmt.Fprintln(out, "ok: every watcher is served by the daemon")
 				return nil

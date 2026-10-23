@@ -18,9 +18,10 @@ Description=gh-monitor daemon socket
 [Socket]
 # Must match the daemon's socket path: $XDG_RUNTIME_DIR/gh-monitor.sock.
 ListenStream=%t/gh-monitor.sock
-# The daemon binds the socket it is given; it must not be unlinked by a
-# predecessor's shutdown, which the daemon knows from having been activated.
-RemoveOnStop=yes
+# No RemoveOnStop: the path belongs to the service manager while this unit is
+# active, and the daemon serves on it. Unlinking it on a stop of this unit
+# alone would leave a running daemon behind a socket nobody can reach. systemd
+# removes a stale socket file itself when it next binds.
 
 [Install]
 WantedBy=sockets.target
