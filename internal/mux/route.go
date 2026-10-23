@@ -51,7 +51,27 @@ type RoutingSource struct {
 	// HubInterval is the hub's polling cadence, quoted in the first-poll
 	// message of a watch the hub serves.
 	HubInterval time.Duration
+	// OnFailover observes every watch that falls back from a sub-daemon to
+	// the hub (issue #122). It is nil when nobody is watching.
+	//
+	// The fallback is not free: a sub-daemon serves a watch through a
+	// webhook at no API cost, and the hub that takes over spends a poll on
+	// it. A log that shows only delivered updates cannot say which watches
+	// gave that saving up, or how often.
+	OnFailover FailoverObserver
 }
+
+// FailoverObserver is notified when a watch moves from a sub-daemon to the
+// hub (issue #122). It reports the watch's target, the sub-daemon that
+// stopped serving it, and why the watch moved.
+//
+// The observer runs on the router's goroutine, so an implementation must not
+// block: the daemon's writes to the event log are a single append under a
+// lock, and a slow disk slows the router down.
+//
+// An observer must be safe for concurrent use: several watches fail over at
+// once.
+type FailoverObserver func(target backend.Target, from, reason string, at time.Time)
 
 // Watch implements backend.Source with the routing described above.
 func (s RoutingSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
@@ -136,6 +156,7 @@ func (s RoutingSource) handOff(ctx context.Context, t backend.Target, opts backe
 
 		ch, err := p.Watch(ctx, t, rest)
 		if err != nil {
+			s.noteFailover(t, p.Name(), fmt.Sprintf("the sub-daemon could not serve the watch: %v", err))
 			fb, err := s.fallback(ctx, t, rest, fmt.Sprintf(
 				"⚠️ sub-daemon %s could not serve %s (%v); polling it through the hub instead", p.Name(), t, err))
 			if err == nil {
@@ -146,7 +167,9 @@ func (s RoutingSource) handOff(ctx context.Context, t backend.Target, opts backe
 		if reported {
 			ch = skipFirstPoll(ctx, ch)
 		}
-		forward(s.failover(ctx, t, rest, p.Name(), ch))
+		// Everything the sub-daemon delivers is marked with its name, so a
+		// log says which serving path produced each update (issue #122).
+		forward(s.failover(ctx, t, rest, p.Name(), stampSource(ctx, ch, p.Name())))
 	}()
 	return out
 }
@@ -232,6 +255,7 @@ func (s RoutingSource) failover(ctx context.Context, t backend.Target, opts back
 		}
 		notice := fmt.Sprintf("⚠️ sub-daemon %s stopped serving %s; polling it through the hub instead", name, t)
 		_, _ = fmt.Fprintf(s.Reg.out, "gh-monitor daemon: %s\n", notice)
+		s.noteFailover(t, name, "the sub-daemon stopped serving the watch before it was done")
 		ch, err := s.Fallback.Watch(ctx, t, opts)
 		if err != nil {
 			notice = fmt.Sprintf("⚠️ sub-daemon %s stopped serving %s, and the hub could not take over (%v)", name, t, err)
@@ -246,6 +270,43 @@ func (s RoutingSource) failover(ctx context.Context, t backend.Target, opts back
 		}
 	}()
 	return out
+}
+
+// stampSource marks every update on the channel with the name of the
+// serving path that produced it (issue #122). The channel closes when the
+// input closes or ctx is cancelled.
+func stampSource(ctx context.Context, in <-chan backend.Update, name string) <-chan backend.Update {
+	out := make(chan backend.Update, 16)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case u, open := <-in:
+				if !open {
+					return
+				}
+				u.Source = name
+				select {
+				case out <- u:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// noteFailover records that a watch moved from a sub-daemon to the hub
+// (issue #122). It is a witness: a failure to observe the fallback must not
+// take the watch down.
+func (s RoutingSource) noteFailover(t backend.Target, from, reason string) {
+	if s.OnFailover == nil {
+		return
+	}
+	s.OnFailover(t, from, reason, time.Now())
 }
 
 // noticeUpdate is a degraded update that carries a routing diagnostic.

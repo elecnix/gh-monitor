@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
@@ -674,9 +675,31 @@ func TestPoller_FetchErrorNamesBlindSharedSurfaces_NonPR(t *testing.T) {
 // issue #98: a shed-tier transition must state that PR status and check
 // outcomes REMAIN watched, because "no longer watching comments" alone
 // invites the reader to wonder whether checks went too.
+//
+// The transition is driven, not raced. A poller broadcasts a tier change to
+// whoever is attached when it happens, and nothing replays that broadcast
+// afterwards, so a transition that happens on the poller's FIRST poll can
+// be lost entirely: the poller starts before Subscribe attaches the
+// consumer, so the notice can reach nobody and the tier is already applied,
+// leaving no transition to announce. A test that waits for that first poll's
+// notice therefore fails intermittently, on a fast machine about one run in a
+// hundred.
+//
+// So the test makes the transition happen on a poll that is guaranteed to
+// come after the subscriber is attached: the budget starts full, the first
+// poll lands, and only then does the budget drop and the poller wake. The
+// notice is then announced on a poll whose broadcast cannot be lost.
 func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
-	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 100, limit: 5000}}
+	now := time.Now()
+	// The guard reads its budget from a store the test controls, so the
+	// reading can change between polls. The service stub stays full: the
+	// store is what the guard consults first.
+	store := ghcli.NewRateLimitStore()
+	store.Observe("github.com", ghcli.GraphQLHeaders(5000, 5000, now.Add(25*time.Minute)), now)
+
+	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 5000, limit: 5000}}
 	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
+	budget.UseObserved(store, "github.com")
 
 	h := New(func(ctx context.Context, _ resolver.Identity, tier monitor.QueryTier) (any, error) {
 		return prFixture(nil), nil
@@ -688,6 +711,24 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
+
+	// Wait for the first poll to land. The subscriber is attached by the
+	// time the first-poll update arrives, so the transition below is
+	// announced to somebody.
+	for {
+		u, ok := <-ch
+		if !ok {
+			t.Fatal("subscription closed")
+		}
+		if u.Event.Type == monitor.EventFirstPoll {
+			break
+		}
+	}
+
+	// Now the budget drops: 2% remaining maps to TierNoReviews, so
+	// annotations, reviews and review threads are shed.
+	store.Observe("github.com", ghcli.GraphQLHeaders(100, 5000, time.Now().Add(25*time.Minute)), time.Now())
+	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 
 	deadline := time.After(asyncDeadline)
 	for {
