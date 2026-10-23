@@ -222,6 +222,7 @@ The `owner/repo#number` shorthand is the same cross-reference form GitHub's own 
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
 - `--until <kind,kind>` - Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
 - `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
+- `--annotation-checks <check,check>` - Check names whose annotations to surface. Default: every check. Case-insensitive, matched on the whole check name. `none` drops all annotation events. The flag overrides the `annotationChecks` preference.
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
 
@@ -253,6 +254,31 @@ gh monitor --run-id 30433642 -R owner/repo --events run-completed
 ```
 
 The recognised event kinds are the notification template keys: `new-unresolved-threads`, `new-general-comments`, `conflict`, `new-failing-checks`, `ci-all-green`, `review-approved`, `review-changes-requested`, `review-dismissed`, `new-commit`, `merged`, `closed`, `first-poll`, `all-clear`, `timeout`, `issue-closed`, `issue-reopened`, `issue-new-comment`, `issue-mention`, `run-queued`, `run-in-progress`, `run-completed`, `repo-new-pr`, `repo-new-issue`, `check-annotations`, `degraded`. Matching is case-insensitive. An empty allowlist suppresses everything; omit the flag to emit everything.
+
+#### Narrowing check-run annotations to the checks you care about
+
+`check-annotations` reports the annotations a pull request's check runs posted. Two filters narrow that set, and they apply together — an annotation survives only when its level **and** its check name pass.
+
+`--annotation-levels` filters by severity: `notice`, `warning`, `failure`, or `none`. It defaults to `warning,failure`.
+
+`--annotation-checks` filters by check name: a comma-separated allowlist, matched case-insensitively on the whole name. Omit it and every check's annotations are reported.
+
+```sh
+# Wake only when the dupdelta check posts a new duplication finding:
+gh monitor -R owner/repo 42 --annotation-checks dupdelta --annotation-levels warning
+```
+
+Without the check-name filter, that watch wakes on every annotation any check posted — and a pull request that runs the same job six times posts the same deprecation warning six times, which buries the one finding the consumer wanted. The check name is already part of the snapshot, so filtering it costs nothing extra to fetch.
+
+The filter can also be set in the preferences file, which is where a standing preference belongs:
+
+```sh
+gh monitor prefs set '{"annotationChecks": ["dupdelta"]}'
+```
+
+`--annotation-checks` overrides the stored value when it is set, the way every other flag in the command does; an empty stored list means "every check". `none` drops all annotations, and `gh monitor prefs set '{"annotationChecks": null}'` clears the stored list.
+
+Both filters are applied when the snapshot is built, not when the event is emitted, so a filtered-out annotation never reaches the diff and never re-fires as "new" on a later poll.
 
 #### Exiting when a condition fires with `--until`
 
@@ -591,7 +617,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "annotationChecks": ["check", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 #### Optional template segments
 

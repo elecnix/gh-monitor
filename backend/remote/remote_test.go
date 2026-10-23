@@ -187,6 +187,36 @@ func TestWatchStreamsUpdatesAcrossTheWire(t *testing.T) {
 	}
 }
 
+// TestWatchCarriesTheAnnotationFiltersAcrossTheWire confirms the annotation
+// filters reach an out-of-process backend intact. A backend that cannot see
+// the operator's filters would report every check's annotations, which is
+// the noise the filters exist to remove (issue #110).
+func TestWatchCarriesTheAnnotationFiltersAcrossTheWire(t *testing.T) {
+	fake := &fakeBackend{seen: make(chan Request, 1)}
+	p, err := Connect(context.Background(), pipeTransport(t, ServerConfig{
+		Name: "relay", Kinds: []backend.Kind{backend.KindPR}, Source: fake,
+	}))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	_, err = p.Watch(context.Background(), prTarget(), backend.WatchOptions{
+		AnnotationLevels: []string{"warning"},
+		AnnotationChecks: []string{"dupdelta"},
+	})
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+
+	req := <-fake.seen
+	if len(req.Options.AnnotationLevels) != 1 || req.Options.AnnotationLevels[0] != "warning" {
+		t.Fatalf("annotation levels did not survive the wire: %+v", req.Options)
+	}
+	if len(req.Options.AnnotationChecks) != 1 || req.Options.AnnotationChecks[0] != "dupdelta" {
+		t.Fatalf("annotation checks did not survive the wire: %+v", req.Options)
+	}
+}
+
 func TestWatchClosesTheChannelWhenTheServerFinishes(t *testing.T) {
 	p, err := Connect(context.Background(), pipeTransport(t, ServerConfig{
 		Name: "relay", Kinds: []backend.Kind{backend.KindPR}, Source: &fakeBackend{},
