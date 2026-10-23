@@ -357,7 +357,8 @@ func TestAdoptRefusedByOldDaemon(t *testing.T) {
 
 	_, _, err := Adopt(ctx, socket, Options{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported op")
+	assert.ErrorIs(t, err, ErrUnsupported,
+		"an old daemon is a fallback, not a fault: the caller must be able to tell them apart")
 }
 
 // TestAdoptAbortsAnnouncementOnAnyLaterFailure pins where the undo belongs.
@@ -443,4 +444,67 @@ func TestAdoptDoesNotAbortWhenBeforeFDRefused(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Zero(t, aborts)
+}
+
+// TestAdoptDoesNotAnnounceForAMissingDaemon pins what a failed Info means.
+// Only "the daemon predates daemon-info" is a reason to carry on undescribed;
+// anything else — no socket, nothing listening, a refused connection — means
+// there is no predecessor to take over from, and announcing one would name a
+// successor for a daemon that does not exist.
+func TestAdoptDoesNotAnnounceForAMissingDaemon(t *testing.T) {
+	socket := shortPath(t, "ghmon-missing-*.d") // never bound
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	announced, aborted := 0, 0
+	_, _, err := Adopt(ctx, socket, Options{
+		BeforeFD: func(DaemonInfo) error { announced++; return nil },
+		AbortFD:  func(DaemonInfo) { aborted++ },
+	})
+	require.Error(t, err, "there is no daemon on that socket to hand off from")
+	assert.Zero(t, announced, "a missing daemon must not be announced at all")
+	assert.Zero(t, aborted, "and nothing was announced, so there is nothing to undo")
+}
+
+// TestAdoptAnnouncesForADaemonThatCannotDescribeItself keeps the other side:
+// an older daemon answers "unsupported op", which is a real predecessor and
+// must not block the takeover.
+func TestAdoptAnnouncesForADaemonThatCannotDescribeItself(t *testing.T) {
+	socket := shortPath(t, "ghmon-old-*.d")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	l, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, aerr := l.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				// A daemon from before OpInfo: it answers nothing it does not
+				// know, and never hands its socket over either.
+				_ = remote.Serve(ctx, c, remote.ServerConfig{
+					Name: "daemon",
+					Source: backend.SourceFunc(func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+						return nil, errors.New("unused")
+					}),
+				})
+			}(conn)
+		}
+	}()
+
+	announced := 0
+	var got DaemonInfo
+	_, _, err = Adopt(ctx, socket, Options{
+		BeforeFD: func(pre DaemonInfo) error { announced++; got = pre; return nil },
+	})
+	assert.Equal(t, 1, announced,
+		"a predecessor too old to describe itself is still a predecessor")
+	assert.Equal(t, socket, got.Socket)
+	assert.Zero(t, got.PID, "and it is described honestly, with no invented pid")
+	assert.Error(t, err, "the state read still fails, so the handoff does not complete")
 }
