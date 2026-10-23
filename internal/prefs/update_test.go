@@ -121,6 +121,20 @@ func TestUpdateFileRejectsTemplatelessValue(t *testing.T) {
 	assert.Contains(t, err.Error(), "no {token}")
 }
 
+func TestUpdateFileAcceptsOptionalSegment(t *testing.T) {
+	base := t.TempDir()
+	eff, err := UpdateFile(base, []byte(`{"templates":{"new-commit":"commit {commitShortOid}[[ by {commitAuthor}]]"}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "commit {commitShortOid}[[ by {commitAuthor}]]", eff.Templates["new-commit"])
+}
+
+func TestUpdateFileRejectsUnclosedSegment(t *testing.T) {
+	base := t.TempDir()
+	_, err := UpdateFile(base, []byte(`{"templates":{"new-commit":"commit {commitShortOid}[[ by {commitAuthor}"}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unclosed [[segment]]")
+}
+
 func TestUpdateFileRejectsUnknownTopLevelKey(t *testing.T) {
 	base := t.TempDir()
 	_, err := UpdateFile(base, []byte(`{"foo":"bar"}`))

@@ -174,3 +174,45 @@ func TestRenderDispatchesOnTargetKind(t *testing.T) {
 		})
 	}
 }
+
+// TestRenderNewCommitNamesCoauthors pins the rendered new-commit message
+// (issue #179): it names the commit's co-authors, and the clause is omitted
+// entirely when the commit carries no Co-authored-by trailer — never rendered
+// as a dangling "co-authored by ."
+func TestRenderNewCommitNamesCoauthors(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	commit := func(coauthors ...string) *backend.CommitSummary {
+		return &backend.CommitSummary{
+			Oid:             "abc1234def5678",
+			ShortOid:        "abc1234",
+			Author:          "alice",
+			Coauthors:       coauthors,
+			MessageHeadline: "feat: x",
+		}
+	}
+	update := func(c *backend.CommitSummary) backend.Update {
+		return backend.Update{
+			Target: backend.Target{Kind: backend.KindPR, Owner: "owner", Repo: "repo", Number: 42},
+			Event:  Event{Type: EventNewCommit, Commit: c},
+			At:     at,
+		}
+	}
+
+	n := Render(update(commit("bob")), prefs.DefaultPreferences(), time.Minute)
+	assert.Equal(t,
+		"📝 New commit abc1234 pushed to owner/repo#42 by alice, co-authored by bob. "+
+			"Review the PR description to ensure it still reflects the latest changes.",
+		n.Message)
+
+	n = Render(update(commit("bob", "carol")), prefs.DefaultPreferences(), time.Minute)
+	assert.Contains(t, n.Message, "co-authored by bob, carol",
+		"every co-author is named, not only the first")
+
+	n = Render(update(commit()), prefs.DefaultPreferences(), time.Minute)
+	assert.Equal(t,
+		"📝 New commit abc1234 pushed to owner/repo#42 by alice. "+
+			"Review the PR description to ensure it still reflects the latest changes.",
+		n.Message)
+	assert.NotContains(t, n.Message, "co-authored",
+		"a commit with no co-authors must not carry an empty clause")
+}
