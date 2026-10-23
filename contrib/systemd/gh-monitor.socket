@@ -1,0 +1,27 @@
+# A socket for the gh-monitor daemon that outlives every daemon that serves it
+# (issue #193).
+#
+# With socket activation the service manager holds the listening socket for the
+# whole session: a restart, an upgrade, or a crash becomes invisible to a
+# client's connect(), and the in-memory handoff between an outgoing daemon and
+# its successor only has to carry watching state, never the socket itself.
+#
+# Install:
+#   install -Dm0644 contrib/systemd/gh-monitor.socket ~/.config/systemd/user/
+#   install -Dm0644 contrib/systemd/gh-monitor-daemon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now gh-monitor.socket
+
+[Unit]
+Description=gh-monitor daemon socket
+
+[Socket]
+# Must match the daemon's socket path: $XDG_RUNTIME_DIR/gh-monitor.sock.
+ListenStream=%t/gh-monitor.sock
+# No RemoveOnStop: the path belongs to the service manager while this unit is
+# active, and the daemon serves on it. Unlinking it on a stop of this unit
+# alone would leave a running daemon behind a socket nobody can reach. systemd
+# removes a stale socket file itself when it next binds.
+
+[Install]
+WantedBy=sockets.target

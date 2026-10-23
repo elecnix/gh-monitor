@@ -25,29 +25,80 @@ func runtimeRoot(t *testing.T) string {
 	return dir
 }
 
-func TestRuntimePathPrefersXDGRuntimeDir(t *testing.T) {
+func TestRuntimeDirPrefersXDGRuntimeDir(t *testing.T) {
 	runtimeRoot(t)
-	got, err := RuntimePath()
+	got, err := RuntimeDir()
 	if err != nil {
-		t.Fatalf("RuntimePath: %v", err)
+		t.Fatalf("RuntimeDir: %v", err)
 	}
-	want := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "gh-monitor", "gh-monitor")
+	want := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "gh-monitor")
 	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+		t.Fatalf("RuntimeDir() = %q, want %q", got, want)
 	}
 }
 
-func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
+func TestRuntimeDirFallsBackToCacheDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("XDG_CACHE_HOME", dir)
-	got, err := RuntimePath()
+	got, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	want := filepath.Join(dir, "gh-monitor")
+	if got != want {
+		t.Fatalf("RuntimeDir() = %q, want %q", got, want)
+	}
+}
+
+// TestRuntimePathIsContentAddressed pins what makes concurrent launches of
+// different builds safe: the copy path is a function of the binary's
+// identity, so it is stable for one build and different for another. A shared
+// "current copy" name let one launch rewrite the file another was about to
+// exec.
+func TestRuntimePathIsContentAddressed(t *testing.T) {
+	runtimeRoot(t)
+	first, err := RuntimePath()
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
 	}
-	want := filepath.Join(dir, "gh-monitor", "gh-monitor")
-	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+	dir, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if filepath.Dir(first) != dir {
+		t.Fatalf("runtime copy %q is not in %q", first, dir)
+	}
+	if base := filepath.Base(first); !strings.HasPrefix(base, "gh-monitor-") || len(base) <= len("gh-monitor-") {
+		t.Fatalf("runtime copy %q is not content-addressed", base)
+	}
+	// Stable for the same binary.
+	again, err := RuntimePath()
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
+	if again != first {
+		t.Fatalf("RuntimePath() changed for an unchanged binary: %q then %q", first, again)
+	}
+	// Different for a different binary, even at the same path.
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	other := filepath.Join(t.TempDir(), "gh-monitor")
+	src, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("read test binary: %v", err)
+	}
+	if err := os.WriteFile(other, src[:len(src)-1], 0o755); err != nil {
+		t.Fatalf("write other binary: %v", err)
+	}
+	otherPath, err := CopyPathFor(other)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
+	if otherPath == first {
+		t.Fatalf("two different binaries share one runtime copy path: %q", first)
 	}
 }
 
@@ -58,22 +109,29 @@ func TestMaybeReexecOptOutEnv(t *testing.T) {
 		t.Fatalf("MaybeReexec with opt-out: %v", err)
 	}
 	// Nothing may have been copied.
-	if _, err := os.Stat(filepath.Join(dir, "gh-monitor", "gh-monitor")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("opt-out run must not create the runtime copy; stat err = %v", err)
+	entries, err := os.ReadDir(filepath.Join(dir, "gh-monitor"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("opt-out run must not create the runtime copy, found %d entries", len(entries))
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read runtime dir: %v", err)
 	}
 }
 
 func TestMaybeReexecSkipsWhenAlreadyRuntimeCopy(t *testing.T) {
-	dir := runtimeRoot(t)
+	runtimeRoot(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
+	rt, err := CopyPathFor(exe)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(rt), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Hard-link the test binary at the runtime path: same inode, so SameFile
+	// Hard-link the test binary at its runtime path: same inode, so SameFile
 	// must short-circuit the copy+exec even without any marker env var.
 	if err := os.Link(exe, rt); err != nil {
 		t.Fatalf("link: %v", err)
@@ -86,7 +144,10 @@ func TestMaybeReexecSkipsWhenAlreadyRuntimeCopy(t *testing.T) {
 
 func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	dir := runtimeRoot(t)
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
+	rt, err := RuntimePath()
+	if err != nil {
+		t.Fatalf("RuntimePath: %v", err)
+	}
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(),
@@ -178,9 +239,9 @@ func TestReexecHelperProcess(t *testing.T) {
 	if os.Getenv(helperEnv) == "" {
 		t.Skip("helper process for TestMaybeReexecCopiesAndExecs")
 	}
-	rt, err := RuntimePath()
+	dir, err := RuntimeDir()
 	if err != nil {
-		t.Fatalf("RuntimePath: %v", err)
+		t.Fatalf("RuntimeDir: %v", err)
 	}
 	if err := MaybeReexec(); err != nil {
 		t.Fatalf("MaybeReexec: %v", err)
@@ -189,12 +250,14 @@ func TestReexecHelperProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	if after != rt {
-		t.Errorf("running from %q, want the runtime copy %q", after, rt)
+	// The copy's own path is keyed by the copy's identity, which is not the
+	// path it was written to, so the assertion is about where it lives.
+	if filepath.Dir(after) != dir || !strings.HasPrefix(filepath.Base(after), "gh-monitor-") {
+		t.Errorf("running from %q, want a runtime copy in %q", after, dir)
 	}
 	procExe, err := os.Readlink("/proc/self/exe")
-	if err == nil && procExe != rt {
-		t.Errorf("/proc/self/exe = %q, want %q", procExe, rt)
+	if err == nil && procExe != after {
+		t.Errorf("/proc/self/exe = %q, want %q", procExe, after)
 	}
 	fmt.Println("REEXEC-OK")
 }

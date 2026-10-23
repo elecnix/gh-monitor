@@ -164,3 +164,68 @@ func TestWatchEndsWhenBackendIsNotResumable(t *testing.T) {
 		"degraded:daemon: stream ended without an end-of-stream frame",
 	}, got, "a non-resumable backend's broken stream ends the watch after degrading")
 }
+
+// TestWatch_RevivesAServerThatIsNotComingBack is the client half of "a watcher
+// never polls on its own and never sits silent": when reconnecting stops
+// making progress, the watch asks for the server to be restarted, and says so.
+// A watcher that only retried would be indistinguishable from a quiet target
+// (issue #193).
+func TestWatch_RevivesAServerThatIsNotComingBack(t *testing.T) {
+	srv := startRawWatchServer(t, true)
+	tr, err := ParseEndpoint("unix:" + srv.ln.Addr().String())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	p, err := Connect(ctx, tr)
+	require.NoError(t, err)
+
+	revived := make(chan struct{}, 4)
+	p.SetRevive(func(context.Context) error {
+		select {
+		case revived <- struct{}{}:
+		default:
+		}
+		return nil
+	})
+
+	// The server accepts one connection, streams, then drops it. Every later
+	// attempt is refused by closing the listener, so reconnecting cannot make
+	// progress.
+	ch, err := p.Watch(ctx, backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7, Host: "github.com"},
+		backend.WatchOptions{Interval: time.Hour, ResumeID: "r1"})
+	require.NoError(t, err)
+	_ = srv.ln.Close()
+
+	select {
+	case <-revived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a watch that cannot reconnect must ask for the server to be restarted")
+	}
+	// Drain so the goroutine is not left blocked on the channel.
+	cancel()
+	for range ch { //nolint:revive // drain until closed
+	}
+}
+
+// TestShouldRevive covers the restart cadence: the first attempt comes after
+// reviveAfterAttempts failed reconnects, and it repeats, because a restart
+// that succeeds is not proof the server stayed up. Firing once per streak left
+// a watcher reconnecting to a socket nobody held for the rest of the watch —
+// the outcome revive exists to prevent.
+func TestShouldRevive(t *testing.T) {
+	for _, tc := range []struct {
+		attempts int
+		want     bool
+	}{
+		{1, false}, {4, false},
+		{5, true}, // first attempt of a streak
+		{6, false}, {14, false},
+		{15, true}, // a second attempt, ten failures later
+		{25, true},
+		{26, false},
+	} {
+		assert.Equal(t, tc.want, shouldRevive(tc.attempts), "attempt %d", tc.attempts)
+	}
+}

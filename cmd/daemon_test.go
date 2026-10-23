@@ -16,6 +16,7 @@ import (
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
+	"github.com/elecnix/gh-monitor/internal/activation"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -116,6 +117,15 @@ func startFakeSubdaemon(t *testing.T, ctx context.Context, sockPath string, kind
 // kinds to discovered sub-daemons (issue #88).
 func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry) *daemonServer {
 	t.Helper()
+	return bindTestServerConfigured(t, ctx, h, l, routes, nil)
+}
+
+// bindTestServerConfigured is bindTestServerOnWithRoutes with a hook that runs
+// before the server starts accepting, so a test can shape what the daemon
+// reports (socket activation, supervision) without racing a client that is
+// already talking to it.
+func bindTestServerConfigured(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry, configure func(*daemonServer)) *daemonServer {
+	t.Helper()
 	// A derived context is what makes a handoff complete: the successor's fd
 	// pass triggers shutdown, which must close every client connection — the
 	// signal watchers use to reconnect to the successor.
@@ -127,6 +137,15 @@ func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l
 		routes:    routes,
 		handedOff: &handedOff,
 		shutdown:  func() { cancel(); _ = l.Close() },
+		// The real daemon fills these in; the in-process test server does too,
+		// so OpInfo and the client registry are exercised rather than stubbed.
+		socket:  listenerPath(l),
+		clients: newClientRegistry(),
+		started: time.Now(),
+		info:    daemonInfo{version: runningVersion()},
+	}
+	if configure != nil {
+		configure(srv)
 	}
 	var wg sync.WaitGroup
 	t.Cleanup(func() {
@@ -149,6 +168,15 @@ func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l
 		}
 	}()
 	return srv
+}
+
+// listenerPath is the path a Unix listener is bound to, for tests that build a
+// daemonServer by hand.
+func listenerPath(l net.Listener) string {
+	if ul, ok := l.(*net.UnixListener); ok {
+		return ul.Addr().String()
+	}
+	return ""
 }
 
 // startTestDaemon wires a hub with a counting fake fetcher to a real Unix
@@ -772,4 +800,61 @@ func TestDaemon_NeverShutsDownOnIdle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, collectUntil(t, ch, backend.EventFirstPoll), "first-poll",
 		"a client attaching after an idle window must be served immediately")
+}
+
+// TestDaemon_ActivatedSocketIsUsedAndKept is the socket-activation contract:
+// the daemon serves the descriptor the service manager passed, at the path the
+// service manager chose, and never unlinks that path — the unit is still
+// listening on it.
+func TestDaemon_ActivatedSocketIsUsedAndKept(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "activated.sock")
+	l, err := net.Listen("unix", path)
+	require.NoError(t, err)
+	ul, ok := l.(*net.UnixListener)
+	require.True(t, ok)
+	ul.SetUnlinkOnClose(false)
+
+	f, err := ul.File() // what systemd passes: an inherited descriptor
+	require.NoError(t, err)
+	require.NoError(t, l.Close())
+
+	before := os.Getenv(activation.FDsEnv)
+	t.Cleanup(func() { _ = os.Setenv(activation.FDsEnv, before) })
+
+	d := &daemonRuntime{socket: filepath.Join(dir, "default.sock")}
+	// The test cannot claim fd 3 in a running test binary, so the descriptor
+	// is injected and the environment only has to make Listeners run.
+	origFile := activationProcessFile
+	activationProcessFile = func(uintptr, string) *os.File { return f }
+	t.Cleanup(func() { activationProcessFile = origFile })
+	t.Setenv(activation.FDsEnv, "1")
+	t.Setenv(activation.PIDEnv, "")
+
+	root := newRootCommand()
+	require.NoError(t, d.adoptActivated(ctx, root))
+	require.NotNil(t, d.activated, "an activated listener must be adopted")
+	assert.True(t, d.socketActivated)
+	assert.Equal(t, path, d.socket, "the path must come from the listener, not the flag")
+}
+
+// TestAutostart_RespectsOptOut is the policy a review found could be bypassed:
+// the client's revive hook called autostartDaemon directly, so a crash of the
+// daemon let a client spawn a replacement even with auto-start forbidden. The
+// check lives in autostartDaemon now, so every caller inherits it.
+func TestAutostart_RespectsOptOut(t *testing.T) {
+	t.Setenv("GH_MONITOR_AUTOSTART", "0")
+
+	origSpawn := spawnDaemonFn
+	t.Cleanup(func() { spawnDaemonFn = origSpawn })
+	spawned := 0
+	spawnDaemonFn = func(string, time.Duration) error { spawned++; return nil }
+
+	err := autostartDaemon(context.Background(), shortSocket(t, "ghmon-noauto-*.d"), time.Minute)
+	require.Error(t, err, "auto-start is forbidden by the environment")
+	assert.Contains(t, err.Error(), "GH_MONITOR_AUTOSTART")
+	assert.Zero(t, spawned, "nothing may be spawned when auto-start is off")
 }

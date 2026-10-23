@@ -23,6 +23,7 @@ package handoff
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 
@@ -64,9 +65,32 @@ func request(ctx context.Context, socket, op string) (remote.Frame, error) {
 
 	frame, err := c.Call(ctx, remote.Request{Op: op})
 	if err != nil {
+		// A daemon that predates the op answers with an error frame, which the
+		// protocol surfaces as a plain error. Translate it here so callers can
+		// tell "too old for this" from "failed to do it" — the first is a
+		// fallback, the second is a fault.
+		if isUnsupported(err.Error()) {
+			return remote.Frame{}, fmt.Errorf("%w: %s", ErrUnsupported, op)
+		}
 		return remote.Frame{}, fmt.Errorf("handoff: %s: %w", op, err)
 	}
 	return frame, nil
+}
+
+// Options tune the successor side of the handoff. Both hooks are optional.
+type Options struct {
+	// BeforeFD receives the predecessor's Info once its state has been read
+	// and before the listening socket is asked for. Returning an error
+	// abandons the handoff while the predecessor is still serving — which is
+	// what makes a supervised takeover safe: the successor announces itself
+	// as the service's main process here, and a refusal costs nothing.
+	BeforeFD func(DaemonInfo) error
+	// AbortFD runs when the socket could not be adopted after BeforeFD
+	// succeeded. The predecessor is still serving (its fd pass never
+	// completed), so whatever BeforeFD announced must be undone: it is the
+	// only chance to leave the service pointing at the process that is
+	// actually answering.
+	AbortFD func(DaemonInfo)
 }
 
 // Adopt performs the successor side of the handoff against the daemon
@@ -74,21 +98,61 @@ func request(ctx context.Context, socket, op string) (remote.Frame, error) {
 // very socket the predecessor served on — and the predecessor's watching
 // state for hub.RestoreState. Any error means the handoff did not happen;
 // the caller falls back to its ordinary behaviour.
-func Adopt(ctx context.Context, socket string) (net.Listener, hub.State, error) {
+//
+// The conversation is deliberately ordered: info, then state, then the
+// listening socket. Each step leaves the predecessor serving, so a successor
+// that changes its mind — or is refused — leaves one daemon on the socket
+// rather than two or none.
+func Adopt(ctx context.Context, socket string, opts Options) (net.Listener, hub.State, error) {
+	info, ierr := Info(ctx, socket)
+	// A daemon that predates OpInfo cannot be described, but it can still be
+	// handed off from: announce with an empty Info rather than losing the
+	// takeover to a missing diagnostic op. Any other failure means there is
+	// nothing to hand off from, and announcing for it would name a successor
+	// for a daemon that does not exist.
+	if ierr != nil && !errors.Is(ierr, ErrUnsupported) {
+		return nil, hub.State{}, ierr
+	}
+	announced := false
+	if opts.BeforeFD != nil {
+		if ierr != nil {
+			info = DaemonInfo{Socket: socket}
+		}
+		if err := opts.BeforeFD(info); err != nil {
+			return nil, hub.State{}, err
+		}
+		announced = true
+	}
+
+	// abort undoes an announcement. Every failure after this point leaves the
+	// predecessor serving, so the service must be pointed back at it — a
+	// MAINPID naming a successor that never took over is how a healthy daemon
+	// gets killed on the next restart. Wiring it to the fd pass alone was not
+	// enough: the state read can fail too.
+	abort := func() {
+		if announced && opts.AbortFD != nil {
+			opts.AbortFD(info)
+		}
+	}
+
 	f, err := request(ctx, socket, OpHandoff)
 	if err != nil {
+		abort()
 		return nil, hub.State{}, err
 	}
 	if len(f.Result) == 0 {
+		abort()
 		return nil, hub.State{}, fmt.Errorf("handoff: empty state response")
 	}
 	var state hub.State
 	if err := json.Unmarshal(f.Result, &state); err != nil {
+		abort()
 		return nil, hub.State{}, fmt.Errorf("handoff: decode state: %w", err)
 	}
 
 	listener, err := adoptSocket(ctx, socket)
 	if err != nil {
+		abort()
 		return nil, hub.State{}, err
 	}
 	return listener, state, nil

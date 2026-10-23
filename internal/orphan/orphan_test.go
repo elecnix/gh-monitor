@@ -148,3 +148,62 @@ func TestNilPPIDFnDisablesTheGuard(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestResolveLauncherWalksPastGh is the shape that leaked pollers: the watch's
+// parent is `gh`, which forks the extension and waits, so `gh` is what gets
+// reparented when the session exits — and watching the watch's own parent
+// reported "launcher alive" forever.
+func TestResolveLauncherWalksPastGh(t *testing.T) {
+	// 100 = watch, 200 = gh (wrapper), 300 = the session that asked for it.
+	tree := map[int]struct {
+		ppid int
+		comm string
+	}{
+		100: {200, "gh-monitor"},
+		200: {300, "gh"},
+		300: {1, "pi"},
+	}
+	parentOf := func(pid int) (int, string, bool) {
+		e, ok := tree[pid]
+		return e.ppid, e.comm, ok
+	}
+	if got := ResolveLauncher(100, parentOf); got != 300 {
+		t.Fatalf("ResolveLauncher = %d, want the session 300 (not the wrapper)", got)
+	}
+}
+
+// TestResolveLauncherDirectParent covers a direct invocation: the shell that
+// started the watch is its launcher, resolved on the first hop — the guard's
+// behaviour before wrappers were considered.
+func TestResolveLauncherDirectParent(t *testing.T) {
+	parentOf := func(pid int) (int, string, bool) {
+		switch pid {
+		case 100:
+			return 50, "gh-monitor", true
+		case 50:
+			return 1, "bash", true
+		}
+		return 0, "", false
+	}
+	if got := ResolveLauncher(100, parentOf); got != 50 {
+		t.Fatalf("ResolveLauncher = %d, want 50", got)
+	}
+}
+
+func TestResolveLauncherUnknownIsZero(t *testing.T) {
+	parentOf := func(int) (int, string, bool) { return 0, "", false }
+	if got := ResolveLauncher(100, parentOf); got != 0 {
+		t.Fatalf("ResolveLauncher = %d, want 0 when the tree is unreadable", got)
+	}
+	if got := ResolveLauncher(100, nil); got != 0 {
+		t.Fatalf("ResolveLauncher with no reader = %d, want 0", got)
+	}
+}
+
+// TestLauncherPIDIsReadable pins the fallback on this platform: the guard must
+// always have a usable baseline pid, even when the walk finds nothing.
+func TestLauncherPIDIsReadable(t *testing.T) {
+	if got := LauncherPID(); got <= 0 {
+		t.Fatalf("LauncherPID = %d, want a positive pid", got)
+	}
+}
