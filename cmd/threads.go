@@ -69,7 +69,7 @@ func newThreadsListCommand(bo *backendOptions) *cobra.Command {
 	opts := &threadsListOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "list [<number> | <url>]",
+		Use:   "list [<number> | <url> | <owner/repo#number>]",
 		Short: "List review threads for a pull request",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -133,7 +133,7 @@ func newThreadsMutationCommand(bo *backendOptions, resolve bool) *cobra.Command 
 	}
 
 	cmd := &cobra.Command{
-		Use:   use + " [<number> | <url>]",
+		Use:   use + " [<number> | <url> | <owner/repo#number>]",
 		Short: short,
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

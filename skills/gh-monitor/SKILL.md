@@ -21,6 +21,8 @@ gh extension install elecnix/gh-monitor
 
 All commands accept `-R owner/repo`. IDs use GraphQL format (`PRR_*`, `PRRT_*`, `PRRC_*`). Use `--body-file -` for stdin input.
 
+**Pull request selector.** Any command that takes a pull request accepts `owner/repo#number` (`gh monitor owner/repo#42`), a number with `-R owner/repo` (`gh monitor -R owner/repo 42`), or a pull request URL. The shorthand names its own repository, so it needs no `-R`; it carries no host, so it uses `GH_HOST` (`github.com` by default), while a URL carries its own host.
+
 ### View Reviews & Threads
 
 ```sh
