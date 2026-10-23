@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -238,7 +239,15 @@ func (d *daemonRuntime) spawnSuccessor() (int, error) {
 	}
 	defer func() { _ = devnull.Close() }()
 
-	c := exec.Command(bin, "daemon", "--socket", d.socket, "--interval", fmt.Sprint(int(d.interval.Seconds())))
+	// The interval flag is passed only when a real cadence was resolved. Its
+	// own default is the built-in cadence, and announcing "--interval 0" for a
+	// runtime built without one would read as "never poll" to anyone looking
+	// at the process table.
+	args := []string{"daemon", "--socket", d.socket}
+	if d.interval >= 10*time.Second {
+		args = append(args, "--interval", strconv.Itoa(int(d.interval.Seconds())))
+	}
+	c := exec.Command(bin, args...)
 	c.Stdin = devnull
 	c.Stdout = devnull
 	c.Stderr = devnull
