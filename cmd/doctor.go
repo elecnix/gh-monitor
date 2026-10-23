@@ -162,24 +162,35 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 					len(unlinked), minAge)
 				return fmt.Errorf("%d watcher(s) are polling outside the daemon", len(unlinked))
 			}
-			reaped := 0
+			reaped, failed, tooYoung := 0, 0, 0
 			for _, p := range unlinked {
 				if p.Age < minAge {
+					tooYoung++
 					continue
 				}
 				if err := p.Stop(); err != nil {
+					// A stop that fails is not a stop that came too early: the
+					// age gate above already let this one through. Counting it
+					// as "younger than --min-age" would send the operator back
+					// to wait, when waiting is exactly what cannot help.
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pid %d: %v\n", p.PID, err)
+					failed++
 					continue
 				}
 				_, _ = fmt.Fprintf(out, "stopped pid %d\n", p.PID)
 				reaped++
 			}
 			_, _ = fmt.Fprintf(out, "reaped %d of %d unattached watcher(s)\n", reaped, len(unlinked))
-			if reaped < len(unlinked) {
+			if failed > 0 {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-					"%d watcher(s) are still attached to nothing; they are younger than %s, so re-run --reap once they are older\n",
-					len(unlinked)-reaped, minAge)
-				return fmt.Errorf("%d watcher(s) are still polling outside the daemon", len(unlinked)-reaped)
+					"%d watcher(s) could not be stopped (see the errors above); they are still polling outside the daemon\n", failed)
+			}
+			if tooYoung > 0 {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"%d watcher(s) are younger than %s, so re-run --reap once they are older\n", tooYoung, minAge)
+			}
+			if failed+tooYoung > 0 {
+				return fmt.Errorf("%d watcher(s) are still polling outside the daemon", failed+tooYoung)
 			}
 			return nil
 		},
