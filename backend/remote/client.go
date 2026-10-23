@@ -37,7 +37,22 @@ func (p *Provider) SetRevive(f ReviveFunc) { p.revive = f }
 // server is not coming back on its own. The first failures cover a handoff
 // (the successor is already serving); this many cover a daemon that was
 // stopped or crashed.
-const reviveAfterAttempts = 5
+//
+// A restart that succeeds is not proof the server stayed up, so the attempt
+// repeats every reviveEvery failures afterwards: a daemon that dies again
+// right after being restarted would otherwise leave the watcher reconnecting
+// to a socket nobody holds for the rest of the watch.
+const (
+	reviveAfterAttempts = 5
+	reviveEvery         = 10
+)
+
+// shouldRevive reports whether the nth consecutive failed reconnect warrants
+// another restart attempt: the first at reviveAfterAttempts, then every
+// reviveEvery.
+func shouldRevive(attempts int) bool {
+	return attempts >= reviveAfterAttempts && (attempts-reviveAfterAttempts)%reviveEvery == 0
+}
 
 // Connect opens a probe connection, reads the server's hello, and returns a
 // Provider describing what that server covers. The probe is closed
@@ -208,12 +223,15 @@ func (p *Provider) pumpWatch(ctx context.Context, t backend.Target, opts backend
 			reconn, rbr, oerr := p.openWatch(ctx, t, opts)
 			if oerr != nil {
 				attempts++
-				if p.revive != nil && attempts == reviveAfterAttempts {
-					// Loud, and only once per streak: a watcher must never
-					// look quiet while it is failing to reach anybody.
+				if p.revive != nil && shouldRevive(attempts) {
+					// Loud on the first attempt of a streak, and loud again
+					// whenever an attempt fails: a watcher must never look
+					// quiet while it is failing to reach anybody. A repeat
+					// attempt that merely succeeds is not news.
+					firstAttempt := attempts == reviveAfterAttempts
 					if rerr := p.revive(ctx); rerr != nil {
 						degrade(fmt.Errorf("could not restart %s (%v); still retrying", p.hello.Name, rerr))
-					} else {
+					} else if firstAttempt {
 						degrade(fmt.Errorf("%s was not running; restarting it", p.hello.Name))
 					}
 				}

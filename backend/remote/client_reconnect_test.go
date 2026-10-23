@@ -208,3 +208,24 @@ func TestWatch_RevivesAServerThatIsNotComingBack(t *testing.T) {
 	for range ch { //nolint:revive // drain until closed
 	}
 }
+
+// TestShouldRevive covers the restart cadence: the first attempt comes after
+// reviveAfterAttempts failed reconnects, and it repeats, because a restart
+// that succeeds is not proof the server stayed up. Firing once per streak left
+// a watcher reconnecting to a socket nobody held for the rest of the watch —
+// the outcome revive exists to prevent.
+func TestShouldRevive(t *testing.T) {
+	for _, tc := range []struct {
+		attempts int
+		want     bool
+	}{
+		{1, false}, {4, false},
+		{5, true}, // first attempt of a streak
+		{6, false}, {14, false},
+		{15, true}, // a second attempt, ten failures later
+		{25, true},
+		{26, false},
+	} {
+		assert.Equal(t, tc.want, shouldRevive(tc.attempts), "attempt %d", tc.attempts)
+	}
+}
