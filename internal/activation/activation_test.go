@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -117,4 +118,55 @@ func TestListeners_NonListenerDescriptorIsAnError(t *testing.T) {
 		func(uintptr, string) *os.File { return r }, nil))
 	require.Error(t, err, "a passed descriptor that is not a listener must not be silently skipped")
 	assert.Nil(t, ls)
+}
+
+// TestListeners_ClosesTheInheritedDescriptor pins the thing a review called a
+// leak: net.FileListener dups the descriptor, and the inherited one must be
+// closed or every activated socket costs two. The check is EBADF on the
+// descriptor afterwards, which is the only evidence that nothing holds it.
+func TestListeners_ClosesTheInheritedDescriptor(t *testing.T) {
+	path, f := boundListener(t)
+	t.Cleanup(func() { _ = f.Close() })
+	// A dup of the bound socket, standing in for the descriptor systemd
+	// passes; the test's own handle stays valid so it can be compared against.
+	inherited, err := syscall.Dup(int(f.Fd()))
+	require.NoError(t, err)
+	passed := os.NewFile(uintptr(inherited), "passed")
+
+	ls, err := Listeners(testEnv("1", "", "", os.Getpid(),
+		func(uintptr, string) *os.File { return passed }, nil))
+	require.NoError(t, err)
+	require.Len(t, ls, 1)
+	t.Cleanup(func() { _ = ls[0].Close() })
+
+	// The inherited descriptor is gone...
+	assert.ErrorIs(t, syscall.Fstat(inherited, &syscall.Stat_t{}), syscall.EBADF,
+		"the inherited descriptor must be closed, not merely marked close-on-exec")
+	// ...while the adopted listener still serves the same path.
+	c, err := net.Dial("unix", path)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	accepted, err := ls[0].Accept()
+	require.NoError(t, err)
+	_ = accepted.Close()
+}
+
+// TestListeners_ClosesTheDescriptorWhenAdoptionFails is the same guarantee on
+// the error path: a descriptor that cannot be adopted is still consumed, and
+// leaking it would make a misconfigured unit leak one per restart.
+func TestListeners_ClosesTheDescriptorWhenAdoptionFails(t *testing.T) {
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	t.Cleanup(func() { _ = w.Close() })
+
+	inherited, err := syscall.Dup(int(r.Fd()))
+	require.NoError(t, err)
+	passed := os.NewFile(uintptr(inherited), "passed")
+
+	_, err = Listeners(testEnv("1", "", "", os.Getpid(),
+		func(uintptr, string) *os.File { return passed }, nil))
+	require.Error(t, err, "a pipe is not a listener")
+	assert.ErrorIs(t, syscall.Fstat(inherited, &syscall.Stat_t{}), syscall.EBADF,
+		"an adopted-but-rejected descriptor must not be leaked either")
 }

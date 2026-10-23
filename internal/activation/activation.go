@@ -23,7 +23,6 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // firstFD is where the protocol puts the first passed descriptor: right after
@@ -60,10 +59,13 @@ func Listeners(env Env) ([]net.Listener, error) {
 		if f == nil {
 			return nil, fmt.Errorf("activation: no descriptor %d", fd)
 		}
-		// syscall.CloseOnExec, not f.Close: net.FileListener dups the
-		// descriptor, so the inherited one must be closed without touching
-		// the copy the listener now owns.
-		syscall.CloseOnExec(int(fd))
+		// net.FileListener dups the descriptor; f.Close then closes the
+		// inherited one, so the process does not keep two per activated
+		// socket. It runs before the error check because the descriptor is
+		// consumed either way — an adoption that fails must not leak it.
+		// (No syscall.CloseOnExec here: it would mark a descriptor that is
+		// about to be closed, and it names the number rather than the file,
+		// so it would be wrong for any injected File that is a dup.)
 		l, err := net.FileListener(f)
 		closeErr := f.Close()
 		if err != nil {
