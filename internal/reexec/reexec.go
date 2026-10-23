@@ -103,7 +103,11 @@ func identityKey(path string) (string, error) {
 	}
 	inode, device := identityFields(fi)
 	h := sha256.New()
-	fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device)
+	// A hash write cannot fail, but the check is what tells every linter —
+	// and the next reader — that nothing is being ignored here.
+	if _, err := fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device); err != nil {
+		return "", fmt.Errorf("fingerprint %s: %w", path, err)
+	}
 	return hex.EncodeToString(h.Sum(nil))[:16], nil
 }
 
