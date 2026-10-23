@@ -331,7 +331,11 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	// predecessor's daemon held for it, so it resumes diffing where it left
 	// off instead of replaying what it already reported (issue #73).
 	if opts.ResumeID != "" {
-		if raw, ok := h.takeResume(opts.ResumeID); ok && len(raw) > 0 {
+		// takeResume locks h.mu itself: several watchers reconnecting at once
+		// after a handoff is the normal case, and an unsynchronised delete is a
+		// fatal map race that takes the whole daemon down.
+		raw, claimed := h.takeResume(opts.ResumeID)
+		if claimed && len(raw) > 0 {
 			st := newStatusForKind(key.kind)
 			if err := json.Unmarshal(raw, st); err == nil {
 				sub.handle.restore(st)

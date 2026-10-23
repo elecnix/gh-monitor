@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -225,4 +227,111 @@ func TestRestoreRoundTripsRunLatestAsAStatus(t *testing.T) {
 	require.NotNil(t, restored, "the successor must adopt the carried observation")
 	assert.Equal(t, fetched, restored,
 		"restored as the status the run fetch produced, byte-for-byte")
+}
+
+// TestSubscribe_TakeResumeIsSerialised is the crash the fleet exposed, end to
+// end: several watchers reconnecting at the same instant after one handoff,
+// each claiming the baseline held for it. Subscribe dropped h.mu before
+// calling takeResume, the deletes raced, and a Go map written by two
+// goroutines is a fatal error rather than a lost update — the daemon dies with
+// every other watcher on it.
+//
+// It is a scenario test, not a guard: Go throws only when two claims overlap
+// inside the map operation, which measured at one crash in fifty plain
+// `go test` runs (a `-race` run catches it immediately, and CI does not run
+// -race). TestTakeResumeTakesItsOwnLock is the deterministic guard.
+func TestSubscribe_TakeResumeIsSerialised(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h1.Stop)
+
+	// One state carrying many watcher baselines, as a busy daemon's handoff
+	// export does.
+	const watchers = 8
+	opts := testHubOpts()
+	opts.ResumeID = "seed"
+	ch, cancelSeed := h1.SubscribePR(ctx, testHubTarget(), opts)
+	t.Cleanup(cancelSeed)
+	collect(ch, 100*time.Millisecond)
+	state := h1.ExportState()
+	require.Len(t, state.Resumes, 1)
+
+	state.Resumes = state.Resumes[:0]
+	for i := 0; i < watchers; i++ {
+		seed := h1.ExportState().Resumes[0]
+		seed.ResumeID = fmt.Sprintf("watcher-%d", i)
+		state.Resumes = append(state.Resumes, seed)
+	}
+
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h2.Stop)
+	require.NoError(t, h2.RestoreState(state))
+
+	// Reconnect every watcher at once, which is what a handoff causes.
+	var wg sync.WaitGroup
+	for i := 0; i < watchers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			o := testHubOpts()
+			o.ResumeID = fmt.Sprintf("watcher-%d", i)
+			c, cancelSub := h2.SubscribePR(ctx, testHubTarget(), o)
+			defer cancelSub()
+			collect(c, 50*time.Millisecond)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// TestTakeResumeTakesItsOwnLock is the deterministic guard for the resume
+// table's invariant: h.resumes is guarded by h.mu, and takeResume is the one
+// function that mutates it, so takeResume must take that lock itself.
+//
+// It asserts the invariant instead of waiting for a race: with h.mu held, a
+// call from another goroutine must block. A fix that leaves the locking at the
+// call site fails here in one run out of one, because takeResume would return
+// while the lock is still held. (The scenario test above cannot be the guard:
+// measured at one crash in fifty plain `go test` runs, since Go throws only
+// when two claims overlap inside the map operation.)
+func TestTakeResumeTakesItsOwnLock(t *testing.T) {
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return nil, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	// Seed one baseline directly, then hold the lock the table is guarded by.
+	h.mu.Lock()
+	h.resumes["w1"] = resumeEntry{
+		state:   ResumeState{ResumeID: "w1", Baseline: json.RawMessage(`{"state":"OPEN"}`)},
+		expires: time.Now().Add(time.Minute),
+	}
+	h.mu.Unlock()
+
+	h.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		_, _ = h.takeResume("w1")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		h.mu.Unlock()
+		t.Fatal("takeResume returned while h.mu was held: it does not take the lock itself, " +
+			"so any caller that forgets is a fatal map race")
+	case <-time.After(100 * time.Millisecond):
+	}
+	h.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("takeResume never returned after h.mu was released")
+	}
 }
