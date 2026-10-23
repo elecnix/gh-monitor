@@ -175,9 +175,22 @@ func (h *Hub) RestoreState(s State) error {
 	return nil
 }
 
-// takeResume consumes the baseline held for resumeID, if one is live. Called
-// with h.mu held.
+// takeResume consumes the baseline held for resumeID, if one is live.
+//
+// It takes h.mu itself, because h.resumes is guarded by h.mu and this is the
+// one function that reads and deletes from it. The previous contract —
+// "called with h.mu held" — was a comment, and the single caller had stopped
+// honouring it: two watchers reconnecting after a handoff deleted from the map
+// concurrently, and Go answers that with a fatal error rather than a lost
+// update, taking the daemon down with every other watcher on it.
+//
+// It must therefore not be called with h.mu held: Go mutexes are not
+// reentrant, and a second lock is a deadlock rather than a subtle race — loud
+// and immediate, which is the direction to fail in.
 func (h *Hub) takeResume(resumeID string) (json.RawMessage, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
 	entry, ok := h.resumes[resumeID]
 	if !ok {
 		return nil, false
