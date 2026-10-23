@@ -31,11 +31,16 @@ func listWatchers(self int) ([]watcherProcess, error) {
 		if err != nil || !isGhMonitorWatcher(argv) {
 			continue
 		}
+		started, _ := procStartTicks(pid)
 		out = append(out, watcherProcess{
 			PID:      pid,
 			Age:      procAge(pid),
 			Describe: describeArgv(argv),
-			Stop:     func() error { return syscall.Kill(pid, syscall.SIGTERM) },
+			Alive: func() bool {
+				again, err := procStartTicks(pid)
+				return err == nil && again == started
+			},
+			Stop: func() error { return syscall.Kill(pid, syscall.SIGTERM) },
 		})
 	}
 	return out, nil
@@ -80,6 +85,28 @@ func isGhMonitorWatcher(argv []string) bool {
 	// children of the daemon and are named by their config, not by this
 	// binary, so anything else running this program is a client.
 	return true
+}
+
+// procStartTicks is the process's start time in clock ticks since boot: the
+// kernel's identity for "this exact process", since a recycled pid gets a new
+// one. Comparing it before and after a scan is how a signal avoids the wrong
+// process.
+func procStartTicks(pid int) (int64, error) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, err
+	}
+	s := string(raw)
+	close := strings.LastIndexByte(s, ')')
+	if close < 0 {
+		return 0, fmt.Errorf("unreadable stat for pid %d", pid)
+	}
+	fields := strings.Fields(s[close+1:])
+	// After comm: state(0) ppid(1) ... starttime(19)
+	if len(fields) < 20 {
+		return 0, fmt.Errorf("short stat for pid %d", pid)
+	}
+	return strconv.ParseInt(fields[19], 10, 64)
 }
 
 // procAge is how long a process has been running, from its start time.
