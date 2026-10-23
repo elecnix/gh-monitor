@@ -90,7 +90,10 @@ with its current settings until it is stopped by hand.`,
 				pid, rerr := handoff.Reload(ctx, socket)
 				switch {
 				case rerr == nil:
-					newPID, werr := waitForNewDaemon(ctx, socket, before.PID, reloadTakeoverTimeout)
+					// Wait for the pid the daemon said it started, not merely for
+					// "a different pid": the resident daemon answering is also
+					// a different pid when its own report was unusable.
+					newPID, werr := waitForNewDaemon(ctx, socket, before.PID, pid, reloadTakeoverTimeout)
 					if werr != nil {
 						return fmt.Errorf("%w (the successor was started as pid %d)", werr, pid)
 					}

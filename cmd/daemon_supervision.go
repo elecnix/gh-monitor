@@ -298,14 +298,22 @@ func (s recordingSource) Watch(ctx context.Context, t backend.Target, opts backe
 // reload client turns into advice rather than a silent no-op.
 var errNoSuccessor = errors.New("the resident daemon could not start its successor")
 
-// waitForNewDaemon waits until the socket answers under a pid other than
-// oldPID, which is how a reload knows the successor is serving.
-func waitForNewDaemon(ctx context.Context, socket string, oldPID int, timeout time.Duration) (int, error) {
+// waitForNewDaemon waits until the socket answers under a pid that is neither
+// oldPID nor zero — and, when the daemon named the successor it started, under
+// exactly that pid.
+//
+// The stricter check matters: with no usable old pid, "non-zero and different"
+// is satisfied by the old daemon answering, and the reload would report a
+// takeover that never happened.
+func waitForNewDaemon(ctx context.Context, socket string, oldPID, wantPID int, timeout time.Duration) (int, error) {
+	if oldPID == 0 && wantPID == 0 {
+		return 0, fmt.Errorf("cannot tell a successor from the resident daemon on %s: neither pid is known", socket)
+	}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
 		info, err := handoff.Info(ctx, socket)
-		if err == nil && info.PID != 0 && info.PID != oldPID {
+		if err == nil && info.PID != 0 && info.PID != oldPID && (wantPID == 0 || info.PID == wantPID) {
 			return info.PID, nil
 		}
 		lastErr = err

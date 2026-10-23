@@ -171,3 +171,30 @@ func TestDoctor_NeverReapsWithoutTheDaemonsClientList(t *testing.T) {
 	assert.Zero(t, stopped, "without the daemon's client list, nothing may be stopped")
 	assert.Contains(t, out, "did not report its clients")
 }
+
+// TestDoctor_FailedStopIsNotReportedAsTooYoung: a stop that fails was already
+// old enough to be attempted, so telling the operator to wait is advice that
+// can only waste their time.
+func TestDoctor_FailedStopIsNotReportedAsTooYoung(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{PID: 100, StartedAt: time.Now()}, nil
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 200, Age: time.Hour, Describe: "-R o/r 7",
+			Stop: func() error { return errors.New("operation not permitted") },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--reap")
+	require.Error(t, err, "a watcher that could not be stopped is still polling")
+	assert.NotContains(t, out, "younger than",
+		"the failure was old enough to attempt; age is not the reason it survived")
+	assert.Contains(t, out, "could not be stopped")
+	assert.Contains(t, out, "operation not permitted")
+}

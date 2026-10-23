@@ -70,11 +70,11 @@ func isGhMonitorWatcher(argv []string) bool {
 	if !strings.HasPrefix(bin, "gh-monitor") && !strings.HasPrefix(bin, "gh_monitor") {
 		return false
 	}
-	for _, a := range argv[1:] {
-		switch a {
-		case "daemon":
-			return false
-		}
+	// Only the subcommand position names a daemon. Scanning every argument
+	// would hide a watcher whose flag value or comment body happens to be the
+	// word "daemon" — the invisibility this command exists to remove.
+	if len(argv) > 1 && argv[1] == "daemon" {
+		return false
 	}
 	// A daemon spawned with a socket path never watches; sub-daemons are
 	// children of the daemon and are named by their config, not by this
