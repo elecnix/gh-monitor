@@ -253,3 +253,33 @@ func TestDoctor_DaemonIsExcludedByPIDNotByItsArgv(t *testing.T) {
 		"the daemon is not a watcher, whatever its command line looks like")
 	assert.Contains(t, out, "every watcher is served")
 }
+
+// TestDoctor_ClassificationHonoursMinAge: the age gate that decides whether a
+// watcher is "just started" must be the operator's --min-age, not the default.
+// With the default in that spot, --min-age 1m would leave a three-minute-old
+// watcher classified as just started and never reaped, and a --min-age 10m
+// run would call a seven-minute watcher unattached and then spare it — the
+// report and the action disagreeing in the same run.
+func TestDoctor_ClassificationHonoursMinAge(t *testing.T) {
+	origInfo := handoffInfoFn
+	handoffInfoFn = func(context.Context, string) (handoff.DaemonInfo, error) {
+		return handoff.DaemonInfo{PID: 100, StartedAt: time.Now()}, nil
+	}
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	origScan := scanWatchers
+	t.Cleanup(func() { scanWatchers = origScan })
+	stopped := 0
+	scanWatchers = func() ([]watcherProcess, error) {
+		return []watcherProcess{{
+			PID: 200, Age: 3 * time.Minute, Describe: "-R o/r 7",
+			Stop: func() error { stopped++; return nil },
+		}}, nil
+	}
+
+	out, err := runDoctor(t, "--min-age", "1m", "--reap")
+	require.NoError(t, err)
+	assert.Equal(t, 1, stopped,
+		"with --min-age 1m a three-minute watcher is old enough to stop")
+	assert.NotContains(t, out, "just started")
+}
