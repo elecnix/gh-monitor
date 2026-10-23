@@ -15,10 +15,14 @@ import (
 	"github.com/elecnix/gh-monitor/internal/sdnotify"
 )
 
-// doctorMinAge is how old an unattached watcher must be before --reap will
-// stop it. A watcher that has just launched has not attached yet; killing it
-// would make `gh monitor doctor --reap` a race against every client starting
-// up.
+// doctorMinAge is the default for --min-age: how old an unattached watcher
+// must be before --reap will stop it. A watcher that has just launched has not
+// attached yet; killing it would make `gh monitor doctor --reap` a race
+// against every client starting up.
+//
+// It is only a default. The classification and the reaping must both use the
+// operator's --min-age value, or a watcher would be called "just started" and
+// then reaped, or reported as unattached and then spared, in the same run.
 var doctorMinAge = 5 * time.Minute
 
 // newDoctorCommand builds `gh monitor doctor`: it compares what the resident
@@ -143,7 +147,7 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 					// No client list to compare against, so this is unknown,
 					// not unattached — and it is not reaped.
 					state = "attached? the daemon did not report its clients"
-				case p.Age < doctorMinAge:
+				case p.Age < minAge:
 					state = "just started (not attached yet)"
 				default:
 					state = "NOT ATTACHED — polling on its own"
