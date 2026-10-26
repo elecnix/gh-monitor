@@ -91,6 +91,7 @@ func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(),
 		helperEnv+"=1",
+		ReexecDepthEnv+"=", // the helper counts its own hops, not the test's
 		"XDG_RUNTIME_DIR="+dir,
 		"XDG_CACHE_HOME="+dir,
 	)
@@ -125,6 +126,22 @@ func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	if info.Mode()&0o111 == 0 {
 		t.Fatalf("runtime copy is not executable: %v", info.Mode())
 	}
+
+	// Exactly one entry: the runtime copy. Every extra file here is a copy of
+	// the binary that nothing will ever reclaim, which is how a runaway re-exec
+	// filled a root filesystem (issue #196). Say so at the point it regresses,
+	// not after the disk is full.
+	entries, err := os.ReadDir(filepath.Dir(rt))
+	if err != nil {
+		t.Fatalf("read runtime dir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != filepath.Base(rt) {
+		t.Fatalf("runtime dir holds %v, want exactly [%s]", names, filepath.Base(rt))
+	}
 }
 
 // TestMaybeReexecReleasesInstalledBinary is the issue #73 end-to-end shape:
@@ -149,6 +166,7 @@ func TestMaybeReexecReleasesInstalledBinary(t *testing.T) {
 	cmd := exec.Command(installed, "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(),
 		helperEnv+"=1",
+		ReexecDepthEnv+"=", // the helper counts its own hops, not the test's
 		"XDG_RUNTIME_DIR="+dir,
 		"XDG_CACHE_HOME="+dir,
 	)

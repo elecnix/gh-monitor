@@ -20,6 +20,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // OptOutEnv disables the relaunch-into-runtime-copy behaviour when set to "0".
@@ -30,6 +33,44 @@ const OptOutEnv = "GH_MONITOR_REEXEC"
 // The launcher sets it before exec'ing the runtime copy, so a resident daemon
 // can watch the installed binary for upgrades and hand off to it (issue #73).
 const InstalledBinEnv = "GH_MONITOR_INSTALLED_BIN"
+
+// ReexecDepthEnv counts how many hops this process has already taken. Without
+// it the chain has no bound of its own: the only thing that ended it was the
+// identity check, and when that assumption breaks — the copy landing on a file
+// the next generation does not recognise as its own — every generation copies
+// again. That is how a test host filled /tmp with hundreds of gigabytes
+// (issue #196).
+const ReexecDepthEnv = "GH_MONITOR_REEXEC_DEPTH"
+
+const (
+	// maxReexecDepth is a fuse, not a budget. One hop is the whole design: the
+	// installed binary exec's the runtime copy and stops there. A second hop
+	// tolerates the copy being replaced underneath a running process (a runtime
+	// directory reclaimed between the copy and the exec). Anything past that is
+	// a loop, and the way to end a loop is to stay where you are and say so.
+	maxReexecDepth = 2
+
+	// staleCopyAge is how long an interrupted copy may sit in the runtime
+	// directory before it is treated as debris. A successful copy takes
+	// milliseconds, so this only ever reclaims files from a generation that died
+	// — killed on a helper's own timeout, or by the OOM killer — mid-write.
+	staleCopyAge = 5 * time.Minute
+
+	// maxPendingCopies and maxPendingCopyFactor bound how much debris may
+	// accumulate before the next attempt refuses to add to it. The threshold is
+	// deliberately loose: several gh-monitor processes starting together is
+	// ordinary and each leaves a copy mid-write for a few milliseconds, so a
+	// tight bound would refuse them and put the installed binary back on the
+	// mapped list, which is the problem this package exists to solve. A runaway
+	// produces hundreds of copies within the same window, so a loose bound still
+	// trips in seconds and caps the damage at a few hundred megabytes.
+	maxPendingCopies     = 8
+	maxPendingCopyFactor = 8
+)
+
+// reexecToFn is the seam tests use to observe a hop without replacing the test
+// process. Production always calls reexecTo.
+var reexecToFn = reexecTo
 
 // RuntimePath returns the path the resident copy of the binary lives at:
 // $XDG_RUNTIME_DIR/gh-monitor/gh-monitor, falling back to the user cache dir
@@ -51,7 +92,8 @@ func RuntimePath() (string, error) {
 // the running executable already is the runtime copy, or on platforms where
 // the mechanism is not implemented; those cases simply run in place, exactly
 // as before this package existed. A returned error means the copy could not
-// be made; callers should log it and run in place rather than fail.
+// be made, or that the chain has already gone further than a working identity
+// check ever lets it; callers should log it and run in place rather than fail.
 func MaybeReexec() error {
 	if os.Getenv(OptOutEnv) == "0" {
 		return nil
@@ -70,13 +112,35 @@ func MaybeReexec() error {
 	if sameFile(exe, rt) {
 		return nil
 	}
+	depth := reexecDepth()
+	if depth >= maxReexecDepth {
+		return fmt.Errorf("refusing to re-exec again (%s=%d, limit %d): the runtime copy is not being recognised as this process's own, so another hop would only repeat itself",
+			ReexecDepthEnv, depth, maxReexecDepth)
+	}
 	if err := copyExecutable(exe, rt); err != nil {
 		return err
 	}
 	// Remember where we came from: the resident daemon watches that file for
 	// upgrades and hands off to it.
 	_ = os.Setenv(InstalledBinEnv, exe)
-	return reexecTo(rt)
+	_ = os.Setenv(ReexecDepthEnv, strconv.Itoa(depth+1))
+	return reexecToFn(rt)
+}
+
+// reexecDepth reads how many hops this process has taken. A value that cannot
+// be read is treated as zero: an inherited value we do not understand is not a
+// reason to refuse to start, and the bound still applies once we write the next
+// one ourselves.
+func reexecDepth() int {
+	raw := strings.TrimSpace(os.Getenv(ReexecDepthEnv))
+	if raw == "" {
+		return 0
+	}
+	depth, err := strconv.Atoi(raw)
+	if err != nil || depth < 0 {
+		return 0
+	}
+	return depth
 }
 
 // sameFile reports whether path and the runtime copy are the same file. A
@@ -96,9 +160,17 @@ func sameFile(path, rt string) bool {
 // copyExecutable writes src to dst atomically: a temp file in the same
 // directory, fsynced, then renamed over dst. The rename is what keeps a
 // running image on the old inode safe while the new binary lands.
+//
+// Before writing anything it reclaims copies abandoned by a previous attempt
+// and, if the directory is still unhealthy, refuses to add to it (issue #196).
 func copyExecutable(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create runtime dir: %w", err)
+	}
+	removeAbandonedCopies(dir, filepath.Base(dst))
+	if err := guardRuntimeDir(src, dir, filepath.Base(dst)); err != nil {
+		return err
 	}
 	in, err := os.Open(src)
 	if err != nil {
@@ -106,7 +178,7 @@ func copyExecutable(src, dst string) error {
 	}
 	defer func() { _ = in.Close() }()
 
-	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
+	tmp, err := os.CreateTemp(dir, filepath.Base(dst)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp copy: %w", err)
 	}
@@ -135,4 +207,52 @@ func copyExecutable(src, dst string) error {
 		return fmt.Errorf("install runtime copy: %w", err)
 	}
 	return nil
+}
+
+// removeAbandonedCopies deletes temp copies older than staleCopyAge. A live
+// copy is left alone: it may belong to another process mid-hop, and deleting it
+// would fail that hop for no reason. Failures to remove are ignored — a file we
+// cannot delete is not a reason to refuse to upgrade, and guardRuntimeDir is the
+// backstop if the directory stays unhealthy.
+func removeAbandonedCopies(dir, base string) {
+	matches, err := filepath.Glob(filepath.Join(dir, base+".tmp-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-staleCopyAge)
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
+// guardRuntimeDir refuses a copy when the runtime directory already holds more
+// interrupted copies than a healthy directory ever would. This is the case that
+// turned a looping re-exec into a full root filesystem: each generation added a
+// copy of the binary, nothing removed them, and the only symptom was unrelated
+// processes failing to write.
+func guardRuntimeDir(src, dir, base string) error {
+	matches, err := filepath.Glob(filepath.Join(dir, base+".tmp-*"))
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	var pending int64
+	for _, path := range matches {
+		if info, err := os.Stat(path); err == nil {
+			pending += info.Size()
+		}
+	}
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return nil // the copy itself will report this, with a better message
+	}
+	budget := int64(maxPendingCopyFactor) * srcInfo.Size()
+	if len(matches) <= maxPendingCopies && pending <= budget {
+		return nil
+	}
+	return fmt.Errorf("runtime dir %s holds %d interrupted copies (%d bytes, more than %d copies and %d bytes): refusing to add another and fill the disk — remove them and restart",
+		dir, len(matches), pending, maxPendingCopies, budget)
 }
