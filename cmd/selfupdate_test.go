@@ -161,6 +161,17 @@ func TestBuildUpgradeCommand(t *testing.T) {
 	assert.Equal(t, []string{"daemon", "--socket", "/run/d.sock", "--interval", "90"}, cmd.Args[1:])
 }
 
+// TestBuildUpgradeCommandSharesOutput pins that the successor writes where its
+// predecessor wrote. A nil stream here means /dev/null, and the successor — the
+// process that ends up owning the socket and every watched target — would run
+// with its diagnostics discarded exactly when they matter most: the adopted
+// state, the listening socket, and any handoff failure (issue #193).
+func TestBuildUpgradeCommandSharesOutput(t *testing.T) {
+	cmd := buildUpgradeCommand("/path/gh-monitor", "/run/d.sock", 90*time.Second)
+	assert.Equal(t, os.Stdout, cmd.Stdout, "the successor must log where its predecessor logged")
+	assert.Equal(t, os.Stderr, cmd.Stderr, "the successor's errors must reach the same sink")
+}
+
 // ---------------------------------------------------------------------------
 // Self-update cadence (issue #69, config-driven since #82)
 // ---------------------------------------------------------------------------

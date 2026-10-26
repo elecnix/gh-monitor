@@ -105,8 +105,19 @@ func watchInstalledBinary(ctx context.Context, installed, socket string, interva
 }
 
 // buildUpgradeCommand assembles the successor daemon's invocation.
+//
+// The successor shares this daemon's standard streams on purpose. `exec.Cmd`
+// connects nil streams to /dev/null, so without this the successor — the
+// process that now owns the socket and every watched target — would run with
+// its diagnostics discarded, exactly when an operator most needs them: it
+// logs the adopted state, the listening socket, and any handoff failure. Under
+// a service manager these streams are the journal (issue #193); on a terminal
+// they are the operator's.
 func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec.Cmd {
-	return exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+	cmd := exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd
 }
 
 // ---------------------------------------------------------------------------
