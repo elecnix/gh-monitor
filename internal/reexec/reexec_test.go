@@ -84,13 +84,15 @@ func TestMaybeReexecSkipsWhenAlreadyRuntimeCopy(t *testing.T) {
 	// Reaching this line at all proves the process was not replaced.
 }
 
-func TestMaybeReexecCopiesAndExecs(t *testing.T) {
-	dir := runtimeRoot(t)
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
+// runReexecHelper runs exe as the re-exec helper and fails unless it reports
+// ending up at the runtime copy. The depth the parent test process carries must
+// not leak in: the helper counts its own hops.
+func runReexecHelper(t *testing.T, exe, dir string) {
+	t.Helper()
+	cmd := exec.Command(exe, "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
 	cmd.Env = append(os.Environ(),
 		helperEnv+"=1",
+		ReexecDepthEnv+"=",
 		"XDG_RUNTIME_DIR="+dir,
 		"XDG_CACHE_HOME="+dir,
 	)
@@ -101,6 +103,33 @@ func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	if !strings.Contains(string(out), "REEXEC-OK") {
 		t.Fatalf("helper did not report a successful re-exec:\n%s", out)
 	}
+}
+
+// requireOnlyRuntimeCopy is the assertion issue #196 asks for: the runtime
+// directory holds the copy and nothing else. Every extra file there is a copy of
+// the binary that nothing will ever reclaim, which is how a runaway re-exec
+// filled a root filesystem. Fail where the regrowth appears, not once the disk
+// is full.
+func requireOnlyRuntimeCopy(t *testing.T, rt string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(rt))
+	if err != nil {
+		t.Fatalf("read runtime dir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if len(names) != 1 || names[0] != filepath.Base(rt) {
+		t.Fatalf("runtime dir holds %v, want exactly [%s]", names, filepath.Base(rt))
+	}
+}
+
+func TestMaybeReexecCopiesAndExecs(t *testing.T) {
+	dir := runtimeRoot(t)
+	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
+
+	runReexecHelper(t, os.Args[0], dir)
 
 	// The runtime copy must exist, be executable, and match the original.
 	orig, err := os.Executable()
@@ -125,6 +154,8 @@ func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	if info.Mode()&0o111 == 0 {
 		t.Fatalf("runtime copy is not executable: %v", info.Mode())
 	}
+
+	requireOnlyRuntimeCopy(t, rt)
 }
 
 // TestMaybeReexecReleasesInstalledBinary is the issue #73 end-to-end shape:
@@ -146,19 +177,7 @@ func TestMaybeReexecReleasesInstalledBinary(t *testing.T) {
 		t.Fatalf("write installed binary: %v", err)
 	}
 
-	cmd := exec.Command(installed, "-test.run=^TestReexecHelperProcess$", "-test.timeout=60s")
-	cmd.Env = append(os.Environ(),
-		helperEnv+"=1",
-		"XDG_RUNTIME_DIR="+dir,
-		"XDG_CACHE_HOME="+dir,
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("helper process: %v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), "REEXEC-OK") {
-		t.Fatalf("helper did not report a successful re-exec:\n%s", out)
-	}
+	runReexecHelper(t, installed, dir)
 
 	// The installed path is no longer mapped by a live image: an in-place
 	// truncate+write (what `gh extension upgrade` does) must succeed.
