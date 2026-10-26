@@ -80,22 +80,25 @@ func announceSuccessor(socket string, stderr io.Writer) {
 // adopted, and the hub — with any carried watching state — is restored. A
 // Type=notify unit waits for exactly this before it calls the service started.
 func announceReady(stderr io.Writer) {
-	if !sdEnabledFn() {
-		return
-	}
-	if err := sdReadyFn(); err != nil {
-		_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: could not report readiness to the service manager (%v)\n", err)
-	}
+	announce(sdReadyFn, "readiness", stderr)
 }
 
 // announceStopping reports a clean shutdown in progress, so a manager that
 // asked for notifications records the transition instead of only the timeout
 // that ends in a SIGKILL.
 func announceStopping(stderr io.Writer) {
+	announce(sdStoppingFn, "shutdown", stderr)
+}
+
+// announce sends one notification for a daemon that a manager asked about,
+// logging — never failing — when the manager's socket cannot be written.
+// Polling must never depend on a supervisor, so a notification is best-effort
+// by construction.
+func announce(send func() error, what string, stderr io.Writer) {
 	if !sdEnabledFn() {
 		return
 	}
-	if err := sdStoppingFn(); err != nil {
-		_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: could not report shutdown to the service manager (%v)\n", err)
+	if err := send(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "gh-monitor daemon: could not report %s to the service manager (%v)\n", what, err)
 	}
 }

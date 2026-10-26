@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,58 +52,47 @@ func expect(t *testing.T, msgs <-chan string) string {
 	}
 }
 
-// TestReadyDeliversDatagram is the protocol's core shape: READY=1 as one
-// datagram on the manager's socket.
-func TestReadyDeliversDatagram(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "notify.sock")
-	_, msgs := listenManager(t, sock)
-	t.Setenv(NotifySocketEnv, sock)
-
-	if err := Ready(); err != nil {
-		t.Fatalf("Ready: %v", err)
+// deliver runs one notification against a manager socket named the way the
+// service manager names it — a filesystem path, or an abstract-namespace name
+// spelled with a leading '@' — and returns the single datagram it received.
+func deliver(t *testing.T, socketName string, notify func() error) string {
+	t.Helper()
+	_, msgs := listenManager(t, socketName)
+	t.Setenv(NotifySocketEnv, socketName)
+	if err := notify(); err != nil {
+		t.Fatalf("notify over %s: %v", socketName, err)
 	}
-	if got := expect(t, msgs); got != "READY=1" {
-		t.Fatalf("payload = %q, want %q", got, "READY=1")
-	}
+	return expect(t, msgs)
 }
 
-// TestMainPIDAndStoppingPayloads pins the two assignments the daemon's handoff
-// depends on.
-func TestMainPIDAndStoppingPayloads(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "notify.sock")
-	_, msgs := listenManager(t, sock)
-	t.Setenv(NotifySocketEnv, sock)
-
-	if err := MainPID(4242); err != nil {
-		t.Fatalf("MainPID: %v", err)
+// TestNotificationsReachTheManager covers every assignment the daemon sends,
+// over both spellings of the manager's socket. The abstract case is the one
+// that would otherwise fail silently: a leading '@' is what systemd writes,
+// while the kernel wants a leading NUL, and a missed translation connects to
+// nothing at all — the manager simply waits forever, with no error anywhere.
+func TestNotificationsReachTheManager(t *testing.T) {
+	cases := []struct {
+		name   string
+		notify func() error
+		want   string
+	}{
+		{"ready", Ready, "READY=1"},
+		{"main pid", func() error { return MainPID(4242) }, "MAINPID=4242"},
+		{"stopping", Stopping, "STOPPING=1"},
 	}
-	if got := expect(t, msgs); got != "MAINPID=4242" {
-		t.Fatalf("payload = %q, want %q", got, "MAINPID=4242")
-	}
-	if err := Stopping(); err != nil {
-		t.Fatalf("Stopping: %v", err)
-	}
-	if got := expect(t, msgs); got != "STOPPING=1" {
-		t.Fatalf("payload = %q, want %q", got, "STOPPING=1")
-	}
-}
-
-// TestAbstractSocketName is the failure mode that would otherwise be silent:
-// systemd spells abstract-namespace sockets with a leading '@', while the
-// kernel wants a leading NUL. A literal '@' path would connect to nothing (or
-// to a filesystem path that does not exist) and the manager would wait forever
-// without ever reporting an error.
-func TestAbstractSocketName(t *testing.T) {
-	name := fmt.Sprintf("@ghmon-notify-test-%d", os.Getpid())
-	_, msgs := listenManager(t, name)
-	t.Setenv(NotifySocketEnv, name)
-
-	if err := MainPID(os.Getpid()); err != nil {
-		t.Fatalf("MainPID on an abstract socket: %v", err)
-	}
-	want := fmt.Sprintf("MAINPID=%d", os.Getpid())
-	if got := expect(t, msgs); got != want {
-		t.Fatalf("payload = %q, want %q", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name+" over a path socket", func(t *testing.T) {
+			sock := filepath.Join(t.TempDir(), "notify.sock")
+			if got := deliver(t, sock, tc.notify); got != tc.want {
+				t.Fatalf("payload = %q, want %q", got, tc.want)
+			}
+		})
+		t.Run(tc.name+" over an abstract socket", func(t *testing.T) {
+			name := fmt.Sprintf("@ghmon-notify-%d-%s", os.Getpid(), strings.ReplaceAll(tc.name, " ", "-"))
+			if got := deliver(t, name, tc.notify); got != tc.want {
+				t.Fatalf("payload = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

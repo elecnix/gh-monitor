@@ -58,16 +58,10 @@ func stubNotifications(t *testing.T, enabled bool) *notifyRecorder {
 	return rec
 }
 
-func (r *notifyRecorder) seen() []string {
+func (r *notifyRecorder) snapshot() (order []string, pids []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]string(nil), r.order...)
-}
-
-func (r *notifyRecorder) pids() []int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]int(nil), r.mainPID...)
+	return append([]string(nil), r.order...), append([]int(nil), r.mainPID...)
 }
 
 // TestSuccessorNamesItselfBeforeTheHandoff is the ordering rule issue #193
@@ -89,7 +83,8 @@ func TestSuccessorNamesItselfBeforeTheHandoff(t *testing.T) {
 
 	announceSuccessor(sock, &rec.stderr)
 
-	require.Equal(t, []int{os.Getpid()}, rec.pids(),
+	_, pids := rec.snapshot()
+	require.Equal(t, []int{os.Getpid()}, pids,
 		"a successor must name its own pid as the unit's main process")
 	assert.Empty(t, rec.stderr.String(), "a successful announcement is silent")
 }
@@ -110,7 +105,8 @@ func TestAReloadSuccessorDoesNotClaimTheUnit(t *testing.T) {
 
 	announceSuccessor(sock, &rec.stderr)
 
-	assert.Empty(t, rec.pids(), "a client-spawned successor must not claim the unit")
+	order, _ := rec.snapshot()
+	assert.Empty(t, order, "a client-spawned successor must not claim the unit")
 }
 
 // TestColdStartNamesNoSuccessor pins the other half: an ordinary start says
@@ -128,7 +124,8 @@ func TestColdStartNamesNoSuccessor(t *testing.T) {
 	require.NoError(t, os.WriteFile(stale, []byte("not a socket"), 0o600))
 	announceSuccessor(stale, &rec.stderr)
 
-	assert.Empty(t, rec.seen(), "an ordinary start must not claim the unit")
+	order, _ := rec.snapshot()
+	assert.Empty(t, order, "an ordinary start must not claim the unit")
 }
 
 // TestNothingNotifiedWithoutAManager verifies an unsupervised daemon pays
@@ -145,7 +142,8 @@ func TestNothingNotifiedWithoutAManager(t *testing.T) {
 	announceReady(&rec.stderr)
 	announceStopping(&rec.stderr)
 
-	assert.Empty(t, rec.seen())
+	order, _ := rec.snapshot()
+	assert.Empty(t, order)
 }
 
 // TestDaemonReportsReadyThenStopping runs the real daemon command: a
@@ -161,7 +159,8 @@ func TestDaemonReportsReadyThenStopping(t *testing.T) {
 	stop()
 
 	assert.Equal(t, DaemonBackendName, name)
-	assert.Equal(t, []string{"READY", "STOPPING"}, rec.seen(),
+	order, _ := rec.snapshot()
+	assert.Equal(t, []string{"READY", "STOPPING"}, order,
 		"a supervised daemon reports readiness before it is stopped, and never claims the unit on a cold start")
 }
 
