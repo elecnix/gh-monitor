@@ -9,15 +9,71 @@ import (
 	"time"
 )
 
-// scratchRuntime points RuntimePath at a scratch directory without the
-// t.Setenv of runtimeRoot, for tests that need to set particular variables
-// themselves.
-func scratchRuntime(t *testing.T) (dir, rt string) {
+// runtimeCopyOf points RuntimePath at a scratch directory and names the file the
+// resident copy lands on.
+func runtimeCopyOf(t *testing.T) (dir, rt string) {
 	t.Helper()
-	dir = t.TempDir()
-	t.Setenv("XDG_RUNTIME_DIR", dir)
-	t.Setenv("XDG_CACHE_HOME", dir)
+	dir = runtimeRoot(t)
 	return dir, filepath.Join(dir, "gh-monitor", "gh-monitor")
+}
+
+// prepareRuntime is the starting point of every copyExecutable test: a scratch
+// runtime directory that exists, and the binary to copy into it.
+func prepareRuntime(t *testing.T) (runtimeDir, rt, src string) {
+	t.Helper()
+	_, rt = runtimeCopyOf(t)
+	runtimeDir = filepath.Dir(rt)
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return runtimeDir, rt, src
+}
+
+// leaveCopy puts an interrupted copy of size bytes in the runtime directory and
+// backdates it, so age-based reclamation can be exercised deliberately. A size
+// of zero writes a small file; anything larger is sparse and costs no disk.
+func leaveCopy(t *testing.T, runtimeDir, name string, size int64, age time.Duration) string {
+	t.Helper()
+	path := filepath.Join(runtimeDir, "gh-monitor.tmp-"+name)
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size <= 0 {
+		size = 6 // "debris"
+	}
+	if err := f.Truncate(size); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if age != 0 {
+		stamp := time.Now().Add(-age)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+func requireGone(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%q survived; stat err = %v", path, err)
+	}
+}
+
+func requirePresent(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("%q missing: %v", path, err)
+	}
 }
 
 // stubReexec replaces the exec with a recorder, so a test can drive
@@ -37,7 +93,7 @@ func stubReexec(t *testing.T) *[]string {
 // TestMaybeReexecHopsOnceAndRecordsItsDepth pins the accounting the bound
 // depends on: a hop increments the depth, so a chain can be counted at all.
 func TestMaybeReexecHopsOnceAndRecordsItsDepth(t *testing.T) {
-	_, rt := scratchRuntime(t)
+	_, rt := runtimeCopyOf(t)
 	calls := stubReexec(t)
 	t.Setenv(ReexecDepthEnv, "0")
 
@@ -58,7 +114,7 @@ func TestMaybeReexecHopsOnceAndRecordsItsDepth(t *testing.T) {
 // was exactly that assumption breaking — each generation copied again, and
 // each kill on the helper's own -test.timeout left its temp file behind.
 func TestMaybeReexecRefusesToHopForever(t *testing.T) {
-	dir, _ := scratchRuntime(t)
+	_, rt := runtimeCopyOf(t)
 	calls := stubReexec(t)
 	t.Setenv(ReexecDepthEnv, strconv.Itoa(maxReexecDepth))
 
@@ -72,9 +128,7 @@ func TestMaybeReexecRefusesToHopForever(t *testing.T) {
 	if len(*calls) != 0 {
 		t.Fatalf("refused at the depth limit but hopped anyway: %v", *calls)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "gh-monitor", "gh-monitor")); !os.IsNotExist(err) {
-		t.Fatalf("a refused hop must not leave a copy behind; stat err = %v", err)
-	}
+	requireGone(t, rt)
 }
 
 // TestMaybeReexecDepthSurvivesGarbage: an unreadable depth is not a reason to
@@ -82,12 +136,13 @@ func TestMaybeReexecRefusesToHopForever(t *testing.T) {
 func TestMaybeReexecDepthSurvivesGarbage(t *testing.T) {
 	for _, value := range []string{"", "abc", "-1", "one", "+"} {
 		t.Run(value, func(t *testing.T) {
-			scratchRuntime(t)
+			_, rt := runtimeCopyOf(t)
 			stubReexec(t)
 			t.Setenv(ReexecDepthEnv, value)
 			if err := MaybeReexec(); err != nil {
 				t.Fatalf("MaybeReexec with %s=%q: %v", ReexecDepthEnv, value, err)
 			}
+			requirePresent(t, rt)
 		})
 	}
 }
@@ -95,7 +150,7 @@ func TestMaybeReexecDepthSurvivesGarbage(t *testing.T) {
 // TestMaybeReexecReadsAPaddedDepth: the depth is a number, and being wrapped in
 // spaces does not make it a different number.
 func TestMaybeReexecReadsAPaddedDepth(t *testing.T) {
-	scratchRuntime(t)
+	_, rt := runtimeCopyOf(t)
 	calls := stubReexec(t)
 	t.Setenv(ReexecDepthEnv, " 2 ")
 
@@ -105,118 +160,61 @@ func TestMaybeReexecReadsAPaddedDepth(t *testing.T) {
 	if len(*calls) != 0 {
 		t.Fatalf("hopped despite the limit: %v", *calls)
 	}
+	requireGone(t, rt)
 }
 
 // TestCopyExecutableReclaimsAbandonedCopies covers the debris the bound leaves
 // behind: a copy killed mid-write never gets to rename its temp file, and
 // nothing else will ever remove it.
 func TestCopyExecutableReclaimsAbandonedCopies(t *testing.T) {
-	_, rt := scratchRuntime(t)
-	runtimeDir := filepath.Dir(rt)
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	abandoned := filepath.Join(runtimeDir, "gh-monitor.tmp-0123456789")
-	if err := os.WriteFile(abandoned, []byte("half a binary"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * staleCopyAge)
-	if err := os.Chtimes(abandoned, old, old); err != nil {
-		t.Fatal(err)
-	}
+	runtimeDir, rt, src := prepareRuntime(t)
+	abandoned := leaveCopy(t, runtimeDir, "abandoned", 0, 2*staleCopyAge)
 	// A copy in flight right now is somebody else's hop. Leave it alone: a
 	// successful copy takes milliseconds, so an age test never mistakes one for
 	// debris, and removing it would turn that hop into a failure for no reason.
-	inFlight := filepath.Join(runtimeDir, "gh-monitor.tmp-live")
-	if err := os.WriteFile(inFlight, []byte("x"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	inFlight := leaveCopy(t, runtimeDir, "live", 0, 0)
 
-	src, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
 	if err := copyExecutable(src, rt); err != nil {
 		t.Fatalf("copyExecutable: %v", err)
 	}
-
-	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
-		t.Fatalf("abandoned copy %q survived; stat err = %v", abandoned, err)
-	}
-	if _, err := os.Stat(inFlight); err != nil {
-		t.Fatalf("in-flight copy was removed: %v", err)
-	}
-	if _, err := os.Stat(rt); err != nil {
-		t.Fatalf("runtime copy missing: %v", err)
-	}
+	requireGone(t, abandoned)
+	requirePresent(t, inFlight)
+	requirePresent(t, rt)
 }
 
 // TestCopyExecutableToleratesConcurrentAttempts: several clients starting at
 // once each leave a copy mid-write for a moment. That is ordinary, and refusing
 // them would put the installed binary back on the mapped list.
 func TestCopyExecutableToleratesConcurrentAttempts(t *testing.T) {
-	_, rt := scratchRuntime(t)
-	runtimeDir := filepath.Dir(rt)
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	runtimeDir, rt, src := prepareRuntime(t)
 	for i := 0; i < 4; i++ {
-		path := filepath.Join(runtimeDir, "gh-monitor.tmp-concurrent"+strconv.Itoa(i))
-		if err := os.WriteFile(path, []byte("x"), 0o755); err != nil {
-			t.Fatal(err)
-		}
+		leaveCopy(t, runtimeDir, "concurrent"+strconv.Itoa(i), 0, 0)
 	}
-	src, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
+
 	if err := copyExecutable(src, rt); err != nil {
 		t.Fatalf("copyExecutable alongside concurrent attempts: %v", err)
 	}
-	if _, err := os.Stat(rt); err != nil {
-		t.Fatalf("runtime copy missing: %v", err)
-	}
+	requirePresent(t, rt)
 }
 
 // TestCopyExecutableRefusesAnUnhealthyRuntimeDir is the second line of defence:
 // when the directory is already full of interrupted copies, adding another one
 // makes the situation worse and hides the cause. Say so instead.
 func TestCopyExecutableRefusesAnUnhealthyRuntimeDir(t *testing.T) {
-	_, rt := scratchRuntime(t)
-	runtimeDir := filepath.Dir(rt)
-	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	src, err := os.Executable()
-	if err != nil {
-		t.Fatalf("os.Executable: %v", err)
-	}
+	runtimeDir, rt, src := prepareRuntime(t)
 	info, err := os.Stat(src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Sparse, so the test costs no disk: the guard must read the sizes, not
-	// write that many bytes to find out.
-	bloated := filepath.Join(runtimeDir, "gh-monitor.tmp-bloated")
-	f, err := os.Create(bloated)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Truncate(int64(maxPendingCopyFactor+1) * info.Size()); err != nil {
-		_ = f.Close()
-		t.Fatal(err)
-	}
-	_ = f.Close()
+	bloated := int64(maxPendingCopyFactor+1) * info.Size()
+	leaveCopy(t, runtimeDir, "bloated", bloated, 0)
 
 	err = copyExecutable(src, rt)
 	if err == nil {
-		t.Fatalf("copyExecutable must refuse a runtime dir holding %d bytes of interrupted copies",
-			int64(maxPendingCopyFactor+1)*info.Size())
+		t.Fatalf("copyExecutable must refuse a runtime dir holding %d bytes of interrupted copies", bloated)
 	}
 	if !strings.Contains(err.Error(), runtimeDir) {
 		t.Fatalf("error %q should name %s, so the operator knows where to look", err, runtimeDir)
 	}
-	if _, err := os.Stat(rt); !os.IsNotExist(err) {
-		t.Fatalf("a refused copy must not install anything; stat err = %v", err)
-	}
+	requireGone(t, rt)
 }
