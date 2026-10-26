@@ -29,13 +29,14 @@ type notifyRecorder struct {
 func stubNotifications(t *testing.T, enabled bool) *notifyRecorder {
 	t.Helper()
 	rec := &notifyRecorder{}
-	origEnabled, origMainPID, origReady, origStopping := sdEnabledFn, sdMainPIDFn, sdReadyFn, sdStoppingFn
-	origParent := parentPIDFn
+	origEnabled, origSupervised, origMainPID, origReady, origStopping :=
+		sdEnabledFn, sdSupervisedFn, sdMainPIDFn, sdReadyFn, sdStoppingFn
 	t.Cleanup(func() {
-		sdEnabledFn, sdMainPIDFn, sdReadyFn, sdStoppingFn = origEnabled, origMainPID, origReady, origStopping
-		parentPIDFn = origParent
+		sdEnabledFn, sdSupervisedFn, sdMainPIDFn, sdReadyFn, sdStoppingFn =
+			origEnabled, origSupervised, origMainPID, origReady, origStopping
 	})
 	sdEnabledFn = func() bool { return enabled }
+	sdSupervisedFn = func() bool { return enabled }
 	sdMainPIDFn = func(pid int) error {
 		rec.mu.Lock()
 		defer rec.mu.Unlock()
@@ -73,13 +74,10 @@ func TestSuccessorNamesItselfBeforeTheHandoff(t *testing.T) {
 	rec := stubNotifications(t, true)
 	sock := shortSocket(t, "ghmon-sd-*.sock")
 
-	// A live predecessor: something is listening on the daemon socket. In this
-	// test that is this process, so "the predecessor spawned me" is expressed
-	// by the parent pid being our own.
+	// A live predecessor: something is listening on the daemon socket.
 	predecessor, err := ipc.Listen(sock)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = predecessor.Close() })
-	parentPIDFn = os.Getpid
 
 	announceSuccessor(sock, &rec.stderr)
 
@@ -101,7 +99,7 @@ func TestAReloadSuccessorDoesNotClaimTheUnit(t *testing.T) {
 	predecessor, err := ipc.Listen(sock)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = predecessor.Close() })
-	parentPIDFn = func() int { return os.Getpid() + 1 } // the reload client, not the daemon
+	sdSupervisedFn = func() bool { return false } // spawned from the operator's session
 
 	announceSuccessor(sock, &rec.stderr)
 

@@ -31,11 +31,11 @@ import (
 // Notification seams. Package variables, like maybeReexecFn, so tests can
 // assert what a supervised daemon tells its manager with no manager present.
 var (
-	sdEnabledFn  = sdnotify.Enabled
-	sdMainPIDFn  = sdnotify.MainPID
-	sdReadyFn    = sdnotify.Ready
-	sdStoppingFn = sdnotify.Stopping
-	parentPIDFn  = os.Getppid
+	sdEnabledFn    = sdnotify.Enabled
+	sdSupervisedFn = sdnotify.Supervised
+	sdMainPIDFn    = sdnotify.MainPID
+	sdReadyFn      = sdnotify.Ready
+	sdStoppingFn   = sdnotify.Stopping
 )
 
 // announceSuccessor tells the service manager that this process — not the
@@ -51,25 +51,22 @@ var (
 // start, and the manager already treats it as the main process — after a
 // runtime-copy re-exec that is still the PID the manager forked.
 //
-// Neither does a successor that the live daemon did not spawn. The socket's
-// owner must be this process's own parent for the handoff to be ours: a
-// daemon started by an unrelated client — `gh monitor reload` spawns one —
-// is outside the unit's cgroup, and naming it would take the unit away from
-// the process the manager is actually supervising. The kernel supplies the
-// peer's credentials (SO_PEERCRED), so the comparison cannot be spoofed.
+// Neither does a successor started from an operator's shell: `gh monitor
+// reload` spawns one, outside the unit's cgroup, and naming it would take the
+// unit away from the daemon the manager supervises. Supervised is the test for
+// that — not the socket's peer identity, because a Unix socket reports the pid
+// of the process that *created* it, and a handoff inherits the listening
+// socket: from the second handoff onward the kernel still names the original
+// daemon (see internal/sdnotify/supervised_linux.go).
 func announceSuccessor(socket string, stderr io.Writer) {
-	if !sdEnabledFn() {
+	if !sdEnabledFn() || !sdSupervisedFn() {
 		return
 	}
 	c, err := ipc.Dial(socket)
 	if err != nil {
 		return // no live predecessor: an ordinary start
 	}
-	predecessor := ipc.PeerPID(c)
 	_ = c.Close()
-	if predecessor == 0 || parentPIDFn() != predecessor {
-		return // not this process's predecessor
-	}
 	if err := sdMainPIDFn(os.Getpid()); err != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"gh-monitor daemon: could not name the successor to the service manager (%v); it may restart the unit instead of following the handoff\n", err)
