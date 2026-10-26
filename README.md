@@ -476,7 +476,7 @@ Under systemd the handoff above needs one more sentence spoken, and this is the 
 gh-monitor therefore notifies the service manager that started it. When `$NOTIFY_SOCKET` is set:
 
 - **`READY=1` once serving** — the socket is bound or adopted and the hub restored. This is what lets a unit use `Type=notify`, so a daemon that fails to bind is reported as failed instead of "active".
-- **`MAINPID=<successor>` before the handoff** — the successor claims the unit _before_ it asks for the listening socket, so the manager follows it instead of concluding that the service ended. Only a successor its predecessor actually spawned makes that claim, checked against the kernel's peer credentials (`SO_PEERCRED`), so a daemon started from a shell cannot take a unit away from the daemon supervising it.
+- **`MAINPID=<successor>` before the handoff** — the successor claims the unit _before_ it asks for the listening socket, so the manager follows it instead of concluding that the service ended. The claim is made only by a process the manager actually supervises, decided from its own cgroup membership (a `.service` leaf, not a session `.scope`), so a daemon started from an operator's shell — `gh monitor reload` spawns one — cannot take a unit away from the daemon that unit supervises. The obvious alternative, the socket's peer credentials, does not work here: a Unix socket reports the process that _created_ it, and a handoff inherits the listening socket, so from the second handoff onward the kernel still names the original daemon.
 - **`STOPPING=1` on SIGTERM** — so `systemctl stop` and `systemctl restart` record the transition instead of only the timeout that ends in a SIGKILL.
 
 A user unit then looks like this:
