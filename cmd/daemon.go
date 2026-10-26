@@ -30,6 +30,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/mux"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/resolver"
+	"github.com/elecnix/gh-monitor/internal/sdnotify"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
 )
 
@@ -179,6 +180,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	go func() {
 		select {
 		case <-sigCh:
+			// A supervised install hears its manager's SIGTERM: say so, so the
+			// stop is recorded as a transition rather than a timeout.
+			announceStopping(cmd.ErrOrStderr())
 			cancel()
 		case <-ctx.Done():
 		}
@@ -223,6 +227,12 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		}()
 		go routes.Run(ctx, mux.ProbeInterval)
 	}
+
+	// Under a service manager, name this process as the unit's main process
+	// *before* the handoff dial below: the predecessor exits as soon as it has
+	// passed its socket over, and a manager that reads that exit first kills the
+	// cgroup — successor included (issue #193).
+	announceSuccessor(socket, cmd.ErrOrStderr())
 
 	listener, adopted, err := listenOrAdopt(ctx, socket)
 	if err != nil {
@@ -295,6 +305,9 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	} else {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 	}
+	// The socket is bound or adopted and the hub is restored, so the daemon can
+	// answer: a Type=notify unit is waiting for exactly this (issue #193).
+	announceReady(cmd.ErrOrStderr())
 	startBrokerTransport(ctx, cmd, h)
 	startUpgradeWatcher(ctx, cmd, socket, interval)
 	startSelfUpdate(ctx, cmd)
@@ -357,8 +370,12 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir
 		// $GH_MONITOR_SOCK wherever it points, so this redirects them without
 		// any change in the sub-daemon binary. gh-monitor keeps the public
 		// socket and routes to these.
+		// NOTIFY_SOCKET is stripped (issue #193): a sub-daemon that reported
+		// READY=1 would mark the unit started before its daemon serves, and one
+		// that reported MAINPID would hand the unit to a process that does not own
+		// the socket.
 		ChildEnv: func(e subdaemon.Entry) []string {
-			return append(os.Environ(), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
+			return append(sdnotify.WithoutNotifyEnv(os.Environ()), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
 		},
 	}
 }

@@ -461,13 +461,49 @@ gh monitor prefs set '{"reactOnNotify": false}'
 
 `gh extension upgrade` rewrites the installed binary in place, which Linux refuses with "text file busy" while any process has it mapped — and the daemon's whole job is to stay resident. Upgrades are therefore seamless end to end ([#73](https://github.com/elecnix/gh-monitor/issues/73)):
 
-- **The installed file is never busy.** A resident command — the daemon, or a continuous `monitor` watch — launches from a runtime copy of the binary (`$XDG_RUNTIME_DIR/gh-monitor/gh-monitor`, falling back to the user cache dir) instead of the installed file, so the installed file is only ever exec'd for the instant of launch and the upgrade can rewrite it in place. Set `GH_MONITOR_REEXEC=0` to disable the relaunch and run from the installed path (the pre-#73 behaviour; upgrades then require stopping the daemon first).
+- **The installed file is never busy.** A resident command — the daemon, or a continuous `monitor` watch — launches from a runtime copy of the binary (`$XDG_RUNTIME_DIR/gh-monitor/gh-monitor`, falling back to the user cache dir) instead of the installed file, so the installed file is only ever exec'd for the instant of launch and the upgrade can rewrite it in place. Set `GH_MONITOR_REEXEC=0` to disable the relaunch and run from the installed path — the pre-#73 behaviour, where upgrades require stopping the daemon first. That opt-out is not needed under a service manager: see [Running under a service manager](#running-under-a-service-manager).
 - **The daemon adopts the new version by itself.** A resident daemon watches the installed binary; when an upgrade lands, it spawns the new binary, which performs an **in-memory handoff**: over the existing socket it receives the old daemon's watching state — every watched PR's last snapshot, backoff state, query tier, cached ruleset, and each connected watcher's baseline — and then the listening socket itself (passed as a file descriptor, so the socket path is never unbound). The old daemon exits cleanly; the new one serves in its place. No state file is written, and the takeover is seamless by construction:
   - **Watchers survive.** A connected `monitor` process sees its stream break, says so loudly once, reconnects to the same socket, and resumes from the baseline it was last shown — no second first-poll, no replay of what it already reported. Only what actually changed during the switchover is delivered.
   - **No polling state is lost.** The successor continues each PR's poll continuity instead of starting cold, so an upgrade does not re-fetch storm GitHub or re-notify watchers.
   - **No gap.** The successor serves on the adopted listening socket before the predecessor exits, so clients that probe the socket during the upgrade always find a daemon. A successor that fails to take over is announced loudly, and the old daemon keeps serving.
 
 If the running daemon predates the handoff protocol, the new start fails with the ordinary "socket in use" error and clients keep using the old daemon — stop it by hand to complete that one upgrade. Watchers running a build older than the reconnect support still end their watch on a daemon change, as they always did.
+
+#### Running under a service manager
+
+Under systemd the handoff above needs one more sentence spoken, and this is the part a supervisor changes ([#193](https://github.com/elecnix/gh-monitor/issues/193)): the successor is a detached child inside the unit's cgroup, so when the predecessor exits, systemd reads that exit as the _service's_ exit, kills the rest of the cgroup — the successor that has just adopted the socket and the watching state — and restarts from the installed binary. The upgrade lands, but as a restart.
+
+gh-monitor therefore notifies the service manager that started it. When `$NOTIFY_SOCKET` is set:
+
+- **`READY=1` once serving** — the socket is bound or adopted and the hub restored. This is what lets a unit use `Type=notify`, so a daemon that fails to bind is reported as failed instead of "active".
+- **`MAINPID=<successor>` before the handoff** — the successor claims the unit _before_ it asks for the listening socket, so the manager follows it instead of concluding that the service ended. Only a successor its predecessor actually spawned makes that claim, checked against the kernel's peer credentials (`SO_PEERCRED`), so a daemon started from a shell cannot take a unit away from the daemon supervising it.
+- **`STOPPING=1` on SIGTERM** — so `systemctl stop` and `systemctl restart` record the transition instead of only the timeout that ends in a SIGKILL.
+
+A user unit then looks like this:
+
+```ini
+[Unit]
+Description=gh-monitor daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=%h/.local/share/gh/extensions/gh-monitor/gh-monitor daemon
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+```
+
+`NotifyAccess=all` is required: the successor is not yet the unit's main process when it announces itself. Do not set `GH_MONITOR_REEXEC=0` in such a unit — that opt-out is exactly what keeps the installed file mapped and `gh extension upgrade` failing with "text file busy". `Type=simple` with `NotifyAccess=all` works too (the main-pid announcement is independent of the service type); `Type=notify` additionally makes "started" mean "serving".
+
+Two limits are worth knowing:
+
+- `gh monitor reload` still costs a unit restart under systemd. Its successor is spawned by the reloading client, outside the unit's cgroup, so it cannot take the unit over; the daemon it replaces exits and systemd restarts the service. Watching state survives because the successor adopts it either way. Making reload seamless under a supervisor needs the daemon to spawn its own successor — a separate change.
+- None of this exists off Linux: `$NOTIFY_SOCKET` is systemd's, and the macOS/launchd equivalent is not implemented.
 
 #### Broker transport (optional)
 
