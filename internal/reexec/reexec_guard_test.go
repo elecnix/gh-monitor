@@ -3,6 +3,7 @@ package reexec
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -88,6 +89,24 @@ func stubReexec(t *testing.T) *[]string {
 	}
 	t.Cleanup(func() { reexecToFn = orig })
 	return &calls
+}
+
+// TestChildEnvDropsTheDepth: a spawned process starts its own chain, so the hop
+// count of the chain that spawned it must not travel with it. Everything else in
+// the environment belongs to the operator and is passed through untouched.
+func TestChildEnvDropsTheDepth(t *testing.T) {
+	t.Setenv(ReexecDepthEnv, "1")
+	t.Setenv("GH_MONITOR_PROBE_KEPT", "kept")
+
+	env := ChildEnv()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, ReexecDepthEnv+"=") {
+			t.Fatalf("%s leaked to the child: %q", ReexecDepthEnv, kv)
+		}
+	}
+	if !slices.Contains(env, "GH_MONITOR_PROBE_KEPT=kept") {
+		t.Fatal("ChildEnv dropped an unrelated variable")
+	}
 }
 
 // TestMaybeReexecHopsOnceAndRecordsItsDepth pins the accounting the bound

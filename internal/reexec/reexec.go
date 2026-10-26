@@ -68,6 +68,28 @@ const (
 	maxPendingCopyFactor = 8
 )
 
+// ChildEnv is the environment for a process this one is about to launch: our
+// own, minus the re-exec depth.
+//
+// A successor daemon is a new launch, not another hop. It starts from the
+// installed binary and takes exactly one hop of its own, so it must not inherit
+// the count of the chain that spawned it. Inheriting it would be quietly fatal:
+// every handoff would add a hop to a chain that only ever re-execs once, and
+// after a couple of upgrades the fuse would trip on a perfectly healthy daemon,
+// leaving it running from the installed binary — the one state this package
+// exists to avoid, since that image cannot be replaced in place.
+func ChildEnv() []string {
+	prefix := ReexecDepthEnv + "="
+	env := os.Environ()
+	kept := env[:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, prefix) {
+			kept = append(kept, kv)
+		}
+	}
+	return kept
+}
+
 // reexecToFn is the seam tests use to observe a hop without replacing the test
 // process. Production always calls reexecTo.
 var reexecToFn = reexecTo

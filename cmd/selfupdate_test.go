@@ -172,6 +172,20 @@ func TestBuildUpgradeCommandSharesOutput(t *testing.T) {
 	assert.Equal(t, os.Stderr, cmd.Stderr, "the successor's errors must reach the same sink")
 }
 
+// TestBuildUpgradeCommandStartsAFreshReexecChain: the successor is a new launch,
+// not another hop. Handing it the predecessor's hop count would make the count
+// climb on every handoff until the fuse tripped on a healthy daemon and left it
+// running from the installed binary — the one state that cannot be upgraded in
+// place (issue #196).
+func TestBuildUpgradeCommandStartsAFreshReexecChain(t *testing.T) {
+	t.Setenv(reexec.ReexecDepthEnv, "1")
+	cmd := buildUpgradeCommand("/path/gh-monitor", "/run/d.sock", 90*time.Second)
+	require.NotNil(t, cmd.Env, "an explicit environment is what keeps the count from leaking")
+	for _, kv := range cmd.Env {
+		assert.NotContains(t, kv, reexec.ReexecDepthEnv)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Self-update cadence (issue #69, config-driven since #82)
 // ---------------------------------------------------------------------------
