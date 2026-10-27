@@ -210,7 +210,7 @@ gh monitor --once -R owner/repo 42
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
-- `--until <kind,kind>` - Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
+- `--until <kind,kind>` - Comma-separated event kinds, or `any` for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
 - `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
@@ -254,7 +254,12 @@ gh monitor -R owner/repo 42 --until ci-all-green,new-failing-checks --timeout 18
 
 # Exit the moment the PR merges:
 gh monitor -R owner/repo 42 --until merged
+
+# Wake on anything at all, including kinds added in later releases:
+gh monitor -R owner/repo 42 --until any
 ```
+
+The keyword `any` (alias `any-event`) means "the first event of any kind", so the caller needs no hand-written kind list that goes stale. It combines with named kinds without harm. Unlike a named member, `any` counts only events that `--events` lets through, so `--events` and `--until any` compose: `--events merged,closed --until any` wakes on the first merge or close.
 
 The exit code carries the answer: **0** means the condition was met (the triggering event was reported, then the watch exited), and **2** means the watch ended without the condition firing — the `--timeout` deadline passed or the target stream closed. A deadline that passed while the watch was still open ends with a `timeout` line saying so (see [The timeout is a hard deadline](#the-timeout-is-a-hard-deadline)). `--timeout` stays a maximum watch time, never a completion condition. A Ctrl-C is still just a cancel and exits 0. With `--once`, the single snapshot is the whole watch: exit 0 if a set member is present in that snapshot, else 2.
 
