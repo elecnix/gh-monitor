@@ -8,6 +8,12 @@
 // is a filename change, never a rewrite; a new day means a new file. Files
 // older than the retention window are pruned when the day rolls over.
 //
+// The log also carries the daemon's own activity (issue #122): one record per
+// hub fetch and one per failover from a sub-daemon to the hub. Those records
+// describe the polling itself rather than a change on a target, so they are
+// separate kinds — a fetch that found nothing changed delivers no update at
+// all, and its absence is exactly what made polling cost invisible.
+//
 // Logging is a witness, not a dependency: a write failure surfaces as an
 // error return so the caller can disable the log and say so, but it must
 // never take the watch down.
@@ -22,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/elecnix/gh-monitor/backend"
 )
 
 // now is the clock; a package variable so tests pin the day.
@@ -68,6 +76,97 @@ func New(dir string, keepDays int) (*Writer, error) {
 
 // Dir returns the directory the writer logs into.
 func (w *Writer) Dir() string { return w.dir }
+
+// The record kinds the daemon writes for its own activity (issue #122).
+//
+// They are separate from the update vocabulary because they describe the
+// polling itself, not the target: a fetch that found nothing changed
+// delivers no update at all, and a failover is a routing decision rather
+// than a change. A log that only records delivered updates cannot show how
+// often the hub polls, or which watches fell back to it.
+const (
+	// KindHubFetch records one hub fetch: the target, the tier it was read
+	// at, and whether the read changed anything.
+	KindHubFetch = "hub-fetch"
+	// KindHubFailover records a watch moving from a sub-daemon to the hub.
+	KindHubFailover = "hub-failover"
+)
+
+// FetchRecord is one hub fetch (issue #122): the target that was read, the
+// tier it was read at, and whether the read changed anything.
+//
+// The "changed" answer is what a log of delivered updates cannot give. A poll
+// that finds nothing changed delivers no update, so a log built only from
+// deliveries shows how often the hub found something and nothing about how
+// often it looked — which is the number that decides whether the polling is
+// worth its API cost.
+type FetchRecord struct {
+	// Kind names the record: KindHubFetch.
+	Kind string `json:"kind"`
+	// Target is what was read.
+	Target backend.Target `json:"target"`
+	// Tier is the query tier the read ran at ("TierFull", "TierStatus", …).
+	// It is the record of what the read could see: a shed tier did not read
+	// the surfaces it sheds.
+	Tier string `json:"tier"`
+	// Changed reports whether the read found anything different from the
+	// previous observation of this target.
+	Changed bool `json:"changed"`
+	// At is when the read happened.
+	At time.Time `json:"at"`
+}
+
+// NewFetchRecord builds the record of one hub fetch. The tier is the query
+// tier the read ran at; changed reports whether the read found anything
+// different from the previous observation of the target.
+//
+// The record's kind is set here, so a record cannot be written under the
+// wrong kind.
+func NewFetchRecord(target backend.Target, tier string, changed bool, at time.Time) FetchRecord {
+	return FetchRecord{
+		Kind:    KindHubFetch,
+		Target:  target,
+		Tier:    tier,
+		Changed: changed,
+		At:      at,
+	}
+}
+
+// NewFailoverRecord builds the record of one watch that fell back from a
+// sub-daemon to the hub. from is the sub-daemon that stopped serving the
+// watch, and reason says why the watch moved.
+//
+// The record's kind is set here, so a record cannot be written under the
+// wrong kind.
+func NewFailoverRecord(target backend.Target, from, reason string, at time.Time) FailoverRecord {
+	return FailoverRecord{
+		Kind:   KindHubFailover,
+		Target: target,
+		From:   from,
+		Reason: reason,
+		At:     at,
+	}
+}
+
+// FailoverRecord is one watch that fell back from a sub-daemon to the hub
+// (issue #122).
+//
+// It is recorded because the fallback is not free: a sub-daemon that serves a
+// watch through a webhook costs no API budget, and the hub that takes over
+// spends one. A log that shows only what was delivered cannot say which
+// watches gave up that saving, or how often.
+type FailoverRecord struct {
+	// Kind names the record: backend.SourceHubFailover.
+	Kind string `json:"kind"`
+	// Target is the watch that moved.
+	Target backend.Target `json:"target"`
+	// From is the sub-daemon that stopped serving the watch.
+	From string `json:"from"`
+	// Reason says why the watch moved.
+	Reason string `json:"reason"`
+	// At is when the watch moved.
+	At time.Time `json:"at"`
+}
 
 // Log appends one event as a single JSON line. The event is marshalled as-is
 // — callers pass their update envelope so the log records what the backend

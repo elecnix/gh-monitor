@@ -73,6 +73,56 @@ func TestMonitor_EventLogWritesJSONL(t *testing.T) {
 	assert.True(t, sawFailing, "the failing-check update must be logged")
 }
 
+// TestMonitor_EventLogRecordsTheSource verifies the event log says which
+// serving path produced each update (issue #122). A log that cannot tell a
+// hub-served update from a sub-daemon-served one cannot answer "did this
+// cost a poll?" — and the two paths cost very differently.
+func TestMonitor_EventLogRecordsTheSource(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("GH_HOST", "")
+	logDir := filepath.Join(dir, "events")
+	cfgDir := filepath.Join(dir, "gh-monitor")
+	require.NoError(t, os.MkdirAll(cfgDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "preferences.json"),
+		[]byte(`{"eventLog":{"dir":"`+logDir+`","keepDays":5}}`), 0o644))
+
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		return assignJSON(result, openPRWithFailingCheck())
+	}}
+	apiClientFactory = func(string) ghcli.API { return fake }
+
+	root := newRootCommand()
+	root.SetOut(&bytes.Buffer{})
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"7", "-R", "o/r", "--once"})
+	require.NoError(t, root.Execute())
+
+	entries, err := os.ReadDir(logDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	f, err := os.Open(filepath.Join(logDir, entries[0].Name()))
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+
+	var sawUpdate bool
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var u map[string]any
+		require.NoError(t, json.Unmarshal([]byte(sc.Text()), &u))
+		if u["event"] == nil {
+			continue
+		}
+		sawUpdate = true
+		assert.Equal(t, "hub", u["source"],
+			"an update the built-in backend's in-process hub served names the hub as its source")
+	}
+	require.NoError(t, sc.Err())
+	assert.True(t, sawUpdate, "the log must hold at least one update")
+}
+
 // TestMonitor_EventLogOffByDefault verifies no log directory appears when the
 // operator has not turned the event log on — it is strictly opt-in.
 func TestMonitor_EventLogOffByDefault(t *testing.T) {

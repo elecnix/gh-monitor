@@ -125,6 +125,13 @@ type Hub struct {
 	idleCeiling            time.Duration
 	pauseWhenBrokerHealthy bool
 
+	// onFetch observes every fetch the hub performs (issue #122). It is nil
+	// when nobody is watching. The observer is called with the target, the
+	// tier, and whether the read changed anything — a poll that finds
+	// nothing changed delivers no update, so only the hub itself can say
+	// that it looked and found nothing.
+	onFetch FetchObserver
+
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
 
@@ -141,6 +148,31 @@ type Hub struct {
 	// brokerCoverage answers which repositories the wake path actually
 	// reaches. nil means "unknown", which covers nothing — see brokerCovers.
 	brokerCoverage BrokerCoverage
+}
+
+// FetchObserver is notified after every fetch the hub performs (issue #122).
+//
+// It reports the target that was read, the tier it was read at, and whether
+// the read changed anything. The observer runs on the poller's goroutine, so
+// an implementation must not block: the daemon's writes to the event log are
+// a single append under a lock, and a slow disk slows the poller down.
+//
+// An observer must be safe for concurrent use: several pollers fetch at once.
+type FetchObserver func(target backend.Target, tier monitor.QueryTier, changed bool, at time.Time)
+
+// WithFetchObserver installs the observer notified after every fetch. Pass
+// nil to remove it.
+func WithFetchObserver(fn FetchObserver) Option {
+	return func(h *Hub) { h.onFetch = fn }
+}
+
+// SetFetchObserver installs the observer notified after every fetch, or
+// removes it when fn is nil. It exists for the daemon, which learns whether
+// the operator turned the event log on only after building the hub.
+func (h *Hub) SetFetchObserver(fn FetchObserver) {
+	h.mu.Lock()
+	h.onFetch = fn
+	h.mu.Unlock()
 }
 
 // BrokerCoverage reports whether changes to a given repository actually reach
@@ -449,6 +481,13 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 		fetch := h.fetch
 		h.mu.Unlock()
 
+		// fetchTier is the tier the read actually ran at. It is tracked
+		// separately from snapOpts.Tier (the tier the snapshot is distilled
+		// at) because the two differ: a read that falls back to REST ran at
+		// the status tier, and a read that succeeded on the first try ran at
+		// the full tier. The observer must be told the tier that was paid
+		// for, not the zero value of the snapshot's tier field.
+		fetchTier := monitor.TierFull
 		raw, err := fetch(ctx, identity, monitor.TierFull)
 		if err != nil && monitor.IsRateLimitError(err) && keyOf(identity).kind == backend.KindPR && h.restFallback != nil {
 			// GraphQL is rate limited: answer from REST, as a poller would,
@@ -460,10 +499,12 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			if restRaw, restErr := h.restFallback(ctx, identity, nil); restErr == nil && restRaw != nil {
 				raw, err = restRaw, nil
 				snapOpts.Tier = monitor.TierStatus
+				fetchTier = monitor.TierStatus
 				out <- backend.Update{
 					Target: monitor.TargetOf(identity),
 					Event:  restModeNotice(labelFor(keyOf(identity), identity), resetAt, time.Time{}),
 					At:     time.Now(),
+					Source: backend.SourceHub,
 				}
 			}
 		}
@@ -480,9 +521,23 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 					DegradedMessage:  err.Error(),
 					DegradedSurfaces: blindSurfaces(keyOf(identity).kind),
 				},
-				At: time.Now(),
+				At:     time.Now(),
+				Source: backend.SourceHub,
 			}
 			return
+		}
+		// A one-shot read is a fetch too, and it is the most expensive one
+		// a watch makes: it runs at the full tier, and it is the backlog
+		// every routed watch pays for (issue #122). The observer is told
+		// about it like any other fetch, so the log shows the cost.
+		//
+		// A one-shot read has no previous observation to compare against,
+		// so it always counts as a change: it learned the target's state.
+		h.mu.Lock()
+		onFetch := h.onFetch
+		h.mu.Unlock()
+		if onFetch != nil {
+			onFetch(monitor.TargetOf(identity), fetchTier, true, time.Now())
 		}
 
 		distill := traits.distill(t, opts)
@@ -492,6 +547,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 			if cursorOf != nil {
 				u.Cursor = cursorOf(raw)
 			}
+			u.Source = backend.SourceHub
 			select {
 			case out <- u:
 			case <-ctx.Done():
@@ -1251,6 +1307,10 @@ func (p *poller) fetchOnce() {
 		// kinds fall through to the degraded broadcast.
 		if monitor.IsQueryCostError(err) && tier > monitor.TierStatus {
 			curr, err = fetch(ctx, p.identity, tier-1)
+			// The retry is the read that answered, at one tier down: the
+			// record must name the tier that was paid for, not the one
+			// that failed (issue #122).
+			tier = tier - 1
 		}
 		if err != nil && monitor.IsRateLimitError(err) && p.canUseREST() {
 			resetAt, _ := p.budget.GraphQLExhausted(p.identity.Host, time.Now())
@@ -1272,7 +1332,7 @@ func (p *poller) fetchOnce() {
 	p.mu.Lock()
 	p.lastGraphQL = time.Now()
 	p.mu.Unlock()
-	p.deliver(curr)
+	p.deliver(curr, tier)
 }
 
 // reportFailure hands a failed fetch of the given API surface to the poller's
@@ -1330,7 +1390,9 @@ func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
 		fmt.Fprintf(os.Stderr, "gh-monitor: %s: GraphQL rate limited, reading PR state over REST\n", p.label())
 		p.broadcast(ev)
 	}
-	p.deliver(curr)
+	// A REST read sees what a TierStatus GraphQL read sees: state, merge,
+	// head commit and check outcomes, with the rest shed.
+	p.deliver(curr, monitor.TierStatus)
 }
 
 // restModeNotice is the degraded notice that starts REST mode for the PR at
@@ -1417,7 +1479,12 @@ func (p *poller) setTier(tier monitor.QueryTier) {
 
 // deliver ends any degraded episode, then records curr — what the fetch
 // produced — as the latest observation and sends it to every subscriber.
-func (p *poller) deliver(curr any) {
+//
+// It also reports the fetch to the hub's observer (issue #122): the tier the
+// read ran at, and whether it found anything different. The fingerprint
+// comparison it already makes for the idle backoff is exactly the "did
+// anything change" answer, so the observation costs one string compare.
+func (p *poller) deliver(curr any, tier monitor.QueryTier) {
 	// A successful fetch ends every degraded episode this poller has in
 	// flight: announce the recovery before the fresh snapshot, so a
 	// consumer never reads the outage as ongoing past this point. The ledger
@@ -1437,7 +1504,8 @@ func (p *poller) deliver(curr any) {
 	if p.latest != nil {
 		prevFp = p.traits.fingerprint(p.latest)
 	}
-	if p.traits.fingerprint(curr) != prevFp {
+	changed := p.traits.fingerprint(curr) != prevFp
+	if changed {
 		p.noChange = 0
 	} else {
 		p.noChange++
@@ -1450,6 +1518,14 @@ func (p *poller) deliver(curr any) {
 		}
 	}
 	p.mu.Unlock()
+	// The observer runs outside the lock: it writes to the event log, and a
+	// disk that stalls must not hold the poller's state.
+	p.hub.mu.Lock()
+	fn := p.hub.onFetch
+	p.hub.mu.Unlock()
+	if fn != nil {
+		fn(monitor.TargetOf(p.identity), tier, changed, p.degradation.lastSuccess())
+	}
 }
 
 // selectTier returns the fetch tier for the next poll: TierFull when no
@@ -1512,6 +1588,7 @@ func (p *poller) broadcast(ev monitor.Event) {
 		Target: monitor.TargetOf(p.identity),
 		Event:  ev,
 		At:     time.Now(),
+		Source: backend.SourceHub,
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1600,6 +1677,10 @@ func (s *sub) loop() {
 				return
 			}
 			emit := func(u backend.Update) {
+				// Every update this hub delivers was paid for with a poll
+				// (issue #122): the source says so, so a log can tell a
+				// hub-served update from one a sub-daemon delivered.
+				u.Source = backend.SourceHub
 				select {
 				case s.out <- u:
 				case <-s.done:
@@ -1630,6 +1711,7 @@ func (s *sub) loop() {
 			}
 		case u := <-s.notifCh:
 			// Loop-level notices (degraded, tier-shed) pass straight through.
+			u.Source = backend.SourceHub
 			select {
 			case s.out <- u:
 			case <-s.done:
