@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -81,6 +82,34 @@ func TestMonitorQuery_Tiers_WellFormed(t *testing.T) {
 		closes := strings.Count(q, "}")
 		assert.Equal(t, opens, closes, "%s: unbalanced braces", tier)
 		assert.True(t, strings.HasSuffix(strings.TrimSpace(q), "}"), "%s: must end with a closing brace", tier)
+	}
+}
+
+// GitHub rejects a query that declares a variable it never uses, so every
+// generated query must declare exactly the variables its body references.
+func TestQueries_DeclareOnlyUsedVariables(t *testing.T) {
+	declared := regexp.MustCompile(`\$(\w+)\s*:`)
+	used := regexp.MustCompile(`\$(\w+)`)
+	names := func(re *regexp.Regexp, s string) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range re.FindAllStringSubmatch(s, -1) {
+			out[m[1]] = true
+		}
+		return out
+	}
+	builders := map[string]func(QueryTier) string{
+		"MonitorQuery":       MonitorQuery,
+		"MonitorRefQuery":    MonitorRefQuery,
+		"MonitorCommitQuery": MonitorCommitQuery,
+	}
+	for name, build := range builders {
+		for _, tier := range []QueryTier{TierFull, TierNoAnnotations, TierNoReviews, TierStatus} {
+			q := build(tier)
+			header, body, _ := strings.Cut(q, "{\n")
+			decl := names(declared, header)
+			refs := names(used, body)
+			assert.Equal(t, refs, decl, "%s/%s: declared variables must equal used variables", name, tier)
+		}
 	}
 }
 
