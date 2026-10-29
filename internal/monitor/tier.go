@@ -203,8 +203,10 @@ func MonitorQuery(tier QueryTier) string {
 // monitorRefCommitTemplate is shared by the ref and commit queries, whose only
 // shed-able surface is annotations (they carry no comments or reviews). The
 // first %s is the operation name (MonitorRef / MonitorCommit), the second the
-// target fragment.
-const monitorRefCommitTemplate = `query %s($owner: String!, $repo: String!, $oid: GitObjectID!, $ref: String!) {
+// variable that selects the target ($ref: String! / $oid: GitObjectID!), the
+// third the target fragment. GitHub rejects a variable that is declared but
+// unused, so each query declares only its own selector.
+const monitorRefCommitTemplate = `query %s($owner: String!, $repo: String!, %s) {
   repository(owner: $owner, name: $repo) {
 %s  }
 }`
@@ -262,7 +264,7 @@ func MonitorRefQuery(tier QueryTier) string {
 	if tier.HasAnnotations() {
 		anns = annotationsFragment
 	}
-	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorRef", fmt.Sprintf(refCommitTargetFragment, anns))
+	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorRef", "$ref: String!", fmt.Sprintf(refCommitTargetFragment, anns))
 }
 
 // MonitorCommitQuery returns the commit snapshot query for the given tier.
@@ -271,5 +273,5 @@ func MonitorCommitQuery(tier QueryTier) string {
 	if tier.HasAnnotations() {
 		anns = annotationsFragment
 	}
-	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorCommit", fmt.Sprintf(commitObjectFragment, anns))
+	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorCommit", "$oid: GitObjectID!", fmt.Sprintf(commitObjectFragment, anns))
 }
