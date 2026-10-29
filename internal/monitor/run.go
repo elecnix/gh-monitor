@@ -472,6 +472,7 @@ func buildVarsRef(id resolver.Identity, status *RefStatus, ev Event, interval ti
 		"prLabel":     label,
 		"prUrl":       refURL,
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
@@ -530,6 +531,7 @@ func buildVarsIssue(id resolver.Identity, status *IssueStatus, ev Event, interva
 		"prLabel":     fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number),
 		"prUrl":       fmt.Sprintf("https://%s/%s/%s/issues/%d", host, id.Owner, id.Repo, id.Number),
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
@@ -724,6 +726,7 @@ func buildVarsRepo(id resolver.Identity, status *RepoStatus, ev Event, interval 
 		"prLabel":     fmt.Sprintf("%s/%s", id.Owner, id.Repo),
 		"prUrl":       fmt.Sprintf("https://%s/%s/%s", host, id.Owner, id.Repo),
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
