@@ -27,7 +27,8 @@ func TestEventFilter_Allows(t *testing.T) {
 	assert.True(t, nilFilter.Allows("anything-at-all"))
 
 	// non-nil allowlist: only listed kinds pass.
-	f := NewEventFilter("new-failing-checks", "merged")
+	f, err := ParseEventFilter("new-failing-checks,merged")
+	require.NoError(t, err)
 	assert.True(t, f.Allows("new-failing-checks"))
 	assert.True(t, f.Allows("merged"))
 	assert.False(t, f.Allows("first-poll"))
@@ -35,12 +36,14 @@ func TestEventFilter_Allows(t *testing.T) {
 	assert.False(t, f.Allows(""))
 
 	// empty allowlist = mute everything (distinct from nil).
-	empty := NewEventFilter()
+	empty, err := ParseEventFilter("")
+	require.NoError(t, err)
 	assert.False(t, empty.Allows("new-failing-checks"))
 	assert.False(t, empty.Allows("first-poll"))
 
 	// case-insensitive + whitespace-trimmed.
-	mixed := NewEventFilter("  New-Failing-Checks  ")
+	mixed, err := ParseEventFilter("  New-Failing-Checks  ")
+	require.NoError(t, err)
 	assert.True(t, mixed.Allows("new-failing-checks"))
 	assert.True(t, mixed.Allows("NEW-FAILING-CHECKS"))
 }
@@ -97,10 +100,12 @@ func TestEventFilter_String(t *testing.T) {
 	var nilFilter *EventFilter
 	assert.Equal(t, "<all>", nilFilter.String())
 
-	empty := NewEventFilter()
+	empty, err := ParseEventFilter("")
+	require.NoError(t, err)
 	assert.Equal(t, "<none>", empty.String())
 
-	populated := NewEventFilter("merged", "conflict", "new-failing-checks")
+	populated, err := ParseEventFilter("merged, conflict, new-failing-checks")
+	require.NoError(t, err)
 	s := populated.String()
 	assert.Equal(t, "conflict,merged,new-failing-checks", s, "String must be sorted and comma-separated")
 	assert.True(t, strings.Contains(s, "conflict"))

@@ -139,17 +139,19 @@ type RateLimitResource struct {
 	ResetAt   string `json:"-"`     // ISO 8601 derived from Reset
 }
 
-// RateLimitResponse is the parsed response from GET /rate_limit.
-type RateLimitResponse struct {
+// rateLimitResponse is the parsed response from GET /rate_limit. It is
+// unexported because BudgetGuard is its only consumer and sits in this
+// package; the wire shape is not part of any cross-package contract.
+type rateLimitResponse struct {
 	Resources struct {
 		Core    RateLimitResource `json:"core"`
 		GraphQL RateLimitResource `json:"graphql"`
 	} `json:"resources"`
 }
 
-// FetchRateLimit reads the current rate-limit status from GET /rate_limit.
-func (s *Service) FetchRateLimit() (*RateLimitResponse, error) {
-	var result RateLimitResponse
+// fetchRateLimit reads the current rate-limit status from GET /rate_limit.
+func (s *Service) fetchRateLimit() (*rateLimitResponse, error) {
+	var result rateLimitResponse
 	if err := s.API.REST("GET", "rate_limit", nil, nil, &result); err != nil {
 		return nil, err
 	}
@@ -163,11 +165,6 @@ func (s *Service) FetchRateLimit() (*RateLimitResponse, error) {
 	}
 	return &result, nil
 }
-
-// MONITOR_QUERY is kept for back-compat (tests and callers that snapshot a
-// full PR); the tiered builder is MonitorQuery. See tier.go for the tier
-// model and per-tier fragments.
-var MONITOR_QUERY = MonitorQuery(TierFull)
 
 // QueryResponse mirrors the GraphQL envelope's data shape.
 type QueryResponse struct {
