@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -962,4 +963,53 @@ func TestFailedRunLogDetail_TruncationNamesTheFetchCommand(t *testing.T) {
 		h := &Hub{}
 		assert.Equal(t, "", h.failedRunLogDetail(resolver.Identity{Owner: "octo", Repo: "demo"})(13))
 	})
+}
+
+// TestSubscribe_FirstPollTierNoticeReachesItsFirstSubscriber pins the ordering
+// Subscribe owes the subscriber that starts a poller (issue #190). A poller
+// that is already low on budget when it starts sheds on its first poll and
+// broadcasts the notice to whoever is attached at that moment; nothing replays
+// it afterwards. A poller launched before its first subscriber is attached
+// therefore announces the shed to nobody, and the watcher reads the missing
+// surfaces as an all-clear.
+//
+// The scheduler decides that interleaving, so the test fixes it: with one P,
+// yielding inside Subscribe, just before the consumer attaches, hands the CPU
+// to a poller launched too early, which then runs its whole first poll.
+func TestSubscribe_FirstPollTierNoticeReachesItsFirstSubscriber(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+	svc := &monitor.Service{API: &rateLimitAPIStub{remaining: 100, limit: 5000}}
+	budget := monitor.NewBudgetGuard(svc, 60*time.Second)
+
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, budget)
+	h.beforeAttach = func() {
+		for i := 0; i < 100; i++ {
+			runtime.Gosched()
+		}
+	}
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+	t.Cleanup(cancelSub)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case u, ok := <-ch:
+			if !ok {
+				t.Fatal("subscription closed before the shed notice arrived")
+			}
+			if u.Event.Type == monitor.EventDegraded && strings.Contains(u.Event.Notice, "no longer watching") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the first subscriber never received the first poll's tier-shed notice")
+		}
+	}
 }
