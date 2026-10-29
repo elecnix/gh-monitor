@@ -770,28 +770,40 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 		ignored[b] = true
 	}
 
-	status := &PRStatus{
-		State:             pr.State,
-		Merged:            pr.Merged,
-		Conflict:          pr.Mergeable == "CONFLICTING",
-		UnresolvedThreads: []ThreadSummary{},
-		GeneralComments:   []GeneralComment{},
-		FailingChecks:     failingChecks(pr),
-		PendingChecks:     pendingChecks(pr),
-		SuccessfulChecks:  successfulChecks(pr),
-		ShedSurfaces:      opts.Tier.ShedSurfaces(),
-	}
-	status.CheckAnnotations, status.AnnotationsTruncated, status.AnnotationsURL = extractAnnotations(pr, opts.AnnotationLevels)
-
-	// Detect truncated suites: the API returned fewer nodes than exist.
-	status.TruncatedSuites = truncatedSuites(pr)
-
-	// Compute awaiting required checks from the ruleset.
+	// The ruleset names the contexts that must exist. A failed read means the
+	// required set is unknown, so no awaiting set is computed — the snapshot
+	// degrades loudly via RulesetError rather than assuming nothing is required.
+	var requiredChecks []string
+	rulesetErr := ""
 	if opts.RulesetChecks != nil {
-		status.RulesetError = opts.RulesetChecks.Error
-		if opts.RulesetChecks.Error == "" && len(opts.RulesetChecks.Contexts) > 0 {
-			status.AwaitingChecks = awaitingChecks(pr, opts.RulesetChecks.Contexts)
+		rulesetErr = opts.RulesetChecks.Error
+		if rulesetErr == "" {
+			requiredChecks = opts.RulesetChecks.Contexts
 		}
+	}
+
+	// CI is judged in one place, over the head commit's suites and statuses.
+	ci := JudgeCI(HeadCommitViewOf(pr), CIVerdictOptions{
+		AnnotationLevels: opts.AnnotationLevels,
+		RequiredChecks:   requiredChecks,
+	})
+
+	status := &PRStatus{
+		State:                pr.State,
+		Merged:               pr.Merged,
+		Conflict:             pr.Mergeable == "CONFLICTING",
+		UnresolvedThreads:    []ThreadSummary{},
+		GeneralComments:      []GeneralComment{},
+		FailingChecks:        ci.Failing,
+		PendingChecks:        ci.Pending,
+		SuccessfulChecks:     ci.Successful,
+		AwaitingChecks:       ci.Awaiting,
+		TruncatedSuites:      ci.Truncated,
+		CheckAnnotations:     ci.Annotations,
+		AnnotationsTruncated: ci.AnnotationsTruncated,
+		AnnotationsURL:       ci.AnnotationsURL,
+		RulesetError:         rulesetErr,
+		ShedSurfaces:         opts.Tier.ShedSurfaces(),
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {
@@ -846,85 +858,6 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 // Helpers / predicates
 // ---------------------------------------------------------------------------
 
-var failureConclusions = map[string]bool{
-	"FAILURE": true, "ERROR": true, "TIMED_OUT": true, "CANCELLED": true, "ACTION_REQUIRED": true,
-}
-
-// nonVerdictConclusions are terminal conclusions that are NOT results: the run was
-// superseded or deliberately not executed, so it never overrides a verdict, whichever
-// is newer. Measured 2026-08-18: a name carrying a cancelled run beside a successful
-// one was reported as FAILING — the cancelled row was classified per-run instead of
-// per name. The mirror trap (a newer skipped hiding an older failure) is the fleet's
-// laundered-red case. One rule covers both signs: a non-verdict never overrides a
-// verdict, in either direction.
-var nonVerdictConclusions = map[string]bool{
-	"SKIPPED": true, "CANCELLED": true, "STALE": true,
-}
-
-// runVerdict selects the newest VERDICT among a name's runs. A non-verdict
-// (skipped/cancelled/stale) never overrides a verdict, whichever is newer; AMONG
-// VERDICTS the latest wins, so a re-review that found a defect is the real verdict,
-// not the earlier green. A run lacking a parseable completion time sorts oldest (it
-// cannot prove it is newer), and document order breaks ties.
-func runVerdict(runs []CheckRun) (CheckRun, bool) {
-	var best CheckRun
-	found := false
-	var bestT time.Time
-	for i := range runs {
-		r := &runs[i]
-		if r.Status != "COMPLETED" || nonVerdictConclusions[r.Conclusion] {
-			continue
-		}
-		t, err := time.Parse(time.RFC3339, r.CompletedAt)
-		if err != nil {
-			t = time.Time{} // unparseable cannot prove it is newer
-		}
-		if !found || t.After(bestT) {
-			best = *r
-			bestT = t
-			found = true
-		}
-	}
-	return best, found
-}
-
-// isFailureVerdict reports whether a VERDICT conclusion is a failure. CANCELLED is
-// deliberately absent: it is a non-verdict (superseded attempt), used only as a
-// fallback when the name has no verdict at all.
-func isFailureVerdict(c string) bool {
-	switch c {
-	case "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
-		return true
-	}
-	return false
-}
-
-// successConclusions are the terminal conclusions that count as "this check
-// passed" — SKIPPED and NEUTRAL are not failures and nothing more will happen
-// to them, so they settle the check just as SUCCESS does.
-var successConclusions = map[string]bool{
-	"SUCCESS": true, "NEUTRAL": true, "SKIPPED": true,
-}
-
-// pendingStatuses covers every CheckStatusState except COMPLETED (plus the
-// legacy STARTUP_FAILURE entry). A suite matching neither this map nor
-// failureConclusions reads as settled, so omitting a non-terminal status here
-// reports CI as passing while it is still queued.
-var pendingStatuses = map[string]bool{
-	"IN_PROGRESS": true, "QUEUED": true, "WAITING": true, "REQUESTED": true, "PENDING": true,
-	"STARTUP_FAILURE": true,
-}
-
-var failureCommitStates = map[string]bool{"FAILURE": true, "ERROR": true}
-
-var pendingCommitStates = map[string]bool{"PENDING": true, "EXPECTED": true}
-
-var successCommitStates = map[string]bool{"SUCCESS": true}
-
-func isFailureConclusion(c string) bool { return failureConclusions[c] }
-func isSuccessConclusion(c string) bool { return successConclusions[c] }
-func isPendingStatus(s string) bool     { return pendingStatuses[s] }
-
 // acknowledgedReactions are the reaction contents that acknowledge a comment.
 var acknowledgedReactions = map[string]bool{"THUMBS_UP": true}
 
@@ -945,332 +878,6 @@ func lastComment(nodes []Comment) *Comment {
 	return &nodes[len(nodes)-1]
 }
 
-// suiteName resolves a display name for a check suite.
-func suiteName(s *CheckSuite) string {
-	if s.App.Name != "" {
-		return s.App.Name
-	}
-	return s.App.Slug
-}
-
-// extractAnnotations collects annotations from all check runs across all
-// check suites of the head commit, filtered by levels. It also detects
-// truncation: when any check run has totalCount >= 10 (the per-step GitHub
-// cap) or totalCount > len(nodes) (our first: 50 page is full), the returned
-// truncated flag is true and the URL points to the first such run's permalink.
-func extractAnnotations(pr *PullRequest, levels *AnnotationLevels) (annotations []AnnotationSummary, truncated bool, url string) {
-	var out []AnnotationSummary
-	seen := map[string]bool{}
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			for _, run := range suite.CheckRuns.Nodes {
-				runAnns := run.Annotations
-				if runAnns.TotalCount >= 10 && !truncated {
-					truncated = true
-					url = run.Permalink
-				}
-				if runAnns.TotalCount > len(runAnns.Nodes) && !truncated {
-					truncated = true
-					if url == "" {
-						url = run.Permalink
-					}
-				}
-				for _, ann := range runAnns.Nodes {
-					if !levels.Allows(ann.Level) {
-						continue
-					}
-					s := AnnotationSummary{
-						CheckName: run.Name,
-						Path:      ann.Path,
-						Line:      ann.Location.Start.Line,
-						Level:     ann.Level,
-						Title:     ann.Title,
-						Message:   ann.Message,
-					}
-					key := annotationKey(s)
-					if !seen[key] {
-						seen[key] = true
-						out = append(out, s)
-					}
-				}
-			}
-		}
-	}
-	return out, truncated, url
-}
-
-// suiteCarriesRuns reports whether a suite has at least one check run attached.
-//
-// A suite with NO runs is never a verdict on its own. GitHub leaves runs
-// attached to the suite that created them, and keeps that suite's conclusion —
-// a superseded attempt's suite reads CANCELLED only when the attempt had no
-// runs to conclude, i.e. it is the empty container suite the GitHub Actions app
-// materialises per workflow. Those suites all share the container app name, so
-// reading one as a result manufactures a check named "GitHub Actions" that no
-// run backs and that never clears. Classifying by the app name is the same
-// phantom #96 fixed for the with-runs shape; this is the empty-suite shape of
-// it (measured live 2026-09-22 on a large private repo: 7 empty CANCELLED
-// "GitHub Actions" suites, every run SUCCESS or SKIPPED, and the monitor still
-// reported a failing check).
-//
-// The cost is the opposite phantom, accepted deliberately: a cancelled required
-// check that never produced a run reads as absent rather than red, which lands
-// it in AwaitingChecks and still holds CI out of green.
-func suiteCarriesRuns(s *CheckSuite) bool { return len(s.CheckRuns.Nodes) > 0 }
-
-// containerApps are the apps GitHub uses as a CONTAINER for check runs, never
-// as the check itself: the app runs workflows and each run carries its own job
-// name. A suite from one of these that carries no runs has nothing to report,
-// so its own conclusion is not a result. Matched on slug and name, because the
-// tests build suites by name and the API offers both.
-var containerApps = map[string]bool{
-	"github-actions": true,
-	"github actions": true,
-}
-
-func isContainerApp(s *CheckSuite) bool {
-	return containerApps[strings.ToLower(s.App.Slug)] || containerApps[strings.ToLower(s.App.Name)]
-}
-
-// failingChecks collects names of failing check suites/runs plus old-style
-// status contexts in FAILURE/ERROR states.
-func failingChecks(pr *PullRequest) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(name string) {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	// Per-name across ALL suites on the head: a cancelled run beside a successful one
-	// for the same name is a superseded attempt, not a verdict. Classification is per
-	// NAME across all runs, never per run (measured 2026-08-18).
-	byName := map[string][]CheckRun{}
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			// A suite's own conclusion is a result ONLY when the suite carries no
-			// runs — a lone non-container check (e.g. the "CI" app) that concluded
-			// CANCELLED and produced nothing. Where runs exist, classification
-			// defers to them per name; where the app is the container, an empty
-			// suite is not a check at all (see suiteCarriesRuns).
-			if isFailureConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
-				add(suiteName(suite))
-			}
-			for _, run := range suite.CheckRuns.Nodes {
-				name := run.Name
-				if name == "" {
-					name = suiteName(suite)
-				}
-				if name != "" {
-					byName[name] = append(byName[name], run)
-				}
-			}
-		}
-		if c.Status != nil {
-			for _, ctx := range c.Status.Contexts {
-				if failureCommitStates[ctx.State] {
-					add(ctx.Context)
-				}
-			}
-		}
-	}
-	for name, runs := range byName {
-		if v, ok := runVerdict(runs); ok {
-			if isFailureVerdict(v.Conclusion) {
-				add(name)
-			}
-			continue
-		}
-		// No verdict at all: fall back to any failure-shaped conclusion (a cancelled
-		// suite that ran and was the only record still reads red, never green).
-		for _, r := range runs {
-			if isFailureConclusion(r.Conclusion) {
-				add(name)
-				break
-			}
-		}
-	}
-	return out
-}
-
-// successfulChecks collects names of check suites/runs that finished without
-// failing, plus old-style status contexts in the SUCCESS state.
-//
-// This is the positive evidence that CI ran: failingChecks and pendingChecks
-// are both empty whether every check passed or no check has been created yet,
-// and only the former should be reported as green.
-func successfulChecks(pr *PullRequest) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(name string) {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	// Same per-name rule as failingChecks: the latest VERDICT decides. A name whose
-	// latest verdict is a failure is NOT successful even if an earlier run passed.
-	byName := map[string][]CheckRun{}
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			// Mirror of the failingChecks rule: a suite's own conclusion is a result
-			// only when it carries no runs and is not the container app. A SUCCESS
-			// container suite would otherwise pad SuccessfulChecks with the app
-			// name, and every PR on GitHub has such a suite.
-			if isSuccessConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
-				add(suiteName(suite))
-			}
-			for _, run := range suite.CheckRuns.Nodes {
-				name := run.Name
-				if name == "" {
-					name = suiteName(suite)
-				}
-				if name != "" {
-					byName[name] = append(byName[name], run)
-				}
-			}
-		}
-		if c.Status != nil {
-			for _, ctx := range c.Status.Contexts {
-				if successCommitStates[ctx.State] {
-					add(ctx.Context)
-				}
-			}
-		}
-	}
-	for name, runs := range byName {
-		if v, ok := runVerdict(runs); ok {
-			if isSuccessConclusion(v.Conclusion) {
-				add(name)
-			}
-			continue
-		}
-		for _, r := range runs {
-			if isSuccessConclusion(r.Conclusion) {
-				add(name)
-				break
-			}
-		}
-	}
-	return out
-}
-
-// pendingChecks collects names of pending check suites plus old-style status
-// contexts in PENDING/EXPECTED states.
-func pendingChecks(pr *PullRequest) []string {
-	var out []string
-	seen := map[string]bool{}
-	add := func(name string) {
-		if name != "" && !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			// Same rule as the other two classifiers: an empty container suite is
-			// not a check. GitHub materialises one per workflow, runless, before
-			// its jobs exist. Where the suite DOES carry runs, the app name is
-			// still reported — imprecise, but the verdict it produces is right,
-			// because a run is genuinely in flight and the suite clears when it
-			// concludes.
-			if isPendingStatus(suite.Status) && (!isContainerApp(suite) || suiteCarriesRuns(suite)) {
-				add(suiteName(suite))
-			}
-		}
-		if c.Status != nil {
-			for _, ctx := range c.Status.Contexts {
-				if pendingCommitStates[ctx.State] {
-					add(ctx.Context)
-				}
-			}
-		}
-	}
-	return out
-}
-
-// truncatedSuites reports whether the check-suites payload was truncated —
-// the API reported more suites than were returned in nodes. When true, the
-// snapshot is degraded: AwaitingChecks may report checks as absent that
-// actually ran in the dropped suites.
-func truncatedSuites(pr *PullRequest) bool {
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		if c.CheckSuites.TotalCount > len(c.CheckSuites.Nodes) {
-			return true
-		}
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			if suite.CheckRuns.TotalCount > len(suite.CheckRuns.Nodes) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// allPresentCheckNames collects every check name visible in the payload —
-// suite names, individual run names, and old-style status context names.
-func allPresentCheckNames(pr *PullRequest) map[string]bool {
-	names := map[string]bool{}
-	for i := range pr.Commits.Nodes {
-		c := &pr.Commits.Nodes[i].Commit
-		for j := range c.CheckSuites.Nodes {
-			suite := &c.CheckSuites.Nodes[j]
-			if sn := suiteName(suite); sn != "" {
-				names[sn] = true
-			}
-			for _, run := range suite.CheckRuns.Nodes {
-				if run.Name != "" {
-					names[run.Name] = true
-				}
-			}
-		}
-		if c.Status != nil {
-			for _, ctx := range c.Status.Contexts {
-				if ctx.Context != "" {
-					names[ctx.Context] = true
-				}
-			}
-		}
-	}
-	return names
-}
-
-// awaitingChecks returns required context names that are entirely absent from
-// the check-suites/status payload. A check that is present but not successful
-// is still tracked by failingChecks / pendingChecks — awaiting means the check
-// has not been created at all.
-func awaitingChecks(pr *PullRequest, required []string) []string {
-	present := allPresentCheckNames(pr)
-	var out []string
-	seen := map[string]bool{}
-	for _, ctx := range required {
-		if present[ctx] {
-			continue
-		}
-		if !seen[ctx] {
-			seen[ctx] = true
-			out = append(out, ctx)
-		}
-	}
-	return out
-}
-
-// nonDecisiveReviewStates are review states that do not constitute a review
-// decision: PENDING (not yet submitted) and COMMENTED (comments only, neither
-// approval nor a change request). Skipping them ensures a follow-up comment
-// review does not clobber or misattribute an earlier APPROVED / CHANGES_REQUESTED
-// decision.
 var nonDecisiveReviewStates = map[string]bool{"PENDING": true, "COMMENTED": true}
 
 // reviewDecision returns the state and author of the latest decisive review —
@@ -1368,8 +975,11 @@ func SnapshotRef(ref *RefTarget) *RefStatus {
 			status.Author = a.Name
 		}
 	}
-	status.FailingChecks = commitChecks(ref.Target.CheckSuites, ref.Target.Status, failingChecksFromCommit)
-	status.PendingChecks = commitChecks(ref.Target.CheckSuites, ref.Target.Status, pendingChecksFromCommit)
+	// The ref reader is an adapter over the same verdict as the PR reader:
+	// a commit's suites and statuses need no pull-request wrapper.
+	ci := JudgeCI(HeadCommitViewOfSuites(ref.Target.CheckSuites, ref.Target.Status), CIVerdictOptions{})
+	status.FailingChecks = ci.Failing
+	status.PendingChecks = ci.Pending
 	return status
 }
 
@@ -1420,28 +1030,6 @@ func ResolveRefBaseline(api ghcli.API, owner, repo, raw string) (*RefStatus, err
 		return nil, fmt.Errorf("--baseline: %w", err)
 	}
 	return SnapshotCommit(resp.Repository.Object), nil
-}
-
-// commitChecks extracts check names from check suites and status contexts
-// using the provided classifier function which takes a *PullRequest.
-func commitChecks(suites SuiteNodes, status *CommitStatus, classifier func(*PullRequest) []string) []string {
-	pr := &PullRequest{
-		Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
-			CheckSuites: suites,
-			Status:      status,
-		}}}},
-	}
-	return classifier(pr)
-}
-
-// failingChecksFromCommit extracts failing check names from a synthetic PR.
-func failingChecksFromCommit(pr *PullRequest) []string {
-	return failingChecks(pr)
-}
-
-// pendingChecksFromCommit extracts pending check names from a synthetic PR.
-func pendingChecksFromCommit(pr *PullRequest) []string {
-	return pendingChecks(pr)
 }
 
 // ---------------------------------------------------------------------------
