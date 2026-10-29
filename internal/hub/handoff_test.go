@@ -155,6 +155,61 @@ func TestResumeEntryExpires(t *testing.T) {
 		"an expired resume must fall back to the ordinary first poll")
 }
 
+// TestTakeResumeTakesTheHubLock pins the invariant that the resume table is
+// guarded by h.mu, so takeResume cannot read or delete from it unlocked.
+//
+// It asserts the invariant rather than waiting for a race to happen. A test
+// that starts several watchers reconnecting at once and hopes two of them
+// collide on the map does detect the unlocked version — but only sometimes:
+// measured on this branch, removing the lock from takeResume and running
+// that test 30 times under plain `go test` (what CI runs — there is no
+// -race) failed 1 time in 30. A guard that catches a regression 3% of the
+// time is not a guard.
+//
+// This test fails on every run when the lock is missing, because it checks
+// what the function does rather than what a schedule happens to produce: with
+// h.mu held by this goroutine, takeResume must not be able to touch the
+// resume table until h.mu is released.
+func TestTakeResumeTakesTheHubLock(t *testing.T) {
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return nil, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	// Seed one baseline directly, so the call below has a real entry to read
+	// and delete: the test is about takeResume reaching the resume table, and
+	// an empty table would let it return early without touching it.
+	h.mu.Lock()
+	h.resumes["w1"] = resumeEntry{
+		state:   ResumeState{ResumeID: "w1", Baseline: json.RawMessage(`{"state":"OPEN"}`)},
+		expires: time.Now().Add(time.Minute),
+	}
+	h.mu.Unlock()
+
+	h.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.takeResume("w1")
+	}()
+
+	select {
+	case <-done:
+		h.mu.Unlock()
+		t.Fatal("takeResume touched the resume table without holding h.mu")
+	case <-time.After(100 * time.Millisecond):
+		// Still blocked on h.mu, which is the invariant this test exists to
+		// pin.
+	}
+
+	h.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("takeResume did not return after h.mu was released")
+	}
+}
+
 // TestExportWhileRunning verifies ExportState is safe to call while pollers
 // and subscribers are live — the race the real handoff runs, since the
 // predecessor exports while every watcher is still connected.
