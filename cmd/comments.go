@@ -2,18 +2,14 @@ package cmd
 
 import (
 	"errors"
-	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/internal/comments"
-	"github.com/elecnix/gh-monitor/internal/monitor"
-	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
 type commentsOptions struct {
-	Repo    string
-	Pull    int
+	targetSelector
 	Backend backendOptions
 }
 
@@ -32,8 +28,7 @@ func newCommentsCommand() *cobra.Command {
 		},
 	}
 
-	cmd.PersistentFlags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.PersistentFlags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addPersistentTargetFlags(cmd, &opts.targetSelector)
 	addPersistentBackendFlags(cmd, &opts.Backend)
 
 	cmd.AddCommand(newCommentsReplyCommand(opts))
@@ -50,20 +45,12 @@ func newCommentsReplyCommand(parent *commentsOptions) *cobra.Command {
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) > 0 {
-				opts.Selector = args[0]
-			}
-			if opts.Repo == "" {
-				opts.Repo = parent.Repo
-			}
-			if opts.Pull == 0 {
-				opts.Pull = parent.Pull
+				parent.Selector = args[0]
 			}
 			return runCommentsReply(cmd, parent, opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.Flags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
 	cmd.Flags().StringVar(&opts.ThreadID, "thread-id", "", "Review thread identifier to reply to")
 	cmd.Flags().StringVar(&opts.ReviewID, "review-id", "", "GraphQL review identifier when replying inside a pending review")
 	cmd.Flags().StringVar(&opts.Body, "body", "", "Reply text")
@@ -75,9 +62,6 @@ func newCommentsReplyCommand(parent *commentsOptions) *cobra.Command {
 }
 
 type commentsReplyOptions struct {
-	Repo     string
-	Pull     int
-	Selector string
 	ThreadID string
 	ReviewID string
 	Body     string
@@ -94,18 +78,13 @@ func runCommentsReply(cmd *cobra.Command, parent *commentsOptions, opts *comment
 	}
 	opts.Body = body
 
-	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
+	// The selector, --repo and --pr are declared once on the parent, so they
+	// mean the same thing whichever level they are given at.
+	_, target, err := resolveTarget(&parent.targetSelector)
 	if err != nil {
 		return err
 	}
 
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(selector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	reg, err := actorRegistry(cmd.Context(), &parent.Backend)
 	if err != nil {
 		return err

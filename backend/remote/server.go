@@ -33,6 +33,7 @@ type ServerConfig struct {
 	// Coverage serves the coverage stream. Optional; declaring it is what
 	// lets the daemon route by repository instead of by kind.
 	Coverage CoverageSource
+	Report   backend.ReportActor
 	// Resumable is announced in the hello: a dropped watch stream may be
 	// re-established by re-sending the request with the same ResumeID.
 	Resumable bool

@@ -98,4 +98,11 @@ var providerBindings = map[backend.Capability]providerBinding{
 		client:   clientSelf,
 		register: func(*backend.Registry, string, []backend.Kind, any) {},
 	},
+	backend.CapReport: {
+		server: func(c ServerConfig) any { return c.Report },
+		client: clientSelf,
+		register: func(r *backend.Registry, n string, k []backend.Kind, i any) {
+			r.RegisterReport(n, k, i.(backend.ReportActor))
+		},
+	},
 }
