@@ -196,7 +196,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// to clients (issue #193).
 	d := &daemonRuntime{interval: interval, info: daemonInfo{
 		invocationID: os.Getenv("INVOCATION_ID"),
-		supervised:   sdnotify.Enabled(),
+		supervised:   daemonSupervised(),
 		version:      runningVersion(),
 	}}
 	d.socket = socket
@@ -409,7 +409,9 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir
 		// any change in the sub-daemon binary. gh-monitor keeps the public
 		// socket and routes to these.
 		ChildEnv: func(e subdaemon.Entry) []string {
-			return append(os.Environ(), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
+			// NOTIFY_SOCKET is stripped (issue #193): a sub-daemon must not report
+			// readiness or a main pid for the unit.
+			return append(sdnotify.WithoutNotifyEnv(os.Environ()), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
 		},
 	}
 }

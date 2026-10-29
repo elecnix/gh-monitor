@@ -41,6 +41,18 @@ type daemonInfo struct {
 	version string
 }
 
+// sdSupervisedFn is the cgroup test, a variable so a test can stand in a
+// service manager.
+var sdSupervisedFn = sdnotify.Supervised
+
+// daemonSupervised reports whether this daemon may speak for a service. A
+// listening manager is not enough: $NOTIFY_SOCKET is inherited by anything an
+// operator starts from a unit's shell, and a manager accepts a main-pid change
+// only for a process in its service cgroup. The cgroup, not the socket's peer
+// pid, is the test: a handoff passes the listening socket on, so from the
+// second handoff the kernel still names the original creator.
+func daemonSupervised() bool { return sdnotify.Enabled() && sdSupervisedFn() }
+
 // daemonRuntime is the state of one daemon start that outlives its socket
 // acquisition.
 type daemonRuntime struct {
@@ -178,7 +190,7 @@ func (d *daemonRuntime) listenOrAdopt(ctx context.Context) (net.Listener, *hub.S
 // no-notification path, kept for callers that have no service manager in
 // play (and for tests that exercise the handoff seam directly).
 func listenOrAdopt(ctx context.Context, socket string) (net.Listener, *hub.State, error) {
-	d := &daemonRuntime{socket: socket, info: daemonInfo{supervised: sdnotify.Enabled()}}
+	d := &daemonRuntime{socket: socket, info: daemonInfo{supervised: daemonSupervised()}}
 	return d.listenOrAdopt(ctx)
 }
 

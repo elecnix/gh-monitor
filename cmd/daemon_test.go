@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -857,4 +858,42 @@ func TestAutostart_RespectsOptOut(t *testing.T) {
 	require.Error(t, err, "auto-start is forbidden by the environment")
 	assert.Contains(t, err.Error(), "GH_MONITOR_AUTOSTART")
 	assert.Zero(t, spawned, "nothing may be spawned when auto-start is off")
+}
+
+// A daemon may announce itself to a service manager only when one listens and
+// the daemon sits in that manager's service cgroup. A daemon an operator
+// started from a shell (`gh monitor reload` spawns one) can inherit
+// $NOTIFY_SOCKET and still not belong to the unit; naming it would take the
+// unit away from the daemon the manager supervises (issue #193).
+func TestDaemonSupervised(t *testing.T) {
+	cases := []struct {
+		name       string
+		notify     string
+		inCgroup   bool
+		supervised bool
+	}{
+		{"no manager", "", true, false},
+		{"manager, inside the service cgroup", "/run/notify", true, true},
+		{"manager's variable inherited by a shell-started daemon", "/run/notify", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NOTIFY_SOCKET", tc.notify)
+			prev := sdSupervisedFn
+			sdSupervisedFn = func() bool { return tc.inCgroup }
+			t.Cleanup(func() { sdSupervisedFn = prev })
+			assert.Equal(t, tc.supervised, daemonSupervised())
+		})
+	}
+}
+
+// Sub-daemons are launched without the notification socket, so none can report
+// readiness or a main pid for the unit.
+func TestSubdaemonChildEnvDropsNotifySocket(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "/run/notify")
+	l := subdaemonLauncherFn(nil, io.Discard, t.TempDir())
+	env := l.ChildEnv(subdaemon.Entry{Name: "broker-subscriber"})
+	for _, kv := range env {
+		assert.False(t, strings.HasPrefix(kv, "NOTIFY_SOCKET="), "child inherited %q", kv)
+	}
 }

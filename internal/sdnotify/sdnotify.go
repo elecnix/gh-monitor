@@ -84,3 +84,21 @@ func send(addr, payload string) error {
 	}
 	return nil
 }
+
+// WithoutNotifyEnv returns env with the notification variable removed.
+//
+// A child process must not speak for the service: a sub-daemon that sent
+// READY=1 would mark the unit started before the daemon that owns the socket
+// is serving, and one that sent MAINPID would hand the unit to a process that
+// does not own it (issue #193). The daemon's own successor is deliberately not
+// filtered: it is the process the manager must follow.
+func WithoutNotifyEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, SocketEnv+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
