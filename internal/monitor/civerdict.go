@@ -225,6 +225,12 @@ func suiteName(s *CheckSuite) string {
 // it in AwaitingChecks and still holds CI out of green.
 func suiteCarriesRuns(s *CheckSuite) bool { return len(s.CheckRuns.Nodes) > 0 }
 
+// suiteHasRuns is suiteCarriesRuns widened to the API's run count, so a suite
+// whose runs were all cut off by the page size still counts as having runs.
+func suiteHasRuns(s *CheckSuite) bool {
+	return suiteCarriesRuns(s) || s.CheckRuns.TotalCount > 0
+}
+
 // containerApps are the apps GitHub uses as a CONTAINER for check runs, never
 // as the check itself: the app runs workflows and each run carries its own job
 // name. A suite from one of these that carries no runs has nothing to report,
@@ -394,13 +400,13 @@ func pendingChecks(v HeadCommitView) []string {
 	for _, c := range v.Commits {
 		for j := range c.Suites.Nodes {
 			suite := &c.Suites.Nodes[j]
-			// Same rule as the other two classifiers: an empty container suite is
-			// not a check. GitHub materialises one per workflow, runless, before
-			// its jobs exist. Where the suite DOES carry runs, the app name is
-			// still reported — imprecise, but the verdict it produces is right,
-			// because a run is genuinely in flight and the suite clears when it
-			// concludes.
-			if isPendingStatus(suite.Status) && (!isContainerApp(suite) || suiteCarriesRuns(suite)) {
+			// A suite with no runs carries no verdict, whichever app owns it.
+			// GitHub creates one suite per installed App on every push, and an
+			// App that never posts a run leaves its suite queued forever, so
+			// counting it would hold the pull request out of green for good.
+			// Where the suite DOES carry runs, the app name is reported — the
+			// run is genuinely in flight and the suite clears when it concludes.
+			if isPendingStatus(suite.Status) && suiteHasRuns(suite) {
 				add(suiteName(suite))
 			}
 		}

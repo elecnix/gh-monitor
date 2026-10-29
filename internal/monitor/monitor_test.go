@@ -167,7 +167,7 @@ func TestSnapshot_FailingAndPendingChecks(t *testing.T) {
 	pr := &PullRequest{Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
 		CheckSuites: SuiteNodes{Nodes: []CheckSuite{
 			{Conclusion: "FAILURE", App: AppInfo{Name: "CI"}},
-			{Status: "IN_PROGRESS", App: AppInfo{Name: "Deploy"}},
+			{Status: "IN_PROGRESS", App: AppInfo{Name: "Deploy"}, CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{{Name: "deploy", Status: "IN_PROGRESS"}}}},
 			{CheckRuns: RunNodes{Nodes: []CheckRun{{Name: "unit", Conclusion: "ERROR"}}}},
 		}},
 		Status: &CommitStatus{Contexts: []StatusContext{
@@ -187,7 +187,8 @@ func TestSnapshot_PendingCoversEveryNonTerminalStatus(t *testing.T) {
 	for _, status := range []string{"REQUESTED", "PENDING", "QUEUED", "WAITING", "IN_PROGRESS"} {
 		t.Run(status, func(t *testing.T) {
 			pr := &PullRequest{Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
-				CheckSuites: SuiteNodes{Nodes: []CheckSuite{{Status: status, App: AppInfo{Name: "CI"}}}},
+				CheckSuites: SuiteNodes{Nodes: []CheckSuite{{Status: status, App: AppInfo{Name: "CI"},
+					CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{{Name: "build", Status: status}}}}}},
 			}}}}}
 			s := Snapshot(pr, SnapshotOptions{})
 			assert.Equal(t, []string{"CI"}, s.PendingChecks)
@@ -791,7 +792,7 @@ func TestSnapshotRef_WithCommitDetails(t *testing.T) {
 	}{Login: "grace"}}}}
 	rt.Target.CheckSuites = SuiteNodes{Nodes: []CheckSuite{
 		{Conclusion: "FAILURE", App: AppInfo{Name: "CI"}},
-		{Status: "IN_PROGRESS", App: AppInfo{Name: "Deploy"}},
+		{Status: "IN_PROGRESS", App: AppInfo{Name: "Deploy"}, CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{{Name: "deploy", Status: "IN_PROGRESS"}}}},
 	}}
 	rt.Target.Status = &CommitStatus{Contexts: []StatusContext{
 		{State: "FAILURE", Context: "circleci"},
