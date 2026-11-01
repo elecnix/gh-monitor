@@ -125,6 +125,11 @@ type Hub struct {
 	idleCeiling            time.Duration
 	pauseWhenBrokerHealthy bool
 
+	// beforeAttach, when set, runs in Subscribe just before the consumer is
+	// attached to its poller. Tests use it to hold Subscribe at the point
+	// where a poller started too early would already have polled.
+	beforeAttach func()
+
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
 
@@ -242,7 +247,10 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		h.pollers[key] = p
 	}
 	// A poller restored from a handoff already exists but has not started;
-	// whether fresh or restored, it starts with its first subscriber.
+	// whether fresh or restored, it starts with its first subscriber. The
+	// goroutine is launched only once that subscriber is attached (below): the
+	// poller broadcasts a tier-shed notice on its first poll, and nothing
+	// replays a notice to a subscriber that attached afterwards (issue #190).
 	start := !p.started
 	p.started = true
 	h.mu.Unlock()
@@ -286,6 +294,10 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		}
 	}
 	go sub.loop()
+
+	if h.beforeAttach != nil {
+		h.beforeAttach()
+	}
 
 	// Use the poller's cached ruleset (fetched once on first run).
 	p.mu.Lock()
