@@ -70,6 +70,18 @@ type CapabilityInfo struct {
 	// reported, so there is nothing to check here.
 	register func(r *Registry, name string, kinds []Kind, impl any)
 
+	// check reports an implementation that does not satisfy the interface
+	// this capability names. It is separate from register so that adding a
+	// capability does not change register's signature: a capability that
+	// stores its implementation untyped still registers through register,
+	// and its type still has to be checked somewhere.
+	//
+	// Only the capabilities whose register asserts the implementation's
+	// type need one. The mutation capabilities store their implementation
+	// untyped and resolve it with a checked assertion later, so a wrong-typed
+	// one is already reported as an error rather than a panic.
+	check func(name string, impl any) error
+
 	// resolve returns the implementation of Name covering t.
 	resolve func(r *Registry, t Target) (any, string, error)
 }
@@ -84,6 +96,12 @@ var capabilityInfos = []CapabilityInfo{
 		Summary:   "Delivers `Update`s describing what changed on a target",
 		UsedBy:    "continuous watching",
 		register:  func(r *Registry, name string, kinds []Kind, impl any) { r.RegisterSource(name, kinds, impl.(Source)) },
+		check: func(name string, impl any) error {
+			if _, ok := impl.(Source); !ok {
+				return wrongTypeError(name, CapSource, impl)
+			}
+			return nil
+		},
 		resolve: func(r *Registry, t Target) (any, string, error) {
 			return resolve(r.sources, t.Kind, r.pinned, CapSource)
 		},
@@ -94,6 +112,12 @@ var capabilityInfos = []CapabilityInfo{
 		Summary:   "Returns a target's current `Status`",
 		UsedBy:    "`--once`",
 		register:  func(r *Registry, name string, kinds []Kind, impl any) { r.RegisterReader(name, kinds, impl.(Reader)) },
+		check: func(name string, impl any) error {
+			if _, ok := impl.(Reader); !ok {
+				return wrongTypeError(name, CapReader, impl)
+			}
+			return nil
+		},
 		resolve: func(r *Registry, t Target) (any, string, error) {
 			return resolve(r.readers, t.Kind, r.pinned, CapReader)
 		},
@@ -193,6 +217,18 @@ var capabilityInfos = []CapabilityInfo{
 	},
 }
 
+// wrongTypeError reports an implementation that does not satisfy the
+// interface its capability names. The wording matches what resolveActor
+// reports for the same mistake, so a wrong-typed implementation reads the
+// same way whether it is caught at registration or at resolution.
+func wrongTypeError(name string, want Capability, impl any) error {
+	if impl == nil {
+		return fmt.Errorf("%w: backend %q registered a nil %s", ErrNoBackend, name, want)
+	}
+	return fmt.Errorf("%w: backend %q registered a %s of the wrong type (%T)",
+		ErrNoBackend, name, want, impl)
+}
+
 // LookupCapability returns the descriptor for c. The second result is false
 // for a name this build does not know — which is how the remote protocol
 // rejects a capability it could not honour even if it were registered.
@@ -227,10 +263,20 @@ func IsMutation(c Capability) bool {
 // for kinds (nil or empty meaning every kind). It is the untyped entry point
 // the remote client uses; the typed RegisterX methods on Registry remain for
 // in-tree backends that know their own type at the call site.
+//
+// An implementation of the wrong Go type is reported as an error, not a panic:
+// the capability's contract says which interface it implements, and a value
+// that does not satisfy it is a caller mistake, which belongs in the error
+// this function already returns.
 func (r *Registry) RegisterCapability(c Capability, name string, kinds []Kind, impl any) error {
 	info, ok := LookupCapability(c)
 	if !ok {
 		return fmt.Errorf("unknown capability %q", c)
+	}
+	if info.check != nil {
+		if err := info.check(name, impl); err != nil {
+			return err
+		}
 	}
 	info.register(r, name, kinds, impl)
 	return nil
