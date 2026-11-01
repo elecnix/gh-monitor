@@ -1,0 +1,57 @@
+# The gh-monitor daemon under systemd (issue #193).
+#
+# Two settings carry the whole fix:
+#
+#   Type=notify       The daemon reports READY=1 once it serves, and an upgrade
+#                     successor reports MAINPID=<itself> *before* it takes the
+#                     listening socket. systemd then follows the handoff instead
+#                     of treating the predecessor's exit as the service's exit
+#                     and killing the successor with the rest of the cgroup.
+#   NotifyAccess=all  The successor is not the main pid yet when it notifies,
+#                     so systemd must accept notifications from any process of
+#                     this unit.
+#
+# GH_MONITOR_REEXEC is deliberately NOT set. The daemon runs from a
+# content-addressed copy of the binary, so the installed file is never mapped
+# and `gh extension upgrade` can rewrite it in place; the upgrade watcher then
+# hands off to the new binary.
+#
+# Socket activation is optional but recommended (gh-monitor.socket): with it
+# the socket survives a crash, and a handoff never has to move it.
+
+[Unit]
+Description=gh-monitor daemon
+Documentation=https://github.com/elecnix/gh-monitor
+After=network-online.target
+Wants=network-online.target
+# Order after the socket when it is installed, without requiring it: the daemon
+# falls back to binding the path itself.
+After=gh-monitor.socket
+
+[Service]
+Type=notify
+NotifyAccess=all
+EnvironmentFile=-%h/.config/gh-monitor/daemon.env
+ExecStart=%h/.local/share/gh/extensions/gh-monitor/gh-monitor daemon
+# A supervised reload asks the resident daemon to spawn its own successor, so
+# `systemctl --user reload gh-monitor-daemon` is state-preserving.
+ExecReload=%h/.local/share/gh/extensions/gh-monitor/gh-monitor reload
+Restart=always
+RestartSec=3
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+ReadWritePaths=%t
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gh-monitor-daemon
+
+[Install]
+WantedBy=default.target

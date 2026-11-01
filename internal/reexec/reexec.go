@@ -16,6 +16,8 @@
 package reexec
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -66,7 +68,19 @@ const (
 	// trips in seconds and caps the damage at a few hundred megabytes.
 	maxPendingCopies     = 8
 	maxPendingCopyFactor = 8
+
+	// copyRetentionAge is how long an unused content-addressed copy is kept.
+	// Copies are one per build actually launched, not one per launch, but a
+	// rebuild on every `make build` would still leave a 13 MB file per build in
+	// a tmpfs, so old ones are reclaimed. Unlinking a copy another process is
+	// running from is safe: the running image keeps the inode alive.
+	copyRetentionAge = 24 * time.Hour
 )
+
+// copyPattern is the name a runtime copy is stored under. The key in it makes
+// the path a function of the binary's identity, never of the time it was
+// written (see CopyPathFor).
+const copyPattern = "gh-monitor-"
 
 // ChildEnv is the environment for a process this one is about to launch: our
 // own, minus the re-exec depth.
@@ -94,18 +108,107 @@ func ChildEnv() []string {
 // process. Production always calls reexecTo.
 var reexecToFn = reexecTo
 
-// RuntimePath returns the path the resident copy of the binary lives at:
-// $XDG_RUNTIME_DIR/gh-monitor/gh-monitor, falling back to the user cache dir
-// (the same precedence the daemon socket uses). The directory need not exist.
-func RuntimePath() (string, error) {
+// RuntimeDir returns the directory runtime copies live in:
+// $XDG_RUNTIME_DIR/gh-monitor, falling back to the user cache dir (the same
+// precedence the daemon socket uses). The directory need not exist.
+func RuntimeDir() (string, error) {
 	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		return filepath.Join(dir, "gh-monitor", "gh-monitor"), nil
+		return filepath.Join(dir, "gh-monitor"), nil
 	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve runtime copy location: %w", err)
 	}
-	return filepath.Join(cache, "gh-monitor", "gh-monitor"), nil
+	return filepath.Join(cache, "gh-monitor"), nil
+}
+
+// RuntimePath returns the path of the runtime copy for the running executable
+// — the path a resident process runs from.
+func RuntimePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
+	}
+	return CopyPathFor(exe)
+}
+
+// CopyPathFor returns the runtime copy path for the binary at exe.
+//
+// The name is derived from the file's identity — device, inode, size and
+// modification time — not from its path. That is what makes launching two
+// different builds concurrently safe: a single shared "current copy" path is
+// rewritten by every launch, so a process can exec a copy of a binary other
+// than its own between its rename and its exec. Content-addressed copies are
+// written once and never rewritten, so the window is gone rather than
+// narrowed. The depth fuse below still stands behind this, because an identity
+// check is exactly the assumption that failed in issue #196.
+func CopyPathFor(exe string) (string, error) {
+	dir, err := RuntimeDir()
+	if err != nil {
+		return "", err
+	}
+	key, err := identityKey(exe)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, copyPattern+key), nil
+}
+
+// identityKey is a short, stable fingerprint of one binary file. It must
+// change whenever the file's contents do, and must not require reading 13 MB
+// on every launch: size, mtime (nanosecond resolution), device and inode are
+// enough for that, and the inode changes on any atomic replace.
+func identityKey(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	inode, device := identityFields(fi)
+	h := sha256.New()
+	// A hash write cannot fail, but the check is what tells every linter —
+	// and the next reader — that nothing is being ignored here.
+	if _, err := fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device); err != nil {
+		return "", fmt.Errorf("fingerprint %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// isRuntimeCopy reports whether path is a runtime copy: a file directly in the
+// runtime directory under the copy-name pattern. Asking the file *where it
+// lives*, never only what it contains, is what stops a copy being copied again
+// forever — a copy's identity differs from the binary it was made from.
+func isRuntimeCopy(path string) bool {
+	dir, err := RuntimeDir()
+	if err != nil {
+		return false
+	}
+	return filepath.Dir(path) == dir && strings.HasPrefix(filepath.Base(path), copyPattern)
+}
+
+// pruneCopies removes runtime copies that are not keep, once they have gone
+// unused for copyRetentionAge. A copy another process is running from can be
+// unlinked safely: the running image keeps the inode alive and nothing re-reads
+// the path.
+func pruneCopies(dir, keep string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-copyRetentionAge)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), copyPattern) || strings.Contains(e.Name(), ".tmp-") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		if full == keep {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(full)
+	}
 }
 
 // MaybeReexec copies the running executable to RuntimePath and, on success,
@@ -127,11 +230,15 @@ func MaybeReexec() error {
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
 	}
-	rt, err := RuntimePath()
+	rt, err := CopyPathFor(exe)
 	if err != nil {
 		return err
 	}
-	if sameFile(exe, rt) {
+	// Already a runtime copy — this is the re-entered process, or a resident
+	// worker started from one. Either test settling it is enough: the path says
+	// where the file lives, the identity says whether it is the copy we would
+	// have made.
+	if isRuntimeCopy(exe) || sameFile(exe, rt) {
 		return nil
 	}
 	depth := reexecDepth()
@@ -142,6 +249,7 @@ func MaybeReexec() error {
 	if err := copyExecutable(exe, rt); err != nil {
 		return err
 	}
+	pruneCopies(filepath.Dir(rt), rt)
 	// Remember where we came from: the resident daemon watches that file for
 	// upgrades and hands off to it.
 	_ = os.Setenv(InstalledBinEnv, exe)

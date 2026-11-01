@@ -31,9 +31,12 @@ func TestRuntimePathPrefersXDGRuntimeDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
 	}
-	want := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "gh-monitor", "gh-monitor")
-	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+	dir, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if filepath.Dir(got) != dir || !strings.HasPrefix(filepath.Base(got), copyPattern) {
+		t.Fatalf("RuntimePath() = %q, want a content-addressed copy in %q", got, dir)
 	}
 }
 
@@ -45,9 +48,15 @@ func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
 	}
-	want := filepath.Join(dir, "gh-monitor", "gh-monitor")
-	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+	rd, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if rd != filepath.Join(dir, "gh-monitor") {
+		t.Fatalf("RuntimeDir() = %q, want %q", rd, filepath.Join(dir, "gh-monitor"))
+	}
+	if filepath.Dir(got) != rd || !strings.HasPrefix(filepath.Base(got), copyPattern) {
+		t.Fatalf("RuntimePath() = %q, want a content-addressed copy in %q", got, rd)
 	}
 }
 
@@ -58,18 +67,25 @@ func TestMaybeReexecOptOutEnv(t *testing.T) {
 		t.Fatalf("MaybeReexec with opt-out: %v", err)
 	}
 	// Nothing may have been copied.
-	if _, err := os.Stat(filepath.Join(dir, "gh-monitor", "gh-monitor")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("opt-out run must not create the runtime copy; stat err = %v", err)
+	entries, err := os.ReadDir(filepath.Join(dir, "gh-monitor"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("opt-out run must not create a runtime copy, found %d entries", len(entries))
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read runtime dir: %v", err)
 	}
 }
 
 func TestMaybeReexecSkipsWhenAlreadyRuntimeCopy(t *testing.T) {
-	dir := runtimeRoot(t)
+	runtimeRoot(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
+	rt, err := CopyPathFor(exe)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(rt), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -127,15 +143,20 @@ func requireOnlyRuntimeCopy(t *testing.T, rt string) {
 
 func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	dir := runtimeRoot(t)
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
-
-	runReexecHelper(t, os.Args[0], dir)
-
-	// The runtime copy must exist, be executable, and match the original.
 	orig, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
+	// The copy's name comes from the binary's identity, so it is computed here
+	// rather than assumed: a fixed path is exactly what this package stopped
+	// using.
+	rt, err := CopyPathFor(orig)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
+
+	runReexecHelper(t, os.Args[0], dir)
+
 	want, err := os.ReadFile(orig)
 	if err != nil {
 		t.Fatalf("read original: %v", err)
@@ -197,10 +218,6 @@ func TestReexecHelperProcess(t *testing.T) {
 	if os.Getenv(helperEnv) == "" {
 		t.Skip("helper process for TestMaybeReexecCopiesAndExecs")
 	}
-	rt, err := RuntimePath()
-	if err != nil {
-		t.Fatalf("RuntimePath: %v", err)
-	}
 	if err := MaybeReexec(); err != nil {
 		t.Fatalf("MaybeReexec: %v", err)
 	}
@@ -208,12 +225,21 @@ func TestReexecHelperProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	if after != rt {
-		t.Errorf("running from %q, want the runtime copy %q", after, rt)
+	// The copy's own name is keyed by the copy's identity, which differs from
+	// the binary it was made from, so on the second entry CopyPathFor(after)
+	// names a copy that does not exist. What must hold is where the process
+	// lives: a content-addressed copy in the runtime directory, not the
+	// installed binary.
+	dir, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if filepath.Dir(after) != dir || !strings.HasPrefix(filepath.Base(after), copyPattern) {
+		t.Errorf("running from %q, want a runtime copy in %q", after, dir)
 	}
 	procExe, err := os.Readlink("/proc/self/exe")
-	if err == nil && procExe != rt {
-		t.Errorf("/proc/self/exe = %q, want %q", procExe, rt)
+	if err == nil && procExe != after {
+		t.Errorf("/proc/self/exe = %q, want %q", procExe, after)
 	}
 	fmt.Println("REEXEC-OK")
 }

@@ -1057,6 +1057,14 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 			"If it is a daemon from an older build, stop it:\n"+
 			"  pkill -f 'gh monitor daemon'", socket, err)
 	}
+	// A watch outlives the daemon that served it: if the daemon is stopped or
+	// crashes (rather than handing off), the client brings it back instead of
+	// retrying a socket nobody holds. Polling is the daemon's job alone — a
+	// client that gave up on the daemon and polled by itself is exactly how
+	// unattached, upgrade-proof pollers accumulated (issue #193).
+	provider.SetRevive(func(rctx context.Context) error {
+		return autostartDaemon(rctx, socket, interval)
+	})
 	if err := reg.Use(provider); err != nil {
 		return false, fmt.Errorf("register the shared poller: %w", err)
 	}
