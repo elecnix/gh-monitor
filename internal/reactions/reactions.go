@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/ghcli"
 )
 
@@ -18,16 +19,23 @@ mutation AddReaction($subjectId: ID!, $content: ReactionContent!) {
 }
 `
 
-// ValidReactions maps CLI-friendly reaction names to GitHub GraphQL ReactionContent enum values.
+// ValidReactions maps each reaction name to GitHub's GraphQL ReactionContent
+// enum value.
+//
+// The names are the protocol contract, not a CLI convention: the same strings
+// are what ReactionActor.React takes and what reaches an out-of-process
+// backend on the wire, which is why backend exports them too (ReactionNames).
+// Only the values are GitHub-specific — a different backend maps the names to
+// its own API's tokens. A test holds the two lists identical.
 var ValidReactions = map[string]string{
-	"thumbs_up":   "THUMBS_UP",
-	"thumbs_down": "THUMBS_DOWN",
-	"laugh":       "LAUGH",
-	"hooray":      "HOORAY",
-	"confused":    "CONFUSED",
-	"heart":       "HEART",
-	"rocket":      "ROCKET",
-	"eyes":        "EYES",
+	backend.ReactionThumbsUp:   "THUMBS_UP",
+	backend.ReactionThumbsDown: "THUMBS_DOWN",
+	backend.ReactionLaugh:      "LAUGH",
+	backend.ReactionHooray:     "HOORAY",
+	backend.ReactionConfused:   "CONFUSED",
+	backend.ReactionHeart:      "HEART",
+	backend.ReactionRocket:     "ROCKET",
+	backend.ReactionEyes:       "EYES",
 }
 
 // ValidReactionNames returns a sorted list of valid reaction names for display.

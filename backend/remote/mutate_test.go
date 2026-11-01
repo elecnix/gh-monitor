@@ -2,7 +2,9 @@ package remote
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/stretchr/testify/assert"
 	"testing"
 
 	"github.com/elecnix/gh-monitor/backend"
@@ -70,6 +72,22 @@ type recordingReactions struct {
 func (r *recordingReactions) React(_ context.Context, _ backend.Target, subjectID, reaction string) error {
 	r.subjectID, r.reaction = subjectID, reaction
 	return nil
+}
+
+// recordingReport captures the options and target it was asked for, and
+// answers with a fixture built from them.
+type recordingReport struct {
+	opts   backend.ReportOptions
+	target backend.Target
+}
+
+func (r *recordingReport) ViewReport(_ context.Context, t backend.Target, opts backend.ReportOptions) (*backend.Report, error) {
+	r.target, r.opts = t, opts
+	return &backend.Report{Reviews: []backend.ReportReview{{
+		ID:          "PRR_remote",
+		State:       backend.ReportStateApproved,
+		AuthorLogin: opts.Reviewer,
+	}}}, nil
 }
 
 func TestThreadMutationsRoundTripAcrossTheWire(t *testing.T) {
@@ -164,12 +182,55 @@ func TestReactionRoundTripsAcrossTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
-	if err := p.React(context.Background(), prTarget(), "PRRC_1", "THUMBS_UP"); err != nil {
+	// The spelling the CLI sends. gh monitor react validates --type against
+	// the lower_snake_case vocabulary and hands it straight to React, so the
+	// GraphQL enum ("THUMBS_UP") never appears on this socket.
+	if err := p.React(context.Background(), prTarget(), "PRRC_1", backend.ReactionThumbsUp); err != nil {
 		t.Fatalf("React: %v", err)
 	}
-	if actor.subjectID != "PRRC_1" || actor.reaction != "THUMBS_UP" {
+	if actor.subjectID != "PRRC_1" || actor.reaction != backend.ReactionThumbsUp {
 		t.Fatalf("server saw %q %q", actor.subjectID, actor.reaction)
 	}
+}
+
+// TestReactionPayloadCarriesTheWireSpelling pins the bytes an out-of-process
+// backend has to parse: the field names, and values that are the CLI names
+// rather than any API's token.
+//
+// The vocabulary below is written out rather than taken from ReactionNames(),
+// because deriving it from the code under test pins nothing about the values —
+// only the key. A rename from thumbs_up to thumbsup would have passed a derived
+// expectation while breaking every third-party server, which is the whole thing
+// this test exists to prevent. Adding or renaming a reaction is a breaking
+// change to the protocol; it has to come here deliberately.
+func TestReactionPayloadCarriesTheWireSpelling(t *testing.T) {
+	for _, name := range []string{
+		"confused", "eyes", "heart", "hooray",
+		"laugh", "rocket", "thumbs_down", "thumbs_up",
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw, err := json.Marshal(reactPayload{SubjectID: "PRRC_1", Reaction: name})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			want := `{"subject_id":"PRRC_1","reaction":"` + name + `"}`
+			if string(raw) != want {
+				t.Fatalf("payload is %s, want %s", raw, want)
+			}
+		})
+	}
+}
+
+// TestReactionNamesMatchTheWireVocabulary keeps the list the protocol carries
+// and the list this file pins from drifting apart, so neither can gain a name
+// the other does not know about.
+func TestReactionNamesMatchTheWireVocabulary(t *testing.T) {
+	want := []string{
+		"confused", "eyes", "heart", "hooray",
+		"laugh", "rocket", "thumbs_down", "thumbs_up",
+	}
+	assert.Equal(t, want, backend.ReactionNames(),
+		"the carried vocabulary changed; update the pinned spellings above and treat it as a protocol change")
 }
 
 func TestMutationErrorsCrossTheWire(t *testing.T) {
@@ -204,6 +265,66 @@ func TestCallingAnUnservedMutationFails(t *testing.T) {
 	}
 }
 
+func TestReportRoundTripsAcrossTheWire(t *testing.T) {
+	actor := &recordingReport{}
+	p, err := Connect(context.Background(), pipeTransport(t, ServerConfig{
+		Name: "relay", Kinds: []backend.Kind{backend.KindPR}, Report: actor,
+	}))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	out, err := p.ViewReport(context.Background(), prTarget(), backend.ReportOptions{
+		Reviewer:       "alice",
+		States:         []backend.ReportState{backend.ReportStateChangesRequested},
+		StatesProvided: true,
+		TailReplies:    2,
+	})
+	if err != nil {
+		t.Fatalf("ViewReport: %v", err)
+	}
+
+	// The target must survive the wire intact: a backend that routes on owner
+	// and repo cannot route on a target that lost them.
+	if actor.target != prTarget() {
+		t.Fatalf("server saw target %+v, want %+v", actor.target, prTarget())
+	}
+	if actor.opts.Reviewer != "alice" || !actor.opts.StatesProvided {
+		t.Fatalf("options lost in transit: %+v", actor.opts)
+	}
+	if len(actor.opts.States) != 1 || actor.opts.States[0] != backend.ReportStateChangesRequested {
+		t.Fatalf("states lost in transit: %+v", actor.opts.States)
+	}
+	if actor.opts.TailReplies != 2 {
+		t.Fatalf("tail = %d, want 2", actor.opts.TailReplies)
+	}
+	if out == nil || len(out.Reviews) != 1 || out.Reviews[0].ID != "PRR_remote" {
+		t.Fatalf("report did not survive the wire: %+v", out)
+	}
+	if out.Reviews[0].State != backend.ReportStateApproved {
+		t.Fatalf("state = %q, want APPROVED", out.Reviews[0].State)
+	}
+}
+
+// A server that never advertises report must not silently answer a report
+// request: a capability the server never declared comes back as an error
+// naming it, rather than as a zero value that reads as "no reviews".
+func TestCallingAnUnservedReportFails(t *testing.T) {
+	p, err := Connect(context.Background(), pipeTransport(t, ServerConfig{
+		Name: "relay", Kinds: []backend.Kind{backend.KindPR}, Threads: &recordingThreads{},
+	}))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	out, err := p.ViewReport(context.Background(), prTarget(), backend.ReportOptions{})
+	if err == nil {
+		t.Fatalf("a report from a backend without the capability must fail, got %+v", out)
+	}
+	if !contains(err.Error(), string(backend.CapReport)) {
+		t.Fatalf("error should name the missing capability: %v", err)
+	}
+}
+
 func TestServerDeclaresEveryConfiguredMutationCapability(t *testing.T) {
 	p, err := Connect(context.Background(), pipeTransport(t, ServerConfig{
 		Name:      "relay",
@@ -211,6 +332,7 @@ func TestServerDeclaresEveryConfiguredMutationCapability(t *testing.T) {
 		Threads:   &recordingThreads{},
 		Draft:     &recordingDraft{},
 		Reactions: &recordingReactions{},
+		Report:    &recordingReport{},
 	}))
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
@@ -229,6 +351,9 @@ func TestServerDeclaresEveryConfiguredMutationCapability(t *testing.T) {
 	}
 	if _, name, err := reg.DraftFor(prTarget()); err != nil || name != "relay" {
 		t.Fatalf("draft = %q, %v", name, err)
+	}
+	if _, name, err := reg.ReportFor(prTarget()); err != nil || name != "relay" {
+		t.Fatalf("report = %q, %v", name, err)
 	}
 	// Review was never declared, so it stays with the built-in backend.
 	if _, name, err := reg.ReviewFor(prTarget()); err != nil || name != "gh" {

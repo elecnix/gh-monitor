@@ -56,17 +56,19 @@ func (t QueryTier) String() string {
 
 // ShedSurfaces names the surfaces the tier does NOT fetch, in the operator's
 // priority order (least valuable first). The empty slice means nothing is
-// shed. The names are stable identifiers used in notifications and JSON.
-func (t QueryTier) ShedSurfaces() []string {
+// shed. The names are stable identifiers used in notifications and JSON; the
+// vocabulary itself lives in surface.go so the tier, the snapshot and
+// CarryForwardShed all name the same surfaces.
+func (t QueryTier) ShedSurfaces() Surfaces {
 	switch t {
 	case TierFull:
 		return nil
 	case TierNoAnnotations:
-		return []string{"annotations"}
+		return Surfaces{SurfaceAnnotations}
 	case TierNoReviews:
-		return []string{"annotations", "reviews", "review threads"}
+		return Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads}
 	case TierStatus:
-		return []string{"annotations", "reviews", "review threads", "comments"}
+		return Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads, SurfaceComments}
 	}
 	return nil
 }
@@ -203,8 +205,10 @@ func MonitorQuery(tier QueryTier) string {
 // monitorRefCommitTemplate is shared by the ref and commit queries, whose only
 // shed-able surface is annotations (they carry no comments or reviews). The
 // first %s is the operation name (MonitorRef / MonitorCommit), the second the
-// target fragment.
-const monitorRefCommitTemplate = `query %s($owner: String!, $repo: String!, $oid: GitObjectID!, $ref: String!) {
+// variable that selects the target ($ref: String! / $oid: GitObjectID!), the
+// third the target fragment. GitHub rejects a variable that is declared but
+// unused, so each query declares only its own selector.
+const monitorRefCommitTemplate = `query %s($owner: String!, $repo: String!, %s) {
   repository(owner: $owner, name: $repo) {
 %s  }
 }`
@@ -262,7 +266,7 @@ func MonitorRefQuery(tier QueryTier) string {
 	if tier.HasAnnotations() {
 		anns = annotationsFragment
 	}
-	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorRef", fmt.Sprintf(refCommitTargetFragment, anns))
+	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorRef", "$ref: String!", fmt.Sprintf(refCommitTargetFragment, anns))
 }
 
 // MonitorCommitQuery returns the commit snapshot query for the given tier.
@@ -271,5 +275,5 @@ func MonitorCommitQuery(tier QueryTier) string {
 	if tier.HasAnnotations() {
 		anns = annotationsFragment
 	}
-	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorCommit", fmt.Sprintf(commitObjectFragment, anns))
+	return fmt.Sprintf(monitorRefCommitTemplate, "MonitorCommit", "$oid: GitObjectID!", fmt.Sprintf(commitObjectFragment, anns))
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 )
 
@@ -30,27 +31,19 @@ type EventFilter struct {
 // validEventKinds is the complete set of notification Type strings the loop
 // can emit. It is the union of the prefs template keys (the documented,
 // user-facing kind list, which already includes every EventType plus the two
-// loop-level kinds first-poll and all-clear) with the EventType constants —
-// the latter is a defensive superset so a future EventType added without a
-// matching template entry is still a recognised filter kind. This is the
-// authoritative allowlist for ParseEventFilter validation so a typo fails
-// loudly instead of silently muting the kind the caller wanted.
+// loop-level kinds first-poll and all-clear) with every EventType backend
+// declares. The latter is a defensive superset so a future EventType added
+// without a matching template entry is still a recognised filter kind; it is
+// read from backend.AllEventTypes rather than copied out by hand, so a new
+// EventType is covered the day it is declared. This is the authoritative
+// allowlist for ParseEventFilter validation so a typo fails loudly instead of
+// silently muting the kind the caller wanted.
 func validEventKinds() map[string]bool {
 	out := make(map[string]bool, 32)
 	for _, k := range prefs.TemplateKeys() {
 		out[k] = true
 	}
-	// Defensive: every EventType constant, in case one is added without a
-	// template entry. Today these are all already covered by TemplateKeys.
-	for _, e := range []EventType{
-		EventNewFailingChecks, EventCIAllGreen, EventNewUnresolvedThreads,
-		EventNewGeneralComments, EventConflict, EventReviewApproved,
-		EventReviewChangesRequested, EventReviewDismissed, EventNewCommit,
-		EventMerged, EventClosed, EventIssueClosed, EventIssueReopened,
-		EventIssueNewComment, EventIssueMention, EventRunQueued,
-		EventRunInProgress, EventRunCompleted, EventRepoNewPR, EventRepoNewIssue,
-		EventRepoReadiness, EventDegraded,
-	} {
+	for _, e := range backend.AllEventTypes() {
 		out[string(e)] = true
 	}
 	// The client's own timeout line (issue #127) is a loop-level kind like
@@ -60,28 +53,15 @@ func validEventKinds() map[string]bool {
 	return out
 }
 
-// NewEventFilter builds an allowlist from the given event-kind strings. With
-// no arguments it returns a non-nil filter that suppresses everything (the
-// "mute all" case); pass nil to RunOptions.EventFilter (or leave it unset) to
-// emit everything. The kinds are normalised (trimmed, lower-cased) but NOT
-// validated against the known set — use ParseEventFilter for caller-facing
-// input that must reject typos.
-func NewEventFilter(kinds ...string) *EventFilter {
-	f := &EventFilter{allowed: make(map[string]bool, len(kinds))}
-	for _, k := range kinds {
-		if k = strings.ToLower(strings.TrimSpace(k)); k != "" {
-			f.allowed[k] = true
-		}
-	}
-	return f
-}
-
 // ParseEventFilter parses a comma-separated list of event kinds into an
 // EventFilter, rejecting any kind that is not a recognised notification type.
-// Empty/blank entries are dropped, surrounding whitespace is trimmed, and
-// matching is case-insensitive. An empty input string returns a non-nil filter
-// that suppresses everything (callers wanting "emit everything" should pass a
-// nil EventFilter instead, i.e. leave the option unset).
+// This is the only constructor: every caller-facing kind string goes through
+// the validation, so a typo fails loudly instead of silently muting the kind
+// the caller wanted. Empty/blank entries are dropped, surrounding whitespace
+// is trimmed, and matching is case-insensitive. An empty input string returns
+// a non-nil filter that suppresses everything (callers wanting "emit
+// everything" should pass a nil EventFilter instead, i.e. leave the option
+// unset).
 func ParseEventFilter(s string) (*EventFilter, error) {
 	valid := validEventKinds()
 	f := &EventFilter{allowed: make(map[string]bool)}

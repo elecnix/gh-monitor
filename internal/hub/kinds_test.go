@@ -44,13 +44,22 @@ func issueFixture(state string, commentIDs ...string) *monitor.IssueQueryRespons
 	return &resp
 }
 
-func runFixture(status, conclusion string) *monitor.WorkflowRun {
-	return &monitor.WorkflowRun{
-		ID:         30433642,
-		Status:     status,
-		Conclusion: conclusion,
-		HTMLURL:    "https://github.com/octo/demo/actions/runs/30433642",
-		RunNumber:  42,
+// runFixture is what backend/gh's run fetch now returns: the distilled
+// *monitor.RunStatus, not the REST payload. Terminal states are real ones
+// (see AGENTS.md) — a blank status/conclusion pair does not exist.
+func runFixture(status, conclusion string) *monitor.RunStatus {
+	return &monitor.RunStatus{
+		RunID:        30433642,
+		Name:         "deploy",
+		DisplayTitle: "Deploy to prod",
+		Event:        "workflow_dispatch",
+		Status:       status,
+		Conclusion:   conclusion,
+		HeadBranch:   "main",
+		HeadSHA:      "abcdef1234567890",
+		ShortSHA:     "abcdef1",
+		HTMLURL:      "https://github.com/octo/demo/actions/runs/30433642",
+		RunNumber:    42,
 	}
 }
 
@@ -70,6 +79,8 @@ func targetOf(kind backend.Kind) backend.Target {
 		t.Ref = "main"
 	case backend.KindIssue:
 		t.Number = 5
+	case backend.KindRun:
+		t.RunID = 30433642
 	}
 	return t
 }
@@ -78,7 +89,7 @@ func targetOf(kind backend.Kind) backend.Target {
 func waitClosed(t *testing.T, ch <-chan backend.Update) []string {
 	t.Helper()
 	var out []string
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -183,7 +194,7 @@ func TestHub_SubscribeIssue(t *testing.T) {
 }
 
 func TestHub_SubscribeRun(t *testing.T) {
-	var resp *monitor.WorkflowRun
+	var resp *monitor.RunStatus
 	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
 		return resp, nil
 	}, nil, time.Hour, nil)
@@ -225,7 +236,7 @@ func TestHub_SubscribeRepo(t *testing.T) {
 	var first backend.Update
 	select {
 	case first = <-ch:
-	case <-time.After(2 * time.Second):
+	case <-time.After(asyncDeadline):
 		t.Fatal("timed out waiting for the first update")
 	}
 	assert.Equal(t, string(backend.EventFirstPoll), string(first.Event.Type))
@@ -238,7 +249,7 @@ func TestHub_SubscribeRepo(t *testing.T) {
 	var second backend.Update
 	select {
 	case second = <-ch:
-	case <-time.After(2 * time.Second):
+	case <-time.After(asyncDeadline):
 		t.Fatal("timed out waiting for the new-PR update")
 	}
 	assert.Equal(t, string(backend.EventRepoNewPR), string(second.Event.Type))
@@ -316,7 +327,7 @@ func TestHub_Once(t *testing.T) {
 
 		ch := h.Once(ctx, targetOf(backend.KindIssue), testHubOpts())
 		var degraded bool
-		deadline := time.After(2 * time.Second)
+		deadline := time.After(asyncDeadline)
 	loop:
 		for {
 			select {
@@ -369,7 +380,8 @@ func TestHub_OnceDoesNotStartPoller(t *testing.T) {
 func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	// A PR and an issue in the same repository are different identities: each
 	// gets its own poller, and a fetch for one never feeds the other.
-	// Two pollers fetch concurrently and both increment this, so it is atomic.
+	// The counter is atomic because the fetches happen on poller goroutines
+	// while the assertion below reads it from the test goroutine.
 	var fetches atomic.Int32
 	h := New(func(ctx context.Context, id resolver.Identity, _ monitor.QueryTier) (any, error) {
 		fetches.Add(1)
@@ -397,10 +409,11 @@ func TestHub_SubscribeKeepsSeparatePollersPerKind(t *testing.T) {
 	n := len(h.pollers)
 	h.mu.Unlock()
 	assert.Equal(t, 2, n, "each kind gets its own poller")
-	// Wait for the condition, not a stopwatch: a fixed window races the
-	// scheduler and fails on a loaded runner.
+	// Wait for the condition rather than for a stopwatch. A fixed window is a
+	// race with the scheduler: on a loaded runner one poller can be a
+	// scheduling slice behind, which is not what this test is about.
 	assert.Eventually(t, func() bool { return fetches.Load() >= 2 },
-		5*time.Second, 10*time.Millisecond,
+		asyncDeadline, 10*time.Millisecond,
 		"each poller fetched independently (saw %d of 2)", fetches.Load())
 }
 
@@ -457,7 +470,7 @@ func TestPoller_ErrorBackoff(t *testing.T) {
 		// (not a DegradedMessage), so wait for any update at all.
 		select {
 		case <-ch:
-		case <-time.After(2 * time.Second):
+		case <-time.After(asyncDeadline):
 			t.Fatal("timed out waiting for the recovery notice")
 		}
 

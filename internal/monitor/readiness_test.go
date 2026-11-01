@@ -672,3 +672,48 @@ func TestClassifyPRsFull_UnknownMergeStateIsNotReady(t *testing.T) {
 		assert.Contains(t, report.NotReady[0].Reason, "merge-state:SOMETHING_NEW")
 	})
 }
+
+// A GitHub App that is installed but never posts a check run still gets one
+// check suite per push. It stays queued forever with no runs, so it carries no
+// verdict and must not hold a pull request out of ready.
+func TestClassifyPRsFull_RunlessQueuedSuiteDoesNotBlock(t *testing.T) {
+	passing := CheckSuite{
+		Conclusion: "SUCCESS",
+		Status:     "COMPLETED",
+		App:        AppInfo{Name: "CI", Slug: "ci"},
+		CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{
+			{Name: "test", Conclusion: "SUCCESS", Status: "COMPLETED"},
+		}},
+	}
+	runless := CheckSuite{
+		Status: "QUEUED",
+		App:    AppInfo{Name: "Silent App", Slug: "silent-app"},
+	}
+	inFlight := CheckSuite{
+		Status: "QUEUED",
+		App:    AppInfo{Name: "Slow App", Slug: "slow-app"},
+		CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{
+			{Name: "slow", Status: "PENDING"},
+		}},
+	}
+	build := func(suites ...CheckSuite) ReadinessPR {
+		rp := makeReadinessPR(1, "viewer", "MERGEABLE", "CLEAN")
+		rp.Commits = CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
+			Oid:         "abc1234",
+			CheckSuites: SuiteNodes{TotalCount: len(suites), Nodes: suites},
+		}}}}
+		return rp
+	}
+
+	t.Run("queued suite with 0 runs is ignored", func(t *testing.T) {
+		report := ClassifyPRsFull([]ReadinessPR{build(passing, runless)}, "viewer", nil)
+		assert.Len(t, report.Ready, 1, "a runless queued suite carries no verdict")
+	})
+	t.Run("queued suite with a pending run still blocks", func(t *testing.T) {
+		report := ClassifyPRsFull([]ReadinessPR{build(passing, runless, inFlight)}, "viewer", nil)
+		assert.Len(t, report.Ready, 0)
+		require.Len(t, report.NotReady, 1)
+		assert.Contains(t, report.NotReady[0].Reason, "pending:Slow App")
+		assert.NotContains(t, report.NotReady[0].Reason, "Silent App")
+	})
+}

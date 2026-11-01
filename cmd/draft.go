@@ -2,14 +2,12 @@ package cmd
 
 import (
 	"errors"
-	"os"
 	"strconv"
 
 	"github.com/spf13/cobra"
 
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/draft"
-	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
@@ -136,14 +134,12 @@ func newDraftListCommand(bo *backendOptions) *cobra.Command {
 }
 
 type draftActionOptions struct {
-	Repo     string
-	Pull     int
-	Selector string
+	targetSelector
 	PRNumber int
 }
 
 type draftListOptions struct {
-	Repo string
+	targetSelector
 }
 
 func runDraftMark(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions) error {
@@ -155,36 +151,11 @@ func runDraftReady(cmd *cobra.Command, bo *backendOptions, opts *draftActionOpti
 }
 
 func runDraftAction(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions, markAsDraft bool) error {
-	var err error
-	var selector string
-
-	if opts.PRNumber != 0 {
-		// Use the provided PR number directly
-		selector = strconv.Itoa(opts.PRNumber)
-	} else if opts.Selector != "" {
-		// Use the provided selector
-		selector = opts.Selector
-	} else if opts.Pull != 0 {
-		// Use the --pr flag
-		selector = strconv.Itoa(opts.Pull)
-	} else {
-		return errors.New("pull request number is required")
-	}
-
-	inferPR(selector, &opts.Pull)
-	normalizedSelector, err := resolver.NormalizeSelector(selector, opts.Pull)
+	identity, target, err := resolveDraftTarget(opts)
 	if err != nil {
 		return err
 	}
 
-	inferRepo(&opts.Repo)
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(normalizedSelector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	actor, err := draftActorFor(cmd, bo, target)
 	if err != nil {
 		return err
@@ -198,33 +169,11 @@ func runDraftAction(cmd *cobra.Command, bo *backendOptions, opts *draftActionOpt
 }
 
 func runDraftStatus(cmd *cobra.Command, bo *backendOptions, opts *draftActionOptions) error {
-	var err error
-	var selector string
-
-	if opts.PRNumber != 0 {
-		selector = strconv.Itoa(opts.PRNumber)
-	} else if opts.Selector != "" {
-		selector = opts.Selector
-	} else if opts.Pull != 0 {
-		selector = strconv.Itoa(opts.Pull)
-	} else {
-		return errors.New("pull request number is required")
-	}
-
-	inferPR(selector, &opts.Pull)
-	normalizedSelector, err := resolver.NormalizeSelector(selector, opts.Pull)
+	identity, target, err := resolveDraftTarget(opts)
 	if err != nil {
 		return err
 	}
 
-	inferRepo(&opts.Repo)
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(normalizedSelector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	actor, err := draftActorFor(cmd, bo, target)
 	if err != nil {
 		return err
@@ -237,23 +186,30 @@ func runDraftStatus(cmd *cobra.Command, bo *backendOptions, opts *draftActionOpt
 	return encodeJSON(cmd, result)
 }
 
+// resolveDraftTarget picks the pull request a draft verb acts on. A bare
+// positional number lands in PRNumber rather than Selector, so the precedence
+// is: the positional argument, then --pr, and only then the git context.
+func resolveDraftTarget(opts *draftActionOptions) (resolver.Identity, backend.Target, error) {
+	switch {
+	case opts.PRNumber != 0:
+		opts.Selector = strconv.Itoa(opts.PRNumber)
+	case opts.Selector == "" && opts.Pull != 0:
+		opts.Selector = strconv.Itoa(opts.Pull)
+	case opts.Selector == "":
+		return resolver.Identity{}, backend.Target{}, errors.New("pull request number is required")
+	}
+	return resolveTarget(&opts.targetSelector)
+}
+
 func runDraftList(cmd *cobra.Command, bo *backendOptions, opts *draftListOptions) error {
-	inferRepo(&opts.Repo)
-
-	// Use a dummy selector for list operations
-	selector := "1"
-	normalizedSelector, err := resolver.NormalizeSelector(selector, 1)
+	// Listing needs a repository but no particular pull request, so it
+	// resolves a placeholder number and never uses the resulting target's
+	// number: ListDrafts reads the whole repository.
+	_, target, err := resolveTarget(&targetSelector{Selector: "1", Pull: 1, Repo: opts.Repo})
 	if err != nil {
 		return err
 	}
 
-	hostEnv := os.Getenv("GH_HOST")
-	identity, err := resolver.Resolve(normalizedSelector, opts.Repo, hostEnv)
-	if err != nil {
-		return err
-	}
-
-	target := monitor.TargetOf(identity)
 	actor, err := draftActorFor(cmd, bo, target)
 	if err != nil {
 		return err

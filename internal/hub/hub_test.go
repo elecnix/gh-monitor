@@ -418,7 +418,7 @@ func TestPoller_DegradedRecoveryEmits(t *testing.T) {
 	// The next poll succeeds: a recovery notice must precede (or accompany)
 	// the fresh snapshot.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -450,9 +450,17 @@ recovered:
 // waitDegraded reads updates until a fetch-error degraded broadcast arrives.
 // Notices (broker health, tier shed, recovery) carry Notice text rather than
 // DegradedMessage, so they do not satisfy the wait.
+// asyncDeadline bounds how long a test waits for the poller to deliver.
+// These are asynchronous round trips through a scheduler, so the bound has to
+// survive a loaded CI runner, not measure it: a 2s budget failed on GitHub's
+// runners while passing locally, which tests the machine rather than the
+// behaviour. The assertions below are unchanged — a poller that never declares
+// its degradation still fails, just with enough room to get there.
+const asyncDeadline = 15 * time.Second
+
 func waitDegraded(t *testing.T, ch <-chan backend.Update, msg string) {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -514,6 +522,51 @@ func TestPoller_TierNoticeOnLowBudget(t *testing.T) {
 		"the fetch must run at the shed tier for 2% remaining")
 	assert.Contains(t, got, string(monitor.EventDegraded),
 		"entering a shed tier must broadcast a degraded notice")
+}
+
+// TestSubscribe_FirstDegradedBroadcastReachesItsFirstSubscriber pins the
+// ordering Subscribe owes the subscriber that starts a poller. A poller
+// fetches the moment it runs, and a fetch error is broadcast to whoever is
+// attached when it happens: a poller started before its first subscriber is
+// attached therefore announces that failure to nobody. Nothing replays a
+// degraded notice afterwards — a snapshot is handed over from p.latest, a
+// degraded episode is not — and the error backoff then pushes the next poll
+// minutes out, so the watcher that just attached sees "nothing to report"
+// while it is blind, which is the failure the degraded broadcast exists to
+// prevent. The ordering is the scheduler's to decide, so the test repeats
+// the subscribe rather than trying to provoke a specific interleaving.
+func TestSubscribe_FirstDegradedBroadcastReachesItsFirstSubscriber(t *testing.T) {
+	const attempts = 200
+	missed := 0
+	for i := 0; i < attempts; i++ {
+		h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+			return nil, errors.New("gh api failed: exit status 1")
+		}, nil, time.Hour, nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		deadline := time.After(time.Second)
+	waitFirst:
+		for {
+			select {
+			case u, ok := <-ch:
+				if !ok {
+					t.Fatalf("subscription closed before the first failure was announced (attempt %d)", i)
+				}
+				if u.Event.Type == monitor.EventDegraded && u.Event.DegradedMessage != "" {
+					break waitFirst
+				}
+			case <-deadline:
+				missed++
+				break waitFirst
+			}
+		}
+		cancel()
+		cancelSub()
+		h.Stop()
+	}
+	assert.Zero(t, missed,
+		"%d of %d subscribe-then-degrade cycles left the first subscriber unannounced", missed, attempts)
 }
 
 // TestPoller_FetchErrorNamesBlindSharedSurfaces verifies issue #98: a PR's
@@ -587,7 +640,7 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 	ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
 	t.Cleanup(cancelSub)
 
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -605,11 +658,38 @@ func TestPoller_TierNoticeStatesChecksStayWatched(t *testing.T) {
 	}
 }
 
+// TestRestModeNoticeListsShedSurfacesAsACommaSeparatedList pins how the REST
+// -mode notice renders the shed list. The notice prints the Surfaces value
+// with %s and no explicit join, so the rendering comes from
+// monitor.Surfaces.String — and a reader cannot tell a comma-separated list
+// from Go's slice syntax by looking at the format string.
+//
+// The trap is the []string projection: shed.Names() hands fmt a []string, and
+// fmt prints THAT in slice syntax ("[annotations reviews]"). Passing it here
+// instead of shed would produce the exact defect this test forbids, so the
+// assertion below is what keeps the notice site honest.
+func TestRestModeNoticeListsShedSurfacesAsACommaSeparatedList(t *testing.T) {
+	ev := restModeNotice("elecnix/gh-monitor#158", time.Time{}, time.Time{})
+
+	assert.Contains(t, ev.Notice, "annotations, reviews, review threads, comments",
+		"the notice must list the shed surfaces as a comma-separated list")
+	assert.NotContains(t, ev.Notice, "[annotations",
+		"the notice must not carry Go slice syntax")
+	assert.NotContains(t, ev.Notice, "are not watched]",
+		"the shed list must not end in a closing bracket")
+
+	// The structured field is a []string, so it needs the projection — and it
+	// must not acquire slice syntax either.
+	assert.Equal(t, []string{"annotations", "reviews", "review threads", "comments"},
+		ev.DegradedSurfaces,
+		"the degraded-surfaces field carries the same surfaces, one per entry")
+}
+
 // waitDegradedUpdate is waitDegraded returning the whole update, for tests
 // that need the structured degraded fields rather than just the event type.
 func waitDegradedUpdate(t *testing.T, ch <-chan backend.Update, msg string) backend.Update {
 	t.Helper()
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -658,7 +738,7 @@ func TestPoller_RecoveryDeclaresTheGap(t *testing.T) {
 
 	// The next poll succeeds: the recovery notice must carry the gap window.
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(asyncDeadline)
 	for {
 		select {
 		case u, ok := <-ch:
@@ -856,6 +936,24 @@ func TestPoller_RevertsToNormalCadenceWhenBrokerDegrades(t *testing.T) {
 		"once degraded, nextDelay must fall back within the normal ceiling, not the broker-healthy extended one")
 }
 
+// rateLimitResource is one budget bucket of a GET /rate_limit response.
+type rateLimitResource struct {
+	Limit     int   `json:"limit"`
+	Remaining int   `json:"remaining"`
+	Reset     int64 `json:"reset"`
+}
+
+// rateLimitPayload is the GET /rate_limit response body. The stub builds its
+// own copy of the wire shape rather than borrowing monitor's: the shape is a
+// REST contract, not a cross-package API, and encoding/json unmarshals into
+// monitor's own copy of it however these bytes were produced.
+type rateLimitPayload struct {
+	Resources struct {
+		Core    rateLimitResource `json:"core"`
+		GraphQL rateLimitResource `json:"graphql"`
+	} `json:"resources"`
+}
+
 // rateLimitAPIStub serves GET /rate_limit over REST with the given GraphQL
 // remaining/limit, mirroring the monitor package's test fixture.
 type rateLimitAPIStub struct {
@@ -864,7 +962,7 @@ type rateLimitAPIStub struct {
 }
 
 func (r *rateLimitAPIStub) REST(method, path string, params map[string]string, body interface{}, result interface{}) error {
-	rl := monitor.RateLimitResponse{}
+	rl := rateLimitPayload{}
 	rl.Resources.GraphQL.Remaining = r.remaining
 	rl.Resources.GraphQL.Limit = r.limit
 	rl.Resources.GraphQL.Reset = time.Now().Add(30 * time.Minute).Unix()

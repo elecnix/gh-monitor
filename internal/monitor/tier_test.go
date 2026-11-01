@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 
@@ -10,15 +11,15 @@ import (
 func TestTierSurfaces(t *testing.T) {
 	cases := []struct {
 		tier     QueryTier
-		shed     []string
+		shed     Surfaces
 		comments bool
 		reviews  bool
 		anns     bool
 	}{
 		{TierFull, nil, true, true, true},
-		{TierNoAnnotations, []string{"annotations"}, true, true, false},
-		{TierNoReviews, []string{"annotations", "reviews", "review threads"}, true, false, false},
-		{TierStatus, []string{"annotations", "reviews", "review threads", "comments"}, false, false, false},
+		{TierNoAnnotations, Surfaces{SurfaceAnnotations}, true, true, false},
+		{TierNoReviews, Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads}, true, false, false},
+		{TierStatus, Surfaces{SurfaceAnnotations, SurfaceReviews, SurfaceReviewThreads, SurfaceComments}, false, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.tier.String(), func(t *testing.T) {
@@ -84,6 +85,34 @@ func TestMonitorQuery_Tiers_WellFormed(t *testing.T) {
 	}
 }
 
+// GitHub rejects a query that declares a variable it never uses, so every
+// generated query must declare exactly the variables its body references.
+func TestQueries_DeclareOnlyUsedVariables(t *testing.T) {
+	declared := regexp.MustCompile(`\$(\w+)\s*:`)
+	used := regexp.MustCompile(`\$(\w+)`)
+	names := func(re *regexp.Regexp, s string) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range re.FindAllStringSubmatch(s, -1) {
+			out[m[1]] = true
+		}
+		return out
+	}
+	builders := map[string]func(QueryTier) string{
+		"MonitorQuery":       MonitorQuery,
+		"MonitorRefQuery":    MonitorRefQuery,
+		"MonitorCommitQuery": MonitorCommitQuery,
+	}
+	for name, build := range builders {
+		for _, tier := range []QueryTier{TierFull, TierNoAnnotations, TierNoReviews, TierStatus} {
+			q := build(tier)
+			header, body, _ := strings.Cut(q, "{\n")
+			decl := names(declared, header)
+			refs := names(used, body)
+			assert.Equal(t, refs, decl, "%s/%s: declared variables must equal used variables", name, tier)
+		}
+	}
+}
+
 func TestCarryForwardShed(t *testing.T) {
 	// A shed surface must keep its last-known value: dropping reviews must
 	// not turn APPROVED into a dismissal, dropping annotations must not
@@ -104,27 +133,27 @@ func TestCarryForwardShed(t *testing.T) {
 	})
 
 	t.Run("annotations carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"annotations"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceAnnotations}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, prev.CheckAnnotations, curr.CheckAnnotations, "annotations must be carried forward")
 	})
 
 	t.Run("reviews carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"reviews"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviews}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, "APPROVED", curr.ReviewDecision, "review decision must be carried forward")
 		assert.Equal(t, "alice", curr.ReviewAuthor)
 	})
 
 	t.Run("threads and comments carried", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"review threads", "comments"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviewThreads, SurfaceComments}}
 		CarryForwardShed(prev, curr)
 		assert.Equal(t, prev.UnresolvedThreads, curr.UnresolvedThreads)
 		assert.Equal(t, prev.GeneralComments, curr.GeneralComments)
 	})
 
 	t.Run("nil prev is a no-op", func(t *testing.T) {
-		curr := &PRStatus{State: "OPEN", ShedSurfaces: []string{"reviews"}}
+		curr := &PRStatus{State: "OPEN", ShedSurfaces: Surfaces{SurfaceReviews}}
 		CarryForwardShed(nil, curr)
 		assert.Empty(t, curr.ReviewDecision)
 	})
@@ -140,7 +169,7 @@ func TestCarryForwardShed_PreventsFalseEvents(t *testing.T) {
 		UnresolvedThreads: []ThreadSummary{{ID: "t1"}},
 		FailingChecks:     []string{"ci-build"},
 	}
-	curr := &PRStatus{State: "OPEN", FailingChecks: []string{"ci-build"}, ShedSurfaces: []string{"reviews", "review threads"}}
+	curr := &PRStatus{State: "OPEN", FailingChecks: []string{"ci-build"}, ShedSurfaces: Surfaces{SurfaceReviews, SurfaceReviewThreads}}
 	CarryForwardShed(prev, curr)
 
 	events := Diff(prev, curr)

@@ -17,7 +17,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,15 +34,23 @@ import (
 // surfaces (annotations, reviews, comments) as the shared GraphQL budget runs
 // low, keeping status + check outcomes alive.
 //
-// The concrete payload type depends on the identity's target kind, matching
-// what the monitor.Service fetch for that kind returns:
+// The concrete type depends on the identity's target kind. Most kinds cross
+// this boundary as the wire payload, because their distillation reads the
+// subscriber's snapshot options and so has to happen once per subscriber
+// here rather than once at the fetch:
 //
 //	pr     *monitor.PullRequest
 //	ref    *monitor.RefQueryResponse
 //	commit *monitor.CommitQueryResponse
 //	issue  *monitor.IssueQueryResponse
-//	run    *monitor.WorkflowRun
 //	repo   *monitor.RepoQueryResponse
+//
+// A kind whose distillation reads no snapshot options crosses as the
+// distilled status instead: the fetch is the only holder of the wire
+// payload, so it performs the distillation itself and the hub never learns
+// the payload's type (issue #140). `run` is the first such kind:
+//
+//	run    *monitor.RunStatus
 type FetchFunc func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (any, error)
 
 // RulesetFunc returns the required status checks for a repository. It is called
@@ -321,6 +328,15 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	}
 	p.mu.Unlock()
 
+	// The poller starts only once its first subscriber is attached, never
+	// before: run() fetches at once, so starting it earlier raced that first
+	// fetch against the registration above. A poller broadcasts a fetch error
+	// to whoever is attached when it happens, and nothing replays a degraded
+	// notice afterwards — unlike a snapshot, which Subscribe hands over from
+	// p.latest — so a first fetch that failed with no subscriber attached
+	// degraded silently and stayed silent until the error backoff expired (up
+	// to 300s). That is exactly the blindness the degraded broadcast exists to
+	// announce.
 	if start {
 		go p.run()
 	}
@@ -458,7 +474,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 					Type:             backend.EventDegraded,
 					DegradedSurface:  "graphql",
 					DegradedMessage:  err.Error(),
-					DegradedSurfaces: h.blindSurfaces(keyOf(identity)),
+					DegradedSurfaces: blindSurfaces(keyOf(identity).kind),
 				},
 				At: time.Now(),
 			}
@@ -738,10 +754,11 @@ func newStatusForKind(kind backend.Kind) backend.Status {
 	}
 }
 
-// rawForKind returns a zero-valued raw payload of the kind a fetch for this
-// identity returns, so a handoff-carried snapshot (JSON) can be decoded into
-// the concrete type the poller's traits expect.
-func rawForKind(kind backend.Kind) any {
+// zeroFetched returns a zero value of whatever a fetch for this kind
+// produces: for most kinds the wire payload the hub still receives, for a
+// kind that distils at the source (run) the status itself. A handoff-carried
+// snapshot (JSON) decodes into it.
+func zeroFetched(kind backend.Kind) any {
 	switch kind {
 	case backend.KindRef:
 		return &monitor.RefQueryResponse{}
@@ -749,11 +766,14 @@ func rawForKind(kind backend.Kind) any {
 		return &monitor.CommitQueryResponse{}
 	case backend.KindIssue:
 		return &monitor.IssueQueryResponse{}
-	case backend.KindRun:
-		return &monitor.WorkflowRun{}
 	case backend.KindRepo:
 		return &monitor.RepoQueryResponse{}
-	default:
+	case backend.KindRun:
+		// The run fetch already distilled: what crosses the boundary is the
+		// status, so the same zero value newStatusForKind names serves both
+		// tables (issue #140).
+		return newStatusForKind(kind)
+	default: // backend.KindPR
 		return &monitor.PullRequest{}
 	}
 }
@@ -788,7 +808,10 @@ func traitsFor(kind backend.Kind) kindTraits {
 		}
 	case backend.KindRun:
 		return kindTraits{
-			distill: plainDistill(distillRun),
+			// A run's distillation reads no snapshot options, so the fetch
+			// already did it (issue #140). There is nothing here to derive
+			// per subscriber.
+			distill: snapDistill(alreadyDistilled),
 			consumer: func(h *Hub, ro monitor.RunOptions, _ backend.WatchOptions) consumerHandle {
 				c := monitor.NewRunConsumer(ro)
 				// The failed-run log snippet is fetched through the gh CLI,
@@ -797,7 +820,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 				c.FailedLogDetail = h.failedRunLogDetail(ro.Identity)
 				return newHandle(c, "")
 			},
-			fingerprint: fingerprintRunResp,
+			fingerprint: fingerprintRunStatus,
 		}
 	case backend.KindRepo:
 		return kindTraits{
@@ -850,8 +873,12 @@ func distillIssue(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
 		monitor.SnapshotOptions{IgnoredBots: snapOpts.IgnoredBots})
 }
 
-func distillRun(raw any) backend.Status {
-	return monitor.SnapshotRun(raw.(*monitor.WorkflowRun))
+// alreadyDistilled is the distillation for a kind whose fetch ships the
+// distilled status rather than a wire payload (issue #140): the status is
+// what arrived, and a kind in that position reads no snapshot options, so
+// there is nothing to re-derive per subscriber.
+func alreadyDistilled(fetched any, _ monitor.SnapshotOptions) backend.Status {
+	return fetched.(backend.Status)
 }
 
 func distillPR(raw any, snapOpts monitor.SnapshotOptions) backend.Status {
@@ -914,8 +941,11 @@ func fingerprintIssueResp(raw any) string {
 		monitor.SnapshotOptions{}))
 }
 
-func fingerprintRunResp(raw any) string {
-	return monitor.FingerprintRun(monitor.SnapshotRun(raw.(*monitor.WorkflowRun)))
+// fingerprintRunStatus fingerprints the status the run fetch already
+// distilled — no re-derivation from a payload the hub never receives
+// (issue #140).
+func fingerprintRunStatus(fetched any) string {
+	return monitor.FingerprintRun(fetched.(*monitor.RunStatus))
 }
 
 func fingerprintRepoResp(raw any) string {
@@ -973,35 +1003,47 @@ type poller struct {
 	started bool
 
 	mu          sync.Mutex
-	latest      any               // raw payload of the last successful fetch
+	latest      any               // what the last successful fetch produced: a wire payload, or a status for a kind that distils at the source
 	noChange    int               // consecutive fingerprint-unchanged fetches; drives idle backoff
 	tier        monitor.QueryTier // last fetched tier; drives shed notices
-	degraded    map[string]string // surface -> last emitted error message; drives degraded-episode dedup (issue #66)
 	errBackoff  time.Duration     // consecutive-failure backoff; doubles per failed fetch, resets on success
-	blindFrom   time.Time         // when the current blind window opened: the last successful observation before the first failed fetch (issue #99)
-	lastSuccess time.Time         // when the last successful fetch completed; the honest lower bound for a blind window that opens later
 	restNotice  *monitor.Event    // the mode notice while the poller reads PR state over REST (issue #123); nil in GraphQL mode
 	lastGraphQL time.Time         // when the last successful GraphQL fetch completed; the start of a REST-mode window
 	restFrom    time.Time         // the start of the current REST-mode window: lastGraphQL when REST mode began, zero when unknown
 	subs        map[*sub]struct{}
+
+	// degradation owns what this poller can currently promise its
+	// subscribers: the degraded episodes in flight and the blind window they
+	// leave behind. The poller asks it for a notice and broadcasts whatever
+	// comes back; it never builds one itself.
+	degradation *degradation
 
 	wake  chan struct{}
 	stopc chan struct{}
 	once  sync.Once
 }
 
+// runPollInterval is the base cadence of a workflow-run poller (issue #121).
+// A run is bounded and usually lasts minutes, so the daemon's 300s default
+// would report its completion minutes late.
+const runPollInterval = 60 * time.Second
+
 func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 	key := keyOf(id)
+	if key.kind == backend.KindRun && interval > runPollInterval {
+		interval = runPollInterval
+	}
 	return &poller{
-		hub:      h,
-		identity: id,
-		key:      key,
-		traits:   traitsFor(key.kind),
-		interval: interval,
-		budget:   h.budget,
-		subs:     make(map[*sub]struct{}),
-		wake:     make(chan struct{}, 1),
-		stopc:    make(chan struct{}),
+		hub:         h,
+		identity:    id,
+		key:         key,
+		traits:      traitsFor(key.kind),
+		interval:    interval,
+		budget:      h.budget,
+		degradation: newDegradation(key.kind),
+		subs:        make(map[*sub]struct{}),
+		wake:        make(chan struct{}, 1),
+		stopc:       make(chan struct{}),
 	}
 }
 
@@ -1115,6 +1157,11 @@ func (p *poller) nextDelay() time.Duration {
 		return monitor.Jittered(interval)
 	}
 
+	if p.key.kind == backend.KindRun {
+		// A run ends on its own, so a quiet stretch is not a reason to
+		// back off: the wait that matters is the one before completion.
+		ceiling = interval
+	}
 	d := monitor.Jittered(monitor.IdleIntervalCapped(interval, noChange, ceiling))
 	// A run of consecutive fetch failures backs the cadence off exactly as
 	// the in-process loops did: the error backoff dominates the idle backoff
@@ -1222,25 +1269,10 @@ func (p *poller) fetchOnce() {
 		if err != nil || curr == nil {
 			// Degrade loudly, once per episode: a fetch error must reach
 			// subscribers, never vanish — a silently blind watcher reads as
-			// "all clear". Consecutive identical failures are one episode,
-			// one broadcast (issue #66); a changed error re-notifies, and the
-			// recovery notice goes out on the next successful fetch. The
-			// previous snapshot is retained; no inference replaces it.
-			// Record when the blind window opened: the last successful
-			// observation before the first failure of the episode (issue #99).
-			// time.Now() here would stamp the discovery of the blindness, not
-			// its start — events between the last success and this failure
-			// would fall outside the declared window and the recovery notice
-			// would claim they were observed. When no success has ever been
-			// recorded (first fetch failed, or a handoff resumed with no
-			// observation yet) the window's start is honestly unknowable, so
-			// blindFrom stays zero and the recovery declares no interval at
-			// all rather than a precise-looking lie.
-			p.mu.Lock()
-			if p.blindFrom.IsZero() {
-				p.blindFrom = p.lastSuccess
-			}
-			p.mu.Unlock()
+			// "all clear". The degradation ledger owns the episode dedup, the
+			// blind-window bookkeeping and the notice text; this call site
+			// only names the surface that failed. The previous snapshot is
+			// retained; no inference replaces it.
 			p.reportFailure("graphql", err)
 			return
 		}
@@ -1252,17 +1284,13 @@ func (p *poller) fetchOnce() {
 	p.deliver(curr)
 }
 
-// reportFailure broadcasts a failed fetch of the given API surface as a
-// degraded episode and backs off the cadence.
+// reportFailure hands a failed fetch of the given API surface to the poller's
+// degradation ledger and backs off the cadence. The ledger answers whether
+// this failure is new information; a repeat of the last broadcast for the same
+// surface returns nothing and stays silent.
 func (p *poller) reportFailure(surface string, err error) {
-	msg := fmt.Sprintf("%v", err)
-	if p.enterDegraded(surface, msg) {
-		p.broadcast(monitor.Event{
-			Type:             monitor.EventDegraded,
-			DegradedSurface:  surface,
-			DegradedMessage:  msg,
-			DegradedSurfaces: p.hub.blindSurfaces(p.key),
-		})
+	if ev, announce := p.degradation.fail(surface, err); announce {
+		p.broadcast(ev)
 	}
 	p.mu.Lock()
 	p.errBackoff = monitor.NextErrBackoff(p.errBackoff, p.interval)
@@ -1294,11 +1322,6 @@ func (p *poller) fetchViaREST(ctx context.Context, resetAt time.Time) {
 		if err == nil {
 			err = fmt.Errorf("REST read returned no pull request")
 		}
-		p.mu.Lock()
-		if p.blindFrom.IsZero() {
-			p.blindFrom = p.lastSuccess
-		}
-		p.mu.Unlock()
 		p.reportFailure("rest", fmt.Errorf("GraphQL is rate limited and the REST read failed: %w", err))
 		return
 	}
@@ -1334,7 +1357,7 @@ func restModeNotice(label string, resetAt, from time.Time) monitor.Event {
 	ev := monitor.Event{
 		Type:             monitor.EventDegraded,
 		DegradedSurface:  "graphql",
-		DegradedSurfaces: shed,
+		DegradedSurfaces: shed.Names(),
 	}
 	until := ""
 	if !resetAt.IsZero() {
@@ -1347,7 +1370,7 @@ func restModeNotice(label string, resetAt, from time.Time) monitor.Event {
 		since = " since " + ev.DegradedFrom
 	}
 	ev.Notice = fmt.Sprintf("⚠️ reading PR state over REST because GraphQL is exhausted%s on %s: state, merge, head commit and check outcomes remain watched, and %s are not watched%s until GraphQL answers again. A merge or close read over REST ends the watch without a GraphQL catch-up read, so backfill those surfaces from REST if completeness matters",
-		until, label, strings.Join(shed, ", "), since)
+		until, label, shed, since)
 	return ev
 }
 
@@ -1379,7 +1402,7 @@ func (p *poller) leaveRESTMode(tier monitor.QueryTier) {
 			ev.DegradedFrom, ev.DegradedTo)
 	}
 	if shed := tier.ShedSurfaces(); len(shed) > 0 {
-		msg += fmt.Sprintf(". The GraphQL budget is still low, so %s stay unwatched until it recovers", strings.Join(shed, ", "))
+		msg += fmt.Sprintf(". The GraphQL budget is still low, so %s stay unwatched until it recovers", shed)
 	} else {
 		msg += ". Resuming full monitoring"
 	}
@@ -1401,30 +1424,15 @@ func (p *poller) setTier(tier monitor.QueryTier) {
 	}
 }
 
-// deliver ends any degraded episode, then records curr as the latest payload
-// and sends it to every subscriber.
+// deliver ends any degraded episode, then records curr — what the fetch
+// produced — as the latest observation and sends it to every subscriber.
 func (p *poller) deliver(curr any) {
 	// A successful fetch ends every degraded episode this poller has in
 	// flight: announce the recovery before the fresh snapshot, so a
-	// consumer never reads the outage as ongoing past this point.
-	for _, surface := range p.recoverDegraded() {
-		// Declare the gap (issue #99): the cursor contract never replays — a
-		// cursor advances only on successful fetches — so events missed
-		// during the blind window stay missed, and the recovery notice must
-		// say so instead of reading as an all-clear. From marks the last
-		// successful observation before the failure; To marks recovery.
-		now := time.Now()
-		ev := monitor.Event{
-			Type:   monitor.EventDegraded,
-			Notice: fmt.Sprintf("✅ API recovered (%s) on %s", surface, p.label()),
-		}
-		if blindFrom, ok := p.clearBlindWindow(); !blindFrom.IsZero() && ok {
-			ev.DegradedFrom = blindFrom.UTC().Format(time.RFC3339)
-			ev.DegradedTo = now.UTC().Format(time.RFC3339)
-			ev.Notice = fmt.Sprintf(
-				"✅ API recovered (%s) on %s — events between %s and %s were not observed and will not be replayed; backfill from REST if completeness matters",
-				surface, p.label(), ev.DegradedFrom, ev.DegradedTo)
-		}
+	// consumer never reads the outage as ongoing past this point. The ledger
+	// renders each recovery notice, gap declaration included — absence is not
+	// success, so it must never read as an all-clear (issues #99, #102).
+	for _, ev := range p.degradation.success(p.label(), time.Now()) {
 		p.broadcast(ev)
 	}
 	p.mu.Lock()
@@ -1444,7 +1452,6 @@ func (p *poller) deliver(curr any) {
 		p.noChange++
 	}
 	p.latest = curr
-	p.lastSuccess = time.Now()
 	for s := range p.subs {
 		select {
 		case s.snapshotCh <- curr:
@@ -1452,54 +1459,6 @@ func (p *poller) deliver(curr any) {
 		}
 	}
 	p.mu.Unlock()
-}
-
-// enterDegraded records a degraded observation of the given API surface and
-// reports whether it is new information: the surface just degraded, or it is
-// degraded with a different message than the last broadcast. Consecutive
-// identical failed fetches are one episode, one broadcast (issue #66) — the
-// same transition-noticing semantics the in-process loops use.
-func (p *poller) enterDegraded(surface, msg string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.degraded[surface] == msg {
-		return false
-	}
-	if p.degraded == nil {
-		p.degraded = make(map[string]string)
-	}
-	p.degraded[surface] = msg
-	return true
-}
-
-// recoverDegraded returns the sorted surfaces currently in a degraded episode
-// and clears them — the caller has just fetched successfully again.
-// Deterministic order keeps multi-surface recoveries stable for log diffing.
-func (p *poller) recoverDegraded() []string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.degraded) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(p.degraded))
-	for s := range p.degraded {
-		out = append(out, s)
-	}
-	sort.Strings(out)
-	p.degraded = nil
-	return out
-}
-
-// clearBlindWindow returns and clears the blind-window start recorded by the
-// degraded episode that just recovered. ok is true when a window was open;
-// a false/zero return means the recovery carries no gap declaration (no
-// degraded episode preceded this success).
-func (p *poller) clearBlindWindow() (blindFrom time.Time, ok bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	blindFrom = p.blindFrom
-	p.blindFrom = time.Time{}
-	return blindFrom, !blindFrom.IsZero()
 }
 
 // selectTier returns the fetch tier for the next poll: TierFull when no
@@ -1546,39 +1505,14 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	var msg string
 	if len(shed) > 0 {
 		msg = fmt.Sprintf("⚠️ GraphQL budget low on %s: no longer watching %s until the budget recovers; PR status and check outcomes remain watched",
-			p.label(), strings.Join(shed, ", "))
+			p.label(), shed)
 	} else {
 		msg = fmt.Sprintf("✅ GraphQL budget recovered on %s: resuming full monitoring", p.label())
 	}
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
 }
 
-// blindSurfaces names the watched-surface guarantees a failed fetch of this
-// target's kind stops delivering (issue #98). Surfaces on one query are
-// coupled: a PR's check outcomes, head commit, and mergeability ride the
-// same GraphQL query as its comments and reviews, so a failed PR query
-// suppresses check outcomes even though the tier system never sheds them.
-// Naming only the failed API ("graphql") would let a caller keep trusting
-// CI signals the degraded query can no longer deliver. Ref and commit
-// watches carry check outcomes only; issue/run/repo fetches name what their
-// own query carries, and a backend transport break names nothing because a
-// backend's surfaces are its own to describe.
-func (h *Hub) blindSurfaces(k pollerKey) []string {
-	switch k.kind {
-	case backend.KindPR:
-		return []string{"check outcomes", "head commit", "mergeability"}
-	case backend.KindRef, backend.KindCommit:
-		return []string{"check outcomes"}
-	case backend.KindIssue:
-		return []string{"issue state", "comments"}
-	case backend.KindRun:
-		return []string{"run status"}
-	case backend.KindRepo:
-		return []string{"new PRs and issues"}
-	default:
-		return nil
-	}
-}
+
 
 // broadcast fans a loop-level event out to every subscriber. Sends are
 // non-blocking: a consumer that has not drained its previous notice drops the

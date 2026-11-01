@@ -2,17 +2,15 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/elecnix/gh-monitor/internal/report"
-	"github.com/elecnix/gh-monitor/internal/resolver"
+	"github.com/elecnix/gh-monitor/backend"
 )
 
-func newReviewViewCommand() *cobra.Command {
+func newReviewViewCommand(bo *backendOptions) *cobra.Command {
 	opts := &reviewViewOptions{}
 
 	cmd := &cobra.Command{
@@ -23,12 +21,11 @@ func newReviewViewCommand() *cobra.Command {
 			if len(args) > 0 {
 				opts.Selector = args[0]
 			}
-			return runReviewView(cmd, opts)
+			return runReviewView(cmd, bo, opts)
 		},
 	}
 
-	cmd.Flags().StringVarP(&opts.Repo, "repo", "R", "", "Repository in 'owner/repo' format")
-	cmd.Flags().IntVar(&opts.Pull, "pr", 0, "Pull request number")
+	addTargetFlags(cmd.Flags(), &opts.targetSelector)
 	cmd.Flags().StringVar(&opts.Reviewer, "reviewer", "", "Filter to a specific reviewer (login)")
 	cmd.Flags().StringSliceVar(&opts.States, "states", nil, "Comma-separated review states (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING)")
 	cmd.Flags().BoolVar(&opts.Unresolved, "unresolved", false, "Only include unresolved threads")
@@ -37,14 +34,14 @@ func newReviewViewCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&opts.IncludeCommentNodeID, "include-comment-node-id", false, "Include comment_node_id fields for parent comments and replies")
 	cmd.Flags().StringVar(&opts.Author, "author", "", "Filter threads to those containing a comment by this author login (case-insensitive)")
 	cmd.Flags().BoolVar(&opts.IncludeResolved, "include-resolved", false, "Include resolved threads (overrides --unresolved)")
+	addBackendFlags(cmd, bo)
 
 	return cmd
 }
 
 type reviewViewOptions struct {
-	Repo                 string
-	Pull                 int
-	Selector             string
+	targetSelector
+
 	Reviewer             string
 	States               []string
 	Unresolved           bool
@@ -55,15 +52,9 @@ type reviewViewOptions struct {
 	IncludeResolved      bool
 }
 
-func runReviewView(cmd *cobra.Command, opts *reviewViewOptions) error {
+func runReviewView(cmd *cobra.Command, bo *backendOptions, opts *reviewViewOptions) error {
 	if opts.TailReplies < 0 {
 		return fmt.Errorf("invalid --tail value %d: must be non-negative", opts.TailReplies)
-	}
-
-	inferPR(opts.Selector, &opts.Pull)
-	selector, err := resolver.NormalizeSelector(opts.Selector, opts.Pull)
-	if err != nil {
-		return err
 	}
 
 	states, statesProvided, err := parseStateFilters(opts.States)
@@ -71,14 +62,21 @@ func runReviewView(cmd *cobra.Command, opts *reviewViewOptions) error {
 		return err
 	}
 
-	inferRepo(&opts.Repo)
-	identity, err := resolver.Resolve(selector, opts.Repo, os.Getenv("GH_HOST"))
+	_, target, err := resolveTarget(&opts.targetSelector)
 	if err != nil {
 		return err
 	}
 
-	service := report.NewService(apiClientFactory(identity.Host))
-	output, err := service.Fetch(identity, report.Options{
+	reg, err := actorRegistry(cmd.Context(), bo)
+	if err != nil {
+		return err
+	}
+	actor, _, err := reg.ReportFor(target)
+	if err != nil {
+		return err
+	}
+
+	output, err := actor.ViewReport(cmd.Context(), target, backend.ReportOptions{
 		Reviewer:             strings.TrimSpace(opts.Reviewer),
 		States:               states,
 		StatesProvided:       statesProvided,
@@ -96,17 +94,17 @@ func runReviewView(cmd *cobra.Command, opts *reviewViewOptions) error {
 	return encodeJSON(cmd, output)
 }
 
-func parseStateFilters(raw []string) ([]report.State, bool, error) {
+func parseStateFilters(raw []string) ([]backend.ReportState, bool, error) {
 	if len(raw) == 0 {
 		return nil, false, nil
 	}
 
-	valid := map[string]report.State{
-		"APPROVED":          report.StateApproved,
-		"CHANGES_REQUESTED": report.StateChangesRequested,
-		"COMMENTED":         report.StateCommented,
-		"DISMISSED":         report.StateDismissed,
-		"PENDING":           report.StatePending,
+	valid := map[string]backend.ReportState{
+		"APPROVED":          backend.ReportStateApproved,
+		"CHANGES_REQUESTED": backend.ReportStateChangesRequested,
+		"COMMENTED":         backend.ReportStateCommented,
+		"DISMISSED":         backend.ReportStateDismissed,
+		"PENDING":           backend.ReportStatePending,
 	}
 	allowed := make([]string, 0, len(valid))
 	for key := range valid {
@@ -114,8 +112,8 @@ func parseStateFilters(raw []string) ([]report.State, bool, error) {
 	}
 	sort.Strings(allowed)
 
-	temp := make(map[report.State]struct{})
-	states := make([]report.State, 0, len(raw))
+	temp := make(map[backend.ReportState]struct{})
+	states := make([]backend.ReportState, 0, len(raw))
 	for _, entry := range raw {
 		parts := strings.Split(entry, ",")
 		for _, part := range parts {

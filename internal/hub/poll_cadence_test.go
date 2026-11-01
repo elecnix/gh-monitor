@@ -306,3 +306,49 @@ func TestPoller_ExtendedIdleCapIsScopedToCoveredRepositories(t *testing.T) {
 	assert.LessOrEqual(t, pOther.nextDelay(), 2*monitor.MaxIdleInterval,
 		"an uncovered repository must keep the normal ceiling — no wake path will shorten its blind window")
 }
+
+// TestPoller_RunWatchPollsAtMostEveryMinute pins issue #121: a workflow run
+// is bounded and usually lasts minutes, so its poller must not inherit the
+// daemon's 300s default cadence, and must not back off while the run is
+// quiet. A run that finishes between two polls would otherwise be reported
+// up to five minutes late.
+func TestPoller_RunWatchPollsAtMostEveryMinute(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return runFixture("in_progress", ""), nil
+	}, nil, 300*time.Second, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.Subscribe(ctx, targetOf(backend.KindRun), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 50*time.Millisecond)
+
+	p := pollerOf(h)
+	require.NotNil(t, p)
+	p.mu.Lock()
+	p.noChange = 20 // a long quiet stretch must not stretch the wait
+	p.mu.Unlock()
+
+	assert.LessOrEqual(t, p.nextDelay(), 75*time.Second,
+		"a run watch polls about once a minute (60s plus jitter), however quiet the run")
+}
+
+// TestPoller_RunWatchHonoursShorterInterval keeps an operator's explicit
+// short interval: the run cadence only lowers the base, never raises it.
+func TestPoller_RunWatchHonoursShorterInterval(t *testing.T) {
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		return runFixture("in_progress", ""), nil
+	}, nil, 10*time.Second, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	ch, cancelSub := h.Subscribe(ctx, targetOf(backend.KindRun), testHubOpts())
+	t.Cleanup(cancelSub)
+	_ = collect(ch, 50*time.Millisecond)
+
+	p := pollerOf(h)
+	require.NotNil(t, p)
+	assert.LessOrEqual(t, p.nextDelay(), 15*time.Second)
+}

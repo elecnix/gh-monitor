@@ -13,12 +13,6 @@ import (
 	"github.com/elecnix/gh-monitor/internal/resolver"
 )
 
-// firstPollType and allClearType are loop-level notification kinds that are not
-// Diff events but do have templates in prefs.
-const (
-	firstPollType = "first-poll"
-)
-
 // maxIdleInterval caps the adaptive idle backoff, and maxErrBackoff caps the
 // transient-error backoff. Both mirror pi-ghpr-monitor's 5-minute ceilings.
 // MaxIdleInterval is exported so the shared poller daemon can cap its
@@ -236,36 +230,22 @@ func ciAllGreen(s *PRStatus) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Ref / commit target
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// Issue target
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-// IdleInterval returns the poll interval given the number of consecutive
+// IdleIntervalCapped returns the poll interval given the number of consecutive
 // no-change polls: base until 3 no-change polls, then base*2^(n-3) capped at
-// maxIdleInterval. It is exported so the shared poller daemon can back its
-// per-target cadence off a single shared formula.
-func IdleInterval(base time.Duration, noChange int) time.Duration {
-	return IdleIntervalCapped(base, noChange, maxIdleInterval)
-}
-
-// IdleIntervalCapped is IdleInterval with a caller-supplied ceiling instead
-// of the fixed MaxIdleInterval. It exists for the daemon's optional broker
-// transport (see internal/hub and internal/broker): while that transport
-// reports healthy, a poller's idle backoff is allowed to grow well past the
-// normal 300s ceiling, because a real change now arrives as an immediate
-// wake instead of waiting for the next tick — polling becomes a rare safety
-// net, not the primary path. cap <= 0 is treated as "no ceiling" (the
-// backoff still starts at base and only grows, so this is never used to
-// stop polling altogether).
+// cap. This is the single idle-backoff formula the shared poller daemon uses
+// for every target, and cap is what lets the broker-covered ceiling differ
+// from the default MaxIdleInterval ceiling: while the broker transport reports
+// healthy, a poller's idle backoff may grow well past the normal 300s, because
+// a real change now arrives as an immediate wake instead of waiting for the
+// next tick — polling becomes a rare safety net, not the primary path.
+// cap <= 0 means the cap itself imposes no ceiling: the backoff still starts
+// at base and only grows, so this is never used to stop polling altogether.
+// Growth is not literally unbounded, though — the shift saturates at 20, so
+// the interval tops out at base<<20 rather than running forever. The result
+// is never below base either, so a cap smaller than base has no effect.
 func IdleIntervalCapped(base time.Duration, noChange int, cap time.Duration) time.Duration {
 	d := base
 	if noChange >= 3 {
@@ -492,6 +472,7 @@ func buildVarsRef(id resolver.Identity, status *RefStatus, ev Event, interval ti
 		"prLabel":     label,
 		"prUrl":       refURL,
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
@@ -550,6 +531,7 @@ func buildVarsIssue(id resolver.Identity, status *IssueStatus, ev Event, interva
 		"prLabel":     fmt.Sprintf("%s/%s#%d", id.Owner, id.Repo, id.Number),
 		"prUrl":       fmt.Sprintf("https://%s/%s/%s/issues/%d", host, id.Owner, id.Repo, id.Number),
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
@@ -584,10 +566,6 @@ func setCommitVars(vars map[string]string, host string, id resolver.Identity, c 
 		vars["commitUrl"] = fmt.Sprintf("https://%s/%s/%s/commit/%s", host, id.Owner, id.Repo, c.Oid)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Workflow-run target
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Workflow-run notification rendering
@@ -657,15 +635,6 @@ func buildVarsRun(id resolver.Identity, status *RunStatus, ev Event, interval ti
 	return vars
 }
 
-// ---------------------------------------------------------------------------
-// Repo target (watch a repository for new PRs and issues)
-// ---------------------------------------------------------------------------
-
-
-//
-// When opts.Instance is set, the loop uses the per-instance cursor to filter
-// out items it has already seen across restarts. The cursor is advanced after
-// each poll via opts.AdvanceCursor.
 // ---------------------------------------------------------------------------
 // Cursor-aware repo filtering (issue #32)
 // ---------------------------------------------------------------------------
@@ -757,6 +726,7 @@ func buildVarsRepo(id resolver.Identity, status *RepoStatus, ev Event, interval 
 		"prLabel":     fmt.Sprintf("%s/%s", id.Owner, id.Repo),
 		"prUrl":       fmt.Sprintf("https://%s/%s/%s", host, id.Owner, id.Repo),
 		"intervalSec": strconv.Itoa(int(interval.Seconds())),
+		"pollMode":    pollMode(ev, interval),
 	}
 
 	if status != nil {
