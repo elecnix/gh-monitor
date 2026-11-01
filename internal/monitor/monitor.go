@@ -778,6 +778,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 	// degrades loudly via RulesetError rather than assuming nothing is required.
 	var requiredChecks []string
 	rulesetErr := ""
+
 	if opts.RulesetChecks != nil {
 		rulesetErr = opts.RulesetChecks.Error
 		if rulesetErr == "" {
