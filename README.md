@@ -684,6 +684,13 @@ gh monitor prefs set '{"eventLog": {"dir": "/var/log/gh-monitor", "keepDays": 30
 
 Both fields are optional: `dir` defaults to the user cache dir's `gh-monitor/events`, and `keepDays` defaults to 10. Rotation is a filename change (`events-YYYY-MM-DD.jsonl`), never a rewrite — a new day means a new file, and files older than the retention window are pruned when the day rolls over. It is off by default; a write failure disables logging for that watch with one loud line and never interrupts watching.
 
+Each logged update carries the serving path that produced it in a `source` field: `hub` for an update the shared poller delivered, or the sub-daemon's name for one a sub-daemon delivered ([#122](https://github.com/elecnix/gh-monitor/issues/122)). The two cost very differently — a hub-served update was paid for with an API poll, a sub-daemon-served one arrived through a webhook — so the log says which one it was.
+
+The daemon writes its own activity into the same log, so the polling itself is visible rather than inferred:
+
+- `{"kind":"hub-fetch", ...}` — one hub fetch: the target, the `tier` it was read at, and `changed`, whether the read found anything different. A poll that changes nothing delivers no update, so only the hub can say that it looked and found nothing.
+- `{"kind":"hub-failover", ...}` — a watch that fell back from a sub-daemon to the hub: the target, the sub-daemon it came from (`from`), and why. The fallback is not free — the sub-daemon served the watch at no API cost, and the hub takes over with a poll.
+
 ### Checking which build is running
 
 After an upgrade, ask the binary itself:
