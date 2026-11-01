@@ -405,3 +405,71 @@ func TestMonitorUntilExitsAtTheEndOfTheTriggeringBatch(t *testing.T) {
 	require.Equal(t, []string{"new-failing-checks", "new-unresolved-threads", "check-annotations"},
 		notificationTypes(t, stdout.String()))
 }
+
+// untilAnyUpdates is a stream whose first event is new-failing-checks and
+// whose second is merged, each in a batch of its own.
+func untilAnyUpdates() []backend.Update {
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	return []backend.Update{
+		{Event: backend.Event{Type: backend.EventNewFailingChecks, Checks: []string{"build"}}, At: at},
+		{Event: backend.Event{Type: backend.EventMerged}, At: at, Terminal: true},
+	}
+}
+
+func runUntilAny(t *testing.T, updates []backend.Update, args ...string) (string, error) {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	endpoint := serveTestBackend(t, remote.ServerConfig{
+		Name:   "relay",
+		Kinds:  []backend.Kind{backend.KindPR},
+		Source: &staticSource{updates: updates},
+	})
+	t.Setenv(backendEndpointEnv, endpoint)
+	originalFactory := apiClientFactory
+	t.Cleanup(func() { apiClientFactory = originalFactory })
+	apiClientFactory = func(string) ghcli.API { return &commandFakeAPI{} }
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs(append([]string{"7", "-R", "o/r"}, args...))
+	err := root.Execute()
+	return stdout.String(), err
+}
+
+// TestMonitorUntilAnyExitsOnTheFirstEventOfAnyKind: `any` is the whole
+// spelling of "wake me on anything".
+func TestMonitorUntilAnyExitsOnTheFirstEventOfAnyKind(t *testing.T) {
+	for _, spelling := range []string{"any", "any-event", "ANY"} {
+		t.Run(spelling, func(t *testing.T) {
+			out, err := runUntilAny(t, untilAnyUpdates(), "--until", spelling)
+			require.NoError(t, err)
+			require.Equal(t, []string{"new-failing-checks"}, notificationTypes(t, out))
+		})
+	}
+}
+
+// TestMonitorUntilAnyCombinesWithOtherValues: `any` next to a named kind
+// changes nothing; the first event still wakes the watch.
+func TestMonitorUntilAnyCombinesWithOtherValues(t *testing.T) {
+	out, err := runUntilAny(t, untilAnyUpdates(), "--until", "merged,any")
+	require.NoError(t, err)
+	require.Equal(t, []string{"new-failing-checks"}, notificationTypes(t, out))
+}
+
+// TestMonitorUntilAnyIgnoresEventsTheEventsFilterDrops: an event that
+// --events suppresses does not count, so --until any waits for the next one.
+func TestMonitorUntilAnyIgnoresEventsTheEventsFilterDrops(t *testing.T) {
+	out, err := runUntilAny(t, untilAnyUpdates(), "--until", "any", "--events", "merged")
+	require.NoError(t, err)
+	require.Equal(t, []string{"merged"}, notificationTypes(t, out))
+}
+
+// TestMonitorUntilAnyNotMetWhenTheWatchEndsFirst: the exit-2 contract is the
+// same as for a list.
+func TestMonitorUntilAnyNotMetWhenTheWatchEndsFirst(t *testing.T) {
+	_, err := runUntilAny(t, untilAnyUpdates(), "--until", "any", "--events", "conflict")
+	require.ErrorIs(t, err, errUntilNotMet)
+}

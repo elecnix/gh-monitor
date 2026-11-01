@@ -198,15 +198,15 @@ func actionsRun(name string, suiteID int64) map[string]any {
 		"check_suite": map[string]any{"id": suiteID}}
 }
 
-// TestFetchPRViaREST_RunlessSuitesKeepCIFromReadingGreen reproduces the
-// review of #124, measured on the PR's own head: two third-party suites are
-// queued and have no check runs, beside green GitHub Actions suites. The
-// check-runs endpoint cannot list them, so a REST read built only from runs
-// reported CI green and Diff emitted a false ci-all-green.
-func TestFetchPRViaREST_RunlessSuitesKeepCIFromReadingGreen(t *testing.T) {
+// TestFetchPRViaREST_RunlessQueuedSuitesAreNotPending: two third-party suites
+// are queued and have no check runs, beside green GitHub Actions suites. An
+// App that never posts a run leaves its suite queued forever, so such a suite
+// carries no verdict and must not hold CI out of green (see #203). The
+// check-suites endpoint still lists them, so a REST read matches GraphQL.
+func TestFetchPRViaREST_RunlessQueuedSuitesAreNotPending(t *testing.T) {
 	api := checksAPI(t, []map[string]any{
-		suite(1, "sonatype-lift", "sonatype-lift", "queued", nil),
-		suite(2, "Claude", "claude", "queued", nil),
+		suite(1, "silent-app", "silent-app", "queued", nil),
+		suite(2, "Quiet", "quiet", "queued", nil),
 		suite(3, "GitHub Actions", "github-actions", "completed", "success"),
 		suite(4, "GitHub Actions", "github-actions", "completed", "success"),
 	}, []map[string]any{actionsRun("test", 3), actionsRun("lint", 3), actionsRun("build", 4)}, 3)
@@ -214,12 +214,7 @@ func TestFetchPRViaREST_RunlessSuitesKeepCIFromReadingGreen(t *testing.T) {
 	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
 	require.NoError(t, err)
 	curr := Snapshot(pr, SnapshotOptions{Tier: TierStatus})
-	assert.ElementsMatch(t, []string{"sonatype-lift", "Claude"}, curr.PendingChecks)
-
-	prev := &PRStatus{State: "OPEN", PendingChecks: []string{"sonatype-lift", "Claude"}, LastCommit: curr.LastCommit}
-	for _, ev := range Diff(prev, curr) {
-		assert.NotEqual(t, EventCIAllGreen, ev.Type, "queued suites without runs are not green")
-	}
+	assert.Empty(t, curr.PendingChecks)
 }
 
 // TestFetchPRViaREST_FailingRunlessSuiteFails: a non-container suite that

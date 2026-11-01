@@ -226,7 +226,8 @@ func TestJudgeCI_EveryNonCompletedCheckStatusStateIsPending(t *testing.T) {
 	for _, status := range []string{"IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED", "PENDING", "STARTUP_FAILURE"} {
 		t.Run(status, func(t *testing.T) {
 			v := view([]CheckSuite{
-				{Status: status, Conclusion: "", App: AppInfo{Name: "CI", Slug: "ci-app"}},
+				{Status: status, Conclusion: "", App: AppInfo{Name: "CI", Slug: "ci-app"},
+					CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{{Name: "build", Status: status}}}},
 			}, nil)
 
 			got := JudgeCI(v, CIVerdictOptions{})
@@ -336,7 +337,8 @@ func TestJudgeCI_AnnotationsTruncatedAtThePerStepCap(t *testing.T) {
 func TestHeadCommitViewOfSuites_MatchesThePullRequestAdapter(t *testing.T) {
 	suites := []CheckSuite{
 		checkSuite("CI", "ci-app", "", failingRun("build", ts(0)), greenRun("test", ts(time.Minute))),
-		{Status: "QUEUED", Conclusion: "", App: AppInfo{Name: "Lint", Slug: "lint-app"}},
+		{Status: "QUEUED", Conclusion: "", App: AppInfo{Name: "Lint", Slug: "lint-app"},
+			CheckRuns: RunNodes{TotalCount: 1, Nodes: []CheckRun{{Name: "lint", Status: "QUEUED"}}}},
 	}
 	status := &CommitStatus{Contexts: []StatusContext{{State: "ERROR", Context: "verify"}}}
 

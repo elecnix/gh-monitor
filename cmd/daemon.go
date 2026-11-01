@@ -30,6 +30,7 @@ import (
 	"github.com/elecnix/gh-monitor/internal/monitor"
 	"github.com/elecnix/gh-monitor/internal/mux"
 	"github.com/elecnix/gh-monitor/internal/prefs"
+	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/elecnix/gh-monitor/internal/sdnotify"
 	"github.com/elecnix/gh-monitor/internal/subdaemon"
@@ -852,6 +853,8 @@ func spawnDaemon(socket string, interval time.Duration) error {
 	cmd.Stdin = devnull
 	cmd.Stdout = devnull
 	cmd.Stderr = devnull
+	// A freshly started daemon begins its own re-exec chain.
+	cmd.Env = reexec.ChildEnv()
 	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("spawn daemon: %w", err)

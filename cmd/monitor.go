@@ -41,7 +41,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
 	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
 	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
-	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first)")
+	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds, or 'any' for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first)")
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().StringVar(&opts.AnnotationChecks, "annotation-checks", "", "Comma-separated check names whose annotations to surface (default: every check)")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
@@ -76,6 +76,14 @@ type monitorOptions struct {
 	FromBeginning    bool
 	Viewer           string
 	Backend          backendOptions
+}
+
+// repoOnly reports whether the invocation names a repository and no target.
+// Only then does the monitor show the repo-wide readiness view. A PR number
+// with --repo is a PR watch, so Pull must be zero here too.
+func (o *monitorOptions) repoOnly() bool {
+	return o.Repo != "" && o.Selector == "" && o.Pull == 0 && o.Ref == "" &&
+		o.Commit == "" && o.Issue == 0 && o.RunID == 0
 }
 
 func (o *monitorOptions) Validate() error {
@@ -115,9 +123,7 @@ func (o *monitorOptions) Validate() error {
 	if o.RunID > 0 {
 		targets++
 	}
-	// Repo-only (--repo without any other target) uses the readiness view.
-	repoOnly := o.Repo != "" && o.Selector == "" && o.Pull == 0 && o.Ref == "" && o.Commit == "" && o.Issue == 0 && o.RunID == 0
-	if repoOnly {
+	if o.repoOnly() {
 		return nil
 	}
 	if targets > 1 {
@@ -159,7 +165,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		identity, err = resolver.ResolveIssue(opts.Issue, opts.Repo, os.Getenv("GH_HOST"))
 	} else if opts.RunID > 0 {
 		identity, err = resolver.ResolveRun(opts.RunID, opts.Repo, os.Getenv("GH_HOST"))
-	} else if opts.Repo != "" && opts.Selector == "" && opts.Ref == "" && opts.Commit == "" && opts.Issue == 0 && opts.RunID == 0 {
+	} else if opts.repoOnly() {
 		// Repo-only: use the readiness view instead of the old repo-monitor.
 		return runReadiness(cmd, opts)
 	} else {
@@ -334,6 +340,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// transport serves the watch — the shared-poller daemon, an external
 	// backend, or the in-process --once path.
 	var untilFilter *monitor.EventFilter
+	untilAny := false
 	if strings.TrimSpace(opts.Until) != "" {
 		// --timeout stays a maximum watch time, never a completion condition
 		// (README, and issue #127's fix): a "timeout" member would be a
@@ -343,11 +350,16 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		if strings.Contains(strings.ToLower(opts.Until), "timeout") {
 			return fmt.Errorf("--timeout is a maximum watch time, never a completion condition; %q is not a --until member", opts.Until)
 		}
-		filter, err := monitor.ParseEventFilter(opts.Until)
+		// `any` (or `any-event`) means "the first event of any kind". It is
+		// a keyword of --until only, so it is split off before the rest goes
+		// through the shared kind validation.
+		kinds, any := splitUntilAny(opts.Until)
+		filter, err := monitor.ParseEventFilter(kinds)
 		if err != nil {
 			return err
 		}
 		untilFilter = filter
+		untilAny = any
 	}
 
 	// --annotation-levels: a per-annotation-level filter applied at snapshot
@@ -628,7 +640,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// above, so cursor and log stay correct on the early exit too. The
 		// write failure path is the same as emit()'s: a gone consumer ends
 		// the watch here as well.
-		if untilFilter != nil && untilFilter.Allows(n.Type) {
+		// `any` counts only events the --events filter lets through; a named
+		// member counts even when --events suppressed it.
+		if untilFilter != nil && (untilFilter.Allows(n.Type) || untilAny && (eventFilter == nil || eventFilter.Allows(n.Type))) {
 			if !writeFailed {
 				if write(n) != nil {
 					writeFailed = true
@@ -757,6 +771,21 @@ func writeTimeoutNotice(cmd *cobra.Command, deadline time.Time, timeoutSecs int,
 		Timestamp: deadline,
 	})
 	_ = cmd // cmd is unused today; the writer carries the output stream
+}
+
+// splitUntilAny removes the `any` and `any-event` keywords from a --until
+// value, returning the remaining kinds and whether a keyword was present.
+func splitUntilAny(until string) (kinds string, any bool) {
+	var rest []string
+	for _, raw := range strings.Split(until, ",") {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "any", "any-event":
+			any = true
+		default:
+			rest = append(rest, raw)
+		}
+	}
+	return strings.Join(rest, ","), any
 }
 
 // errUntilNotMet is the sentinel runMonitor returns when a --until watch ends

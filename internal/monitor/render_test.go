@@ -216,3 +216,84 @@ func TestRenderNewCommitNamesCoauthors(t *testing.T) {
 	assert.NotContains(t, n.Message, "co-authored",
 		"a commit with no co-authors must not carry an empty clause")
 }
+
+func TestFirstPollAckSubstitutesPollModeForEveryTargetKind(t *testing.T) {
+	// The default first-poll template is "📡 Monitoring {prLabel} ({pollMode})".
+	// Only the PR vars builder populated {pollMode}, so every other watch kind
+	// rendered the literal token into its first-poll ack — an issue watch read
+	// "📡 Monitoring patty-io/pi-patty-bg-tasks#32 ({pollMode})".
+	// No watch kind may leak an unsubstituted token into that ack.
+	at := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		update backend.Update
+		want   string
+	}{
+		{
+			name: "issue",
+			update: backend.Update{
+				Target: backend.Target{Kind: backend.KindIssue, Owner: "patty-io", Repo: "pi-patty-bg-tasks", Number: 32},
+				Event:  Event{Type: EventFirstPoll},
+				Status: &IssueStatus{State: "OPEN", Title: "t"},
+				At:     at,
+			},
+			want: "📡 Monitoring patty-io/pi-patty-bg-tasks#32 (polling every 60s)",
+		},
+		{
+			name: "ref",
+			update: backend.Update{
+				Target: backend.Target{Kind: backend.KindRef, Owner: "o", Repo: "r", Ref: "main"},
+				Event:  Event{Type: EventFirstPoll},
+				Status: &RefStatus{Oid: "abcdef1234", ShortOid: "abcdef1"},
+				At:     at,
+			},
+			want: "📡 Monitoring o/r@main (polling every 60s)",
+		},
+		{
+			name: "repo",
+			update: backend.Update{
+				Target: backend.Target{Kind: backend.KindRepo, Owner: "o", Repo: "r"},
+				Event:  Event{Type: EventFirstPoll},
+				Status: &RepoStatus{},
+				At:     at,
+			},
+			want: "📡 Monitoring o/r (polling every 60s)",
+		},
+		{
+			name: "pr",
+			update: backend.Update{
+				Target: backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7},
+				Event:  Event{Type: EventFirstPoll},
+				Status: &PRStatus{},
+				At:     at,
+			},
+			want: "📡 Monitoring o/r#7 (polling every 60s)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := Render(tc.update, prefs.DefaultPreferences(), time.Minute)
+			assert.Equal(t, "first-poll", n.Type)
+			assert.NotContains(t, n.Message, "{pollMode}",
+				"the ack must not leak an unsubstituted template token")
+			assert.Equal(t, tc.want, n.Message)
+		})
+	}
+}
+
+func TestFirstPollAckForAnIssueQuotesTheRoutedPollMode(t *testing.T) {
+	// A daemon-served watch reports how it is actually served (route.go's
+	// PollMode); the issue ack must quote that mode, not the client interval.
+	// This is the value the literal {pollMode} stood in for.
+	u := backend.Update{
+		Target: backend.Target{Kind: backend.KindIssue, Owner: "o", Repo: "r", Number: 5},
+		Event: Event{
+			Type:     EventFirstPoll,
+			PollMode: "webhook via broker-subscriber, safety check every 30m",
+		},
+		Status: &IssueStatus{State: "OPEN"},
+		At:     time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC),
+	}
+	n := Render(u, prefs.DefaultPreferences(), time.Minute)
+	assert.Equal(t, "📡 Monitoring o/r#5 (webhook via broker-subscriber, safety check every 30m)", n.Message)
+}

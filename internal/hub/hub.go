@@ -1087,8 +1087,16 @@ type poller struct {
 	once  sync.Once
 }
 
+// runPollInterval is the base cadence of a workflow-run poller (issue #121).
+// A run is bounded and usually lasts minutes, so the daemon's 300s default
+// would report its completion minutes late.
+const runPollInterval = 60 * time.Second
+
 func newPoller(h *Hub, id resolver.Identity, interval time.Duration) *poller {
 	key := keyOf(id)
+	if key.kind == backend.KindRun && interval > runPollInterval {
+		interval = runPollInterval
+	}
 	return &poller{
 		hub:         h,
 		identity:    id,
@@ -1213,6 +1221,11 @@ func (p *poller) nextDelay() time.Duration {
 		return monitor.Jittered(interval)
 	}
 
+	if p.key.kind == backend.KindRun {
+		// A run ends on its own, so a quiet stretch is not a reason to
+		// back off: the wait that matters is the one before completion.
+		ceiling = interval
+	}
 	d := monitor.Jittered(monitor.IdleIntervalCapped(interval, noChange, ceiling))
 	// A run of consecutive fetch failures backs the cadence off exactly as
 	// the in-process loops did: the error backoff dominates the idle backoff

@@ -117,6 +117,8 @@ func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec
 	cmd := exec.Command(installed, "daemon", "--socket", socket, "--interval", strconv.Itoa(int(interval.Seconds())))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// A successor starts its own re-exec chain; it does not continue this one.
+	cmd.Env = reexec.ChildEnv()
 	return cmd
 }
 

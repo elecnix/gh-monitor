@@ -221,7 +221,7 @@ The `owner/repo#number` shorthand is the same cross-reference form GitHub's own 
 - `--timeout <seconds>` - Maximum watch time (default: 0 = until merged/closed)
 - `--ignored-bots <a,b>` - Author logins whose general comments are ignored
 - `--events <kind,kind>` (alias `--only-events`) - Allowlist of event kinds to emit; suppresses every other kind. Omit to emit everything (the default). Unknown kinds are rejected so a typo fails loudly instead of silently muting what you wanted.
-- `--until <kind,kind>` - Comma-separated event kinds; exit 0 the first time any of them fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
+- `--until <kind,kind>` - Comma-separated event kinds, or `any` for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
 - `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
 - `--annotation-checks <check,check>` - Check names whose annotations to surface. Default: every check. Case-insensitive, matched on the whole check name. `none` drops all annotation events. The flag overrides the `annotationChecks` preference.
 - `--once` - Fetch once, emit the current actionable state, and exit
@@ -291,7 +291,12 @@ gh monitor -R owner/repo 42 --until ci-all-green,new-failing-checks --timeout 18
 
 # Exit the moment the PR merges:
 gh monitor -R owner/repo 42 --until merged
+
+# Wake on anything at all, including kinds added in later releases:
+gh monitor -R owner/repo 42 --until any
 ```
+
+The keyword `any` (alias `any-event`) means "the first event of any kind", so the caller needs no hand-written kind list that goes stale. It combines with named kinds without harm. Unlike a named member, `any` counts only events that `--events` lets through, so `--events` and `--until any` compose: `--events merged,closed --until any` wakes on the first merge or close.
 
 The exit code carries the answer: **0** means the condition was met (the triggering event was reported, then the watch exited), and **2** means the watch ended without the condition firing — the `--timeout` deadline passed or the target stream closed. A deadline that passed while the watch was still open ends with a `timeout` line saying so (see [The timeout is a hard deadline](#the-timeout-is-a-hard-deadline)). `--timeout` stays a maximum watch time, never a completion condition. A Ctrl-C is still just a cancel and exits 0. With `--once`, the single snapshot is the whole watch: exit 0 if a set member is present in that snapshot, else 2.
 
@@ -365,7 +370,7 @@ gh monitor --run-id 30433642 -R owner/repo --once
 gh monitor --run-id 30433642 -R owner/repo --text
 ```
 
-The `run-completed` event carries the run's `conclusion` (`success`, `failure`, `timed_out`, `cancelled`, `neutral`, `action_required`, `stale`, `skipped`) as structured JSON, plus `run_id`, the run URL, and the head commit. When the conclusion is a failure variant (`failure`, `timed_out`, `cancelled`, `action_required`), the event also carries a `detail` body holding the **last** 50 lines of the failed-job logs (`gh run view <run-id> --log-failed` puts the error at the end), so an agent can diagnose the failure without an extra turn. A longer log is truncated explicitly: the body's first line says how many earlier lines were dropped and names the exact command that fetches the whole failed-step log — `gh run view <run-id> --repo <owner>/<repo> --log-failed` — so nothing about the failure is out of reach. The same `--interval`, `--timeout`, `--once`, `--text`, and `-R` flags apply. `--run-id` is mutually exclusive with the PR selector and `--ref`/`--commit`/`--issue`.
+The `run-completed` event carries the run's `conclusion` (`success`, `failure`, `timed_out`, `cancelled`, `neutral`, `action_required`, `stale`, `skipped`) as structured JSON, plus `run_id`, the run URL, and the head commit. When the conclusion is a failure variant (`failure`, `timed_out`, `cancelled`, `action_required`), the event also carries a `detail` body holding the **last** 50 lines of the failed-job logs (`gh run view <run-id> --log-failed` puts the error at the end), so an agent can diagnose the failure without an extra turn. A longer log is truncated explicitly: the body's first line says how many earlier lines were dropped and names the exact command that fetches the whole failed-step log — `gh run view <run-id> --repo <owner>/<repo> --log-failed` — so nothing about the failure is out of reach. A run watch polls about once a minute and does not back off while the run is quiet; a shorter `--interval` lowers that. The same `--interval`, `--timeout`, `--once`, `--text`, and `-R` flags apply. `--run-id` is mutually exclusive with the PR selector and `--ref`/`--commit`/`--issue`.
 
 ### Monitoring a repository (merge-readiness view)
 
