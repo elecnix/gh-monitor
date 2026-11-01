@@ -810,3 +810,39 @@ func TestMonitorEventsRejectsUnknownKind(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not-a-real-kind")
 }
+
+// TestMonitorPRWithRepoFlagWatchesPR is the regression test for `--repo X --pr N`
+// routing to the repo-wide readiness view. A PR selector with --repo must
+// watch that PR, never run the MonitorReadiness query.
+func TestMonitorPRWithRepoFlagWatchesPR(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	originalFactory := apiClientFactory
+	defer func() { apiClientFactory = originalFactory }()
+
+	fake := &commandFakeAPI{graphqlFunc: func(query string, variables map[string]interface{}, result interface{}) error {
+		if strings.Contains(query, "MonitorReadiness") {
+			t.Fatal("--repo with --pr must not run the repo readiness query")
+		}
+		require.Contains(t, query, "MonitorPR")
+		return assignJSON(result, openPRWithFailingCheck())
+	}}
+	apiClientFactory = func(string) ghcli.API { return fake }
+
+	root := newRootCommand()
+	stdout := &bytes.Buffer{}
+	root.SetOut(stdout)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"--pr", "7", "-R", "o/r", "--once"})
+	require.NoError(t, root.Execute())
+
+	var labels []string
+	for _, ln := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var n map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(ln), &n), "line not valid json: %s", ln)
+		if l, ok := n["pr_label"].(string); ok {
+			labels = append(labels, l)
+		}
+	}
+	assert.Contains(t, labels, "o/r#7")
+}
