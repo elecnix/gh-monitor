@@ -60,14 +60,25 @@ const DefaultEventLogKeepDays = 10
 // delivers a notification about (review threads, general PR comments, issue
 // comments), so humans on the PR see the notification was received. It is
 // client-side evidence of delivery, not of action.
+//
+// AnnotationChecks (default empty) is a per-check-name allowlist for
+// check-run annotations: only annotations from the named checks are reported
+// (issue #110). An empty list means every check, so the default reports
+// everything. It is the same shape as IgnoredBots, and it is what makes the
+// check-annotations event usable as a wake trigger: a PR that carries the
+// same deprecation warning from six workflow jobs no longer wakes a consumer
+// that only cares about one check's findings.
 type Preferences struct {
-	Templates             map[string]string `json:"templates"`
-	IgnoredBots           []string          `json:"ignoredBots"`
-	RetriggerComments     bool              `json:"retriggerComments"`
-	SelfUpdate            string            `json:"selfUpdate,omitempty"`
-	PollInterval          string            `json:"pollInterval,omitempty"`
-	IdlePollCeiling       string            `json:"idlePollCeiling,omitempty"`
-	PollWhenBrokerHealthy bool              `json:"pollWhenBrokerHealthy"`
+	Templates   map[string]string `json:"templates"`
+	IgnoredBots []string          `json:"ignoredBots"`
+	// AnnotationChecks names the checks whose annotations are reported.
+	// Empty means every check.
+	AnnotationChecks      []string `json:"annotationChecks"`
+	RetriggerComments     bool     `json:"retriggerComments"`
+	SelfUpdate            string   `json:"selfUpdate,omitempty"`
+	PollInterval          string   `json:"pollInterval,omitempty"`
+	IdlePollCeiling       string   `json:"idlePollCeiling,omitempty"`
+	PollWhenBrokerHealthy bool     `json:"pollWhenBrokerHealthy"`
 	// CoveredSafetyInterval is how long a repository a sub-daemon covers may
 	// go without an event before the daemon fetches an active watch on it
 	// once. Unset means DefaultCoveredSafetyInterval; "0" or "false" turns
@@ -150,6 +161,7 @@ func DefaultPreferences() Preferences {
 	return Preferences{
 		Templates:             templates,
 		IgnoredBots:           []string{},
+		AnnotationChecks:      []string{},
 		RetriggerComments:     false,
 		SelfUpdate:            "",
 		PollInterval:          "",
@@ -570,6 +582,7 @@ func legacyPath(baseDir string) (string, error) {
 type storedPreferences struct {
 	Templates             map[string]*string `json:"templates"`
 	IgnoredBots           []string           `json:"ignoredBots"`
+	AnnotationChecks      []string           `json:"annotationChecks"`
 	RetriggerComments     *bool              `json:"retriggerComments,omitempty"`
 	SelfUpdate            *string            `json:"selfUpdate,omitempty"`
 	PollInterval          *string            `json:"pollInterval,omitempty"`

@@ -177,6 +177,12 @@ type RunOptions struct {
 	// and the daemon parses its own from WatchOptions.
 	AnnotationLevels *AnnotationLevels
 
+	// AnnotationChecks controls which check runs' annotations are included
+	// in a PR snapshot's annotations. A nil value includes every check; a
+	// non-nil filter keeps only the check names it allows. It is read
+	// configuration, like AnnotationLevels.
+	AnnotationChecks *AnnotationChecks
+
 	// Now is injectable for tests. It defaults to time.Now.
 	Now func() time.Time
 

@@ -93,6 +93,46 @@ func TestUpdateFileSetsIgnoredBotsReplacing(t *testing.T) {
 	assert.Equal(t, []string{}, eff.IgnoredBots)
 }
 
+// TestUpdateFileSetsAnnotationChecks covers the annotationChecks key: the
+// allowlist of checks whose check-run annotations are reported (issue #110).
+func TestUpdateFileSetsAnnotationChecks(t *testing.T) {
+	base := t.TempDir()
+
+	// Absent: every check (the default).
+	eff, err := UpdateFile(base, []byte(`{}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+
+	// A list replaces the stored list.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta"]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta"}, eff.AnnotationChecks)
+
+	// Persisted to the file, and visible to a fresh Load — the stored list
+	// is what the next invocation reads.
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta"}, got.AnnotationChecks)
+
+	// A second set replaces the value.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta","lint"]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"dupdelta", "lint"}, eff.AnnotationChecks)
+
+	// An empty array clears the list, which means "every check".
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":[]}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+
+	// null also clears it.
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":["dupdelta"]}`))
+	require.NoError(t, err)
+	require.Equal(t, []string{"dupdelta"}, eff.AnnotationChecks)
+	eff, err = UpdateFile(base, []byte(`{"annotationChecks":null}`))
+	require.NoError(t, err)
+	assert.Equal(t, []string{}, eff.AnnotationChecks)
+}
+
 func TestUpdateFileSetsRetriggerComments(t *testing.T) {
 	base := t.TempDir()
 	eff, err := UpdateFile(base, []byte(`{"retriggerComments":true}`))
@@ -221,15 +261,39 @@ func TestUpdateFileSetsEventLog(t *testing.T) {
 	assert.NotContains(t, stored, "eventLog")
 }
 
-func TestUpdateFileRejectsInvalidEventLog(t *testing.T) {
-	base := t.TempDir()
-	_, err := UpdateFile(base, []byte(`{"eventLog":{"keepDays":-1}}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "keepDays")
+// TestUpdateFileRejectsInvalidValues confirms a malformed value is rejected
+// at set time, for every key whose grammar has one.
+//
+// A rejected value is worth failing on rather than storing: an operator who
+// typed a bad value should learn about it immediately, not discover days
+// later that the setting never took effect. A blank check name would never
+// match a check, so accepting it would narrow the allowlist to nothing
+// while looking configured.
+func TestUpdateFileRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		wantMsg string
+	}{
+		{"a negative keepDays", `{"eventLog":{"keepDays":-1}}`, "keepDays"},
+		{"an eventLog that is not an object", `{"eventLog":"on"}`, "eventLog"},
+		{"an unparseable selfUpdate duration", `{"selfUpdate":"banana"}`, "selfUpdate"},
+		{"a selfUpdate that is not a string", `{"selfUpdate":true}`, "selfUpdate"},
+		{"a blank annotation check name", `{"annotationChecks":["dupdelta","  "]}`, "annotationChecks"},
+		{"an annotationChecks that is not a list", `{"annotationChecks":"dupdelta"}`, "annotationChecks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			_, err := UpdateFile(base, []byte(tc.payload))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantMsg)
 
-	// A bare string is not the object shape.
-	_, err = UpdateFile(base, []byte(`{"eventLog":"on"}`))
-	require.Error(t, err)
+			// Nothing was written by the failed attempt.
+			_, statErr := os.Stat(mustPath(t, base))
+			assert.True(t, os.IsNotExist(statErr))
+		})
+	}
 }
 
 func TestUpdateFileSetsSelfUpdate(t *testing.T) {
@@ -261,23 +325,6 @@ func TestUpdateFileNullResetsSelfUpdate(t *testing.T) {
 	// The key is removed from the file so the built-in default (off) applies.
 	stored := readStoredFile(t, base)
 	assert.NotContains(t, stored, "selfUpdate")
-}
-
-func TestUpdateFileRejectsInvalidSelfUpdate(t *testing.T) {
-	base := t.TempDir()
-	// Unparseable durations are rejected at set time — the operator notices
-	// the typo immediately instead of a daemon that silently never updates.
-	_, err := UpdateFile(base, []byte(`{"selfUpdate":"banana"}`))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "selfUpdate")
-
-	// A JSON bool is not the string grammar; reject it too.
-	_, err = UpdateFile(base, []byte(`{"selfUpdate":true}`))
-	require.Error(t, err)
-
-	// Nothing was written by either failed attempt.
-	_, statErr := os.Stat(mustPath(t, base))
-	assert.True(t, os.IsNotExist(statErr))
 }
 
 func mustPath(t *testing.T, base string) string {
