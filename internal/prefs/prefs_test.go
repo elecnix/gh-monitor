@@ -73,6 +73,170 @@ func TestInterpolateDefaultTemplate(t *testing.T) {
 	assert.Contains(t, got, "octocat")
 }
 
+// TestInterpolateOptionalSegment pins the optional-segment syntax: a clause
+// wrapped in [[…]] is dropped when every token in it renders empty, and kept
+// otherwise. This is what lets the built-in new-commit message name the
+// co-authors without ever saying "co-authored by " (issue #179).
+func TestInterpolateOptionalSegment(t *testing.T) {
+	tests := []struct {
+		name     string
+		template string
+		vars     map[string]string
+		expected string
+	}{
+		{
+			name:     "segment kept when its token has a value",
+			template: "a[[ by {commitAuthor}]]b",
+			vars:     map[string]string{"commitAuthor": "alice"},
+			expected: "a by aliceb",
+		},
+		{
+			name:     "segment dropped when its token is empty",
+			template: "a[[ by {commitAuthor}]]b",
+			vars:     map[string]string{"commitAuthor": ""},
+			expected: "ab",
+		},
+		{
+			name:     "segment dropped when its token is absent",
+			template: "a[[ by {commitAuthor}]]b",
+			vars:     map[string]string{},
+			expected: "ab",
+		},
+		{
+			name:     "segment kept when one of its tokens has a value",
+			template: "a[[ {commitAuthor} and {commitCoauthors} ]]b",
+			vars:     map[string]string{"commitAuthor": "alice", "commitCoauthors": ""},
+			expected: "a alice and  b",
+		},
+		{
+			name:     "segment dropped when none of its tokens has a value",
+			template: "a[[ {commitAuthor} and {commitCoauthors} ]]b",
+			vars:     map[string]string{"commitAuthor": "", "commitCoauthors": ""},
+			expected: "ab",
+		},
+		{
+			name:     "brackets without a recognized token stay literal",
+			template: "a[[ always]]b",
+			vars:     map[string]string{},
+			expected: "a[[ always]]b",
+		},
+		{
+			name:     "segment with an unknown token is kept so the typo stays visible",
+			template: "a[[ by {bogus}]]b",
+			vars:     map[string]string{},
+			expected: "a[[ by {bogus}]]b",
+		},
+		{
+			name:     "two segments are independent",
+			template: "a[[ {commitAuthor} ]]b[[ {commitCoauthors} ]]c",
+			vars:     map[string]string{"commitAuthor": "alice"},
+			expected: "a alice bc",
+		},
+		{
+			name:     "nested segments go together",
+			template: "a[[ {commitAuthor}[[ {commitCoauthors}]] ]]b",
+			vars:     map[string]string{"commitAuthor": "alice", "commitCoauthors": "bob"},
+			expected: "a alice bob b",
+		},
+		{
+			name:     "nested inner segment dropped but outer kept",
+			template: "a[[ {commitAuthor}[[ {commitCoauthors}]] ]]b",
+			vars:     map[string]string{"commitAuthor": "alice", "commitCoauthors": ""},
+			expected: "a alice b",
+		},
+		{
+			name:     "nested outer segment dropped with the inner one",
+			template: "a[[ {commitAuthor}[[ {commitCoauthors}]] ]]b",
+			vars:     map[string]string{"commitAuthor": "", "commitCoauthors": ""},
+			expected: "ab",
+		},
+		{
+			name:     "text outside a segment is untouched",
+			template: "a {owner} b[[ {commitAuthor} ]] c",
+			vars:     map[string]string{"owner": "elecnix", "commitAuthor": ""},
+			expected: "a elecnix b c",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, Interpolate(tt.template, tt.vars))
+		})
+	}
+}
+
+// TestInterpolateLeavesLiteralBracketsAlone pins that the optional-segment
+// markers only mean something around a recognized {token}. A template that
+// merely mentions brackets — a citation, a wiki link, a nested list marker —
+// keeps reading the way its author wrote it.
+func TestInterpolateLeavesLiteralBracketsAlone(t *testing.T) {
+	vars := map[string]string{"prLabel": "owner/repo#1"}
+	assert.Equal(t, "see [[1]] on owner/repo#1", Interpolate("see [[1]] on {prLabel}", vars))
+	assert.Equal(t, "see [[note]] on owner/repo#1", Interpolate("see [[note]] on {prLabel}", vars))
+	assert.Equal(t, "see [[{bogus}]] on owner/repo#1", Interpolate("see [[{bogus}]] on {prLabel}", vars))
+}
+
+// TestInterpolateNewCommitTemplate pins the built-in new-commit message
+// (issue #179). It names the commit's co-authors, and the clause is omitted
+// entirely when the commit carries no Co-authored-by trailer — never rendered
+// as a dangling "co-authored by .". The author clause is omitted the same way
+// when the author is unknown.
+func TestInterpolateNewCommitTemplate(t *testing.T) {
+	const (
+		withCoauthor = "📝 New commit abc1234 pushed to owner/repo#42 by alice, co-authored by bob. " +
+			"Review the PR description to ensure it still reflects the latest changes."
+		withoutCoauthor = "📝 New commit abc1234 pushed to owner/repo#42 by alice. " +
+			"Review the PR description to ensure it still reflects the latest changes."
+		withoutAuthor = "📝 New commit abc1234 pushed to owner/repo#42, co-authored by bob. " +
+			"Review the PR description to ensure it still reflects the latest changes."
+		withoutEither = "📝 New commit abc1234 pushed to owner/repo#42. " +
+			"Review the PR description to ensure it still reflects the latest changes."
+	)
+
+	base := map[string]string{
+		"commitShortOid": "abc1234",
+		"prLabel":        "owner/repo#42",
+	}
+	with := func(kv map[string]string) map[string]string {
+		out := map[string]string{}
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range kv {
+			out[k] = v
+		}
+		return out
+	}
+
+	assert.Equal(t, withCoauthor, Interpolate(defaultTemplates["new-commit"],
+		with(map[string]string{"commitAuthor": "alice", "commitCoauthors": "bob"})))
+	assert.Equal(t, withoutCoauthor, Interpolate(defaultTemplates["new-commit"],
+		with(map[string]string{"commitAuthor": "alice", "commitCoauthors": ""})))
+	assert.Equal(t, withoutAuthor, Interpolate(defaultTemplates["new-commit"],
+		with(map[string]string{"commitAuthor": "", "commitCoauthors": "bob"})))
+	assert.Equal(t, withoutEither, Interpolate(defaultTemplates["new-commit"],
+		with(map[string]string{"commitAuthor": "", "commitCoauthors": ""})))
+
+	// A commit whose co-author list is absent from the vars entirely (a
+	// backend that does not carry the field) reads the same as an empty
+	// list: the clause is omitted, not rendered with a hole in it.
+	got := Interpolate(defaultTemplates["new-commit"], with(map[string]string{"commitAuthor": "alice"}))
+	assert.Equal(t, withoutCoauthor, got)
+	assert.NotContains(t, got, "co-authored")
+}
+
+// TestNewCommitTemplateNamesEveryCoauthor pins that the built-in message
+// names every co-author of the commit, comma-joined, and not just the first.
+func TestNewCommitTemplateNamesEveryCoauthor(t *testing.T) {
+	got := Interpolate(defaultTemplates["new-commit"], map[string]string{
+		"commitShortOid":  "abc1234",
+		"prLabel":         "owner/repo#42",
+		"commitAuthor":    "alice",
+		"commitCoauthors": "bob, carol",
+	})
+	assert.Contains(t, got, "co-authored by bob, carol")
+}
+
 func TestInterpolateConflictTemplate(t *testing.T) {
 	// The conflict template must guide the agent to correlate conflicts
 	// with CI failures, so it does not mistakenly assume an Actions outage.
@@ -125,6 +289,34 @@ func TestValidate(t *testing.T) {
 			name: "known key with token accepted",
 			prefs: Preferences{
 				Templates: map[string]string{"merged": "done {prLabel}"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "optional segment accepted",
+			prefs: Preferences{
+				Templates: map[string]string{"merged": "done {prLabel}[[ by {commitAuthor}]]"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "unclosed optional segment rejected",
+			prefs: Preferences{
+				Templates: map[string]string{"merged": "done {prLabel}[[ by {commitAuthor}"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unclosed nested optional segment rejected",
+			prefs: Preferences{
+				Templates: map[string]string{"merged": "done {prLabel}[[ a [[ b {commitAuthor}]]"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "unclosed brackets without a recognized token are literal text",
+			prefs: Preferences{
+				Templates: map[string]string{"merged": "done {prLabel}[[ by hand"},
 			},
 			wantErr: false,
 		},
@@ -193,6 +385,15 @@ func TestLoadOverlaysFile(t *testing.T) {
 func TestLoadDropsTemplatelessValue(t *testing.T) {
 	base := t.TempDir()
 	writeStored(t, base, `{"templates": {"merged": "no tokens"}}`)
+
+	got, err := Load(base)
+	require.NoError(t, err)
+	assert.Equal(t, defaultTemplates["merged"], got.Templates["merged"])
+}
+
+func TestLoadDropsUnclosedSegment(t *testing.T) {
+	base := t.TempDir()
+	writeStored(t, base, `{"templates": {"merged": "done {prLabel}[[ by {commitAuthor}"}}`)
 
 	got, err := Load(base)
 	require.NoError(t, err)
