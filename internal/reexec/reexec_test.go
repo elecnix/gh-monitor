@@ -21,6 +21,10 @@ func runtimeRoot(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
+	// HOME matters as much as the XDG variables: os.UserCacheDir ignores them
+	// on darwin and derives $HOME/Library/Caches instead, so a test that
+	// isolated only XDG left its sandbox and read the real user directory.
+	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CACHE_HOME", dir)
 	return dir
 }
@@ -44,6 +48,10 @@ func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("XDG_CACHE_HOME", dir)
+	// This is the branch that broke on macOS: os.UserCacheDir ignores
+	// XDG_CACHE_HOME there and uses $HOME/Library/Caches, so without HOME the
+	// test compared against the user's real cache directory.
+	t.Setenv("HOME", dir)
 	got, err := RuntimePath()
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
@@ -51,6 +59,9 @@ func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
 	rd, err := RuntimeDir()
 	if err != nil {
 		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if !strings.HasPrefix(rd, dir) {
+		t.Fatalf("RuntimeDir() = %q escaped the sandbox at %q: this test would read the user's real cache", rd, dir)
 	}
 	if rd != filepath.Join(dir, "gh-monitor") {
 		t.Fatalf("RuntimeDir() = %q, want %q", rd, filepath.Join(dir, "gh-monitor"))

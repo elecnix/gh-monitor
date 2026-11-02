@@ -323,6 +323,17 @@ func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "ghm-cmd-test-*")
 	if err == nil {
 		_ = os.Setenv("GH_MONITOR_COVERAGE_FILE", filepath.Join(dir, "coverage.json"))
+		// Point every user-directory derivation at the sandbox, not just the
+		// XDG variables: os.UserCacheDir and os.UserConfigDir ignore XDG on
+		// darwin and derive from $HOME, so a test that isolated only XDG read
+		// the real user directories — passing on a fresh machine and failing
+		// on one that actually uses gh monitor. Done once here rather than per
+		// test, because the failure mode is "this test forgot", which is not a
+		// thing a per-test fix can prevent.
+		_ = os.Setenv("HOME", dir)
+		_ = os.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
+		_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "config"))
+		_ = os.Setenv("XDG_RUNTIME_DIR", filepath.Join(dir, "run"))
 	}
 	code := m.Run()
 	if err == nil {
