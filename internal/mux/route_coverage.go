@@ -191,9 +191,13 @@ func (w *coverWatch) serveSubdaemon(p *remote.Provider, last time.Time, changed 
 	rest.Baseline = w.baseline
 	stream, err := p.Watch(sctx, w.t, rest)
 	if err != nil {
+		w.noteFailover(p.Name(), fmt.Sprintf("the sub-daemon could not serve the watch: %v", err))
 		w.notice(fmt.Sprintf("⚠️ sub-daemon %s could not serve %s (%v); polling it through the hub instead", p.Name(), w.t, err))
 		return phaseDied
 	}
+	// Everything the sub-daemon delivers is marked with its name, so a log
+	// says which serving path produced each update (issue #122).
+	stream = stampSource(sctx, stream, p.Name())
 	if w.reported {
 		stream = skipFirstPoll(sctx, stream)
 	}
@@ -213,6 +217,7 @@ func (w *coverWatch) serveSubdaemon(p *remote.Provider, last time.Time, changed 
 					return phaseEnded
 				}
 				w.midBatch = false
+				w.noteFailover(p.Name(), "the sub-daemon stopped serving the watch before it was done")
 				w.notice(fmt.Sprintf("⚠️ sub-daemon %s stopped serving %s; polling it through the hub instead", p.Name(), w.t))
 				return phaseDied
 			}
@@ -292,6 +297,15 @@ func (w *coverWatch) fetchOnce(mode string) bool {
 		}
 	}
 	return true
+}
+
+// noteFailover records that the watch moved from a sub-daemon to the hub
+// (issue #122).
+func (w *coverWatch) noteFailover(from, reason string) {
+	if w.s.OnFailover == nil {
+		return
+	}
+	w.s.OnFailover(w.t, from, reason, time.Now())
 }
 
 // notice logs a routing diagnostic and tells the watcher.

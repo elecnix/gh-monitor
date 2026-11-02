@@ -34,6 +34,18 @@ type Update struct {
 	// Event is the change itself.
 	Event Event `json:"event"`
 
+	// Source names the serving path this update came from: the polling hub,
+	// or the name of the sub-daemon that served it (issue #122). It is empty
+	// when the producing backend does not say — a backend that cannot
+	// distinguish its paths leaves it unset rather than claiming one.
+	//
+	// It exists because the two paths cost different things and fail
+	// differently: a hub-served update was paid for with an API poll, while
+	// a sub-daemon-served one arrived through a webhook. A log that does not
+	// say which one delivered an update cannot answer "did the hub spend a
+	// poll on this?" or "did the sub-daemon see this?".
+	Source string `json:"source,omitempty"`
+
 	// Status is the target's state at observation time, or nil when the
 	// backend does not have one.
 	Status Status `json:"-"`

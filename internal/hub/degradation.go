@@ -155,6 +155,15 @@ func (d *degradation) clearBlindWindow() (blindFrom time.Time, ok bool) {
 	return blindFrom, !blindFrom.IsZero()
 }
 
+// lastSuccess returns when the last successful fetch completed. A zero time
+// means no fetch has succeeded yet, so nothing observed so far is bounded by
+// a successful observation.
+func (d *degradation) lastSuccess() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.lastOK
+}
+
 // blindSurfaces names the watched-surface guarantees a failed fetch of this
 // target's kind stops delivering (issue #98). Surfaces on one query are
 // coupled: a PR's check outcomes, head commit, and mergeability ride the same
