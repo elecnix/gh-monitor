@@ -22,10 +22,72 @@ func TestNormalizeSelector(t *testing.T) {
 
 	_, err = NormalizeSelector("https://github.com/octo/demo/pull/7", 8)
 	require.Error(t, err)
+}
 
-	_, err = NormalizeSelector("octo/demo#7", 0)
+func TestNormalizeSelectorShorthand(t *testing.T) {
+	// The OWNER/REPO#NUMBER form is accepted as a selector on its own.
+	selector, err := NormalizeSelector("octo/demo#7", 0)
+	require.NoError(t, err)
+	assert.Equal(t, "octo/demo#7", selector)
+
+	// A matching --pr is accepted, exactly as it is for a URL selector.
+	selector, err = NormalizeSelector("octo/demo#7", 7)
+	require.NoError(t, err)
+	assert.Equal(t, "octo/demo#7", selector)
+
+	// A mismatching --pr is rejected, exactly as it is for a URL selector.
+	_, err = NormalizeSelector("octo/demo#7", 8)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "URL or number")
+	assert.Contains(t, err.Error(), "does not match --pr=8")
+
+	// A malformed shorthand is rejected, and the error names the accepted
+	// forms so a reader who typed the shorthand knows what to try next.
+	_, err = NormalizeSelector("octo/demo#7x", 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "owner/repo#number")
+}
+
+func TestResolveShorthand(t *testing.T) {
+	// The whole point of the shorthand: no -R, no git context, no error, and
+	// the same identity -R owner/repo 9 would name.
+	id, err := Resolve("octo/demo#9", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, Identity{Owner: "octo", Repo: "demo", Host: "github.com", Number: 9, Target: "pr"}, id)
+}
+
+func TestResolveShorthandHost(t *testing.T) {
+	// The shorthand carries no host: it names a repository on the host the
+	// caller is already talking to.
+	id, err := Resolve("octo/demo#9", "", "ghe.example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "ghe.example.com", id.Host)
+
+	id, err = Resolve("octo/demo#9", "", "")
+	require.NoError(t, err)
+	assert.Equal(t, "github.com", id.Host)
+}
+
+func TestResolveShorthandOverridesRepoFlag(t *testing.T) {
+	// A selector that names its own repository wins over --repo, the same
+	// way a pull request URL's repository does.
+	id, err := Resolve("octo/demo#9", "other/repo", "github.com")
+	require.NoError(t, err)
+	assert.Equal(t, Identity{Owner: "octo", Repo: "demo", Host: "github.com", Number: 9, Target: "pr"}, id)
+}
+
+func TestResolveShorthandRejectsMalformed(t *testing.T) {
+	for _, selector := range []string{
+		"octo/demo",   // no number: not a pull request selector
+		"octo/demo#",  // no number
+		"octo#9",      // no repository
+		"#9",          // no owner or repository
+		"octo/demo#0", // not a pull request number
+	} {
+		t.Run(selector, func(t *testing.T) {
+			_, err := Resolve(selector, "octo/demo", "github.com")
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestResolveURL(t *testing.T) {

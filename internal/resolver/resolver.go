@@ -12,7 +12,18 @@ import (
 
 var (
 	pullURLRE = regexp.MustCompile(`^/([^/]+)/([^/]+)/pull/([0-9]+)(?:/.*)?$`)
+	// shorthandRE matches the OWNER/REPO#NUMBER cross-reference form — the
+	// shape GitHub's own UI, its cross-references, and this tool's pr_label
+	// all use to name a pull request. Neither an owner nor a repository name
+	// can contain '#', so the separator is unambiguous. The character classes
+	// are GitHub's own rules for the two names, so a typo is rejected here
+	// instead of becoming a 404 from the API.
+	shorthandRE = regexp.MustCompile(`^([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)#([0-9]+)$`)
 )
+
+// selectorHint tells the reader which selector forms are accepted, and where
+// the host comes from — the shorthand names a repository, not a host.
+const selectorHint = "expected owner/repo#number, a number with -R owner/repo, or a pull request URL; the host comes from GH_HOST"
 
 // Identity represents a fully-resolved reference target.
 // Target is one of: "pr", "ref", "commit", "issue".
@@ -52,7 +63,11 @@ func NormalizeSelector(selector string, prFlag int) (string, error) {
 		return selector, nil
 	}
 
-	return "", fmt.Errorf("invalid pull request selector %q: must be a pull request URL or number", selector)
+	if _, err := parseShorthand(selector); err == nil {
+		return selector, nil
+	}
+
+	return "", fmt.Errorf("invalid pull request selector %q: %s", selector, selectorHint)
 }
 
 // Resolve interprets a selector, optional repo flag, and host (GH_HOST) into a concrete pull request identity.
@@ -70,6 +85,16 @@ func Resolve(selector, repoFlag, host string) (Identity, error) {
 		return id, nil
 	}
 
+	// The OWNER/REPO#NUMBER shorthand names its own repository, so it wins
+	// over --repo exactly the way a pull request URL's repository does: a
+	// selector that carries the identity is not second-guessed by a flag
+	// that only fills in a missing part.
+	if id, err := parseShorthand(selector); err == nil {
+		id.Host = host
+		id.Target = "pr"
+		return id, nil
+	}
+
 	if n, err := strconv.Atoi(selector); err == nil && n > 0 {
 		owner, repo, err := splitRepo(repoFlag)
 		if err != nil {
@@ -78,7 +103,7 @@ func Resolve(selector, repoFlag, host string) (Identity, error) {
 		return Identity{Owner: owner, Repo: repo, Host: host, Number: n, Target: "pr"}, nil
 	}
 
-	return Identity{}, fmt.Errorf("invalid pull request selector: %q", selector)
+	return Identity{}, fmt.Errorf("invalid pull request selector %q: %s", selector, selectorHint)
 }
 
 // ResolveRef resolves a ref (branch) target for monitoring.
@@ -163,8 +188,33 @@ func parsePullURL(raw string) (Identity, error) {
 	}, nil
 }
 
+// parseShorthand parses the OWNER/REPO#NUMBER cross-reference form. The host
+// is not part of it: the shorthand names a repository on the host the
+// caller is already talking to (GH_HOST, github.com by default).
+func parseShorthand(raw string) (Identity, error) {
+	matches := shorthandRE.FindStringSubmatch(raw)
+	if matches == nil {
+		return Identity{}, errors.New("not an owner/repo#number shorthand")
+	}
+	number, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return Identity{}, fmt.Errorf("invalid pull request number %q", matches[3])
+	}
+	if number <= 0 {
+		return Identity{}, errors.New("pull request number must be positive")
+	}
+	return Identity{
+		Owner:  matches[1],
+		Repo:   matches[2],
+		Number: number,
+	}, nil
+}
+
 func matchesNumber(selector string, target int) bool {
 	if id, err := parsePullURL(selector); err == nil {
+		return id.Number == target
+	}
+	if id, err := parseShorthand(selector); err == nil {
 		return id.Number == target
 	}
 	if n, err := strconv.Atoi(selector); err == nil {

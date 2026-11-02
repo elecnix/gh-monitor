@@ -14,7 +14,7 @@ func newReviewViewCommand(bo *backendOptions) *cobra.Command {
 	opts := &reviewViewOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "view [<number> | <url>]",
+		Use:   "view [<number> | <url> | <owner/repo#number>]",
 		Short: "View a structured review summary (GraphQL)",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

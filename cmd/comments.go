@@ -40,7 +40,7 @@ func newCommentsReplyCommand(parent *commentsOptions) *cobra.Command {
 	opts := &commentsReplyOptions{}
 
 	cmd := &cobra.Command{
-		Use:   "reply [<number> | <url>]",
+		Use:   "reply [<number> | <url> | <owner/repo#number>]",
 		Short: "Reply to a pull request review thread",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

@@ -15,7 +15,7 @@ func newReviewCommand() *cobra.Command {
 	opts := &reviewOptions{Side: "RIGHT", Event: "COMMENT"}
 
 	cmd := &cobra.Command{
-		Use:   "review [<number> | <url>]",
+		Use:   "review [<number> | <url> | <owner/repo#number>]",
 		Short: "Manage pending reviews via GraphQL helpers",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

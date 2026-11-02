@@ -3,7 +3,10 @@
 All commands accept pull request selectors as either:
 
 - a pull request URL (`https://github.com/owner/repo/pull/123`)
+- the `owner/repo#number` shorthand (`owner/repo#123`), which names its own repository and needs no `-R`
 - a pull request number when combined with `-R owner/repo`
+
+The shorthand carries no host: it names a repository on the host the command is already talking to (`GH_HOST`, `github.com` by default). A pull request URL carries its own host and wins over `GH_HOST`.
 
 Unless stated otherwise, commands emit JSON only. Optional fields are omitted instead of serializing as `null`. Array responses default to `[]`.
 
@@ -95,7 +98,7 @@ gh monitor review --delete-comment \
 
 - **Purpose:** Emit a consolidated snapshot of reviews, inline comments, and replies.
 - **Inputs:**
-  - Optional pull request selector argument (URL or number with `--repo`).
+  - Optional pull request selector argument (URL, `owner/repo#number`, or number with `--repo`).
   - `--repo` / `--pr` flags when not providing the positional number.
   - Filters: `--reviewer`, `--states`, `--unresolved`, `--not_outdated`, `--tail`.
   - `--include-comment-node-id` to surface comment IDs on parent comments and replies.

@@ -204,6 +204,16 @@ gh monitor --text -R owner/repo 42
 gh monitor --once -R owner/repo 42
 ```
 
+**The pull request selector.** Every command that takes a pull request accepts three forms:
+
+| Form                   | Example                                     | Notes                                           |
+| ---------------------- | ------------------------------------------- | ----------------------------------------------- |
+| `owner/repo#number`    | `gh monitor owner/repo#42`                  | Names its own repository, so no `-R` is needed  |
+| a number with `--repo` | `gh monitor -R owner/repo 42`               | The repository comes from the flag              |
+| a pull request URL     | `gh monitor https://github.com/o/r/pull/42` | Carries its own host, which wins over `GH_HOST` |
+
+The `owner/repo#number` shorthand is the same cross-reference form GitHub's own UI uses, and the same form this tool prints in its `pr_label` field. It carries no host: it names a repository on the host the command is already talking to (`GH_HOST`, `github.com` by default). A URL carries its own host and wins over `GH_HOST`. Combining the shorthand with `--pr` follows the same rule as a URL: `owner/repo#42 --pr 42` is accepted and `--pr 7` is rejected.
+
 **Monitor flags:**
 
 - `--interval <seconds>` - Base polling interval (default: 300, min 10). Sets the cadence of a shared poller **this command starts**; a daemon that is already running keeps its own cadence (see [Shared poller daemon](#shared-poller-daemon))
