@@ -61,7 +61,7 @@ func TestNotify_SendsEachAssignment(t *testing.T) {
 }
 
 func TestNotify_UnreachableSocketIsAnError(t *testing.T) {
-	t.Setenv(SocketEnv, filepath.Join(t.TempDir(), "nobody-listens"))
+	t.Setenv(SocketEnv, filepath.Join(shortTmp(), "nobody-listens"))
 	assert.Error(t, Ready(""), "a supervised daemon must be told its notification was lost")
 }
 
@@ -74,4 +74,14 @@ func TestWithoutNotifyEnv(t *testing.T) {
 
 	keep := []string{"NOTIFY_SOCKET_EXTRA=1"}
 	assert.Equal(t, keep, WithoutNotifyEnv(keep), "a name that merely starts with the variable's is not the variable")
+}
+
+// shortTmp is where socket fixtures create their directory: darwin caps a Unix
+// socket path at 104 bytes and TMPDIR there is a long /var/folders/... path,
+// so a socket built on t.TempDir() cannot be bound at all.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }

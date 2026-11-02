@@ -85,25 +85,41 @@ func TestHandoff_RepeatedHandoffsKeepTheFleet(t *testing.T) {
 		srv := bindTestServerOn(t, ctx, h2, l2)
 
 		// Every watcher must re-attach under its own resume id.
-		require.Eventually(t, func() bool {
+		//
+		// The bound is generous and the failure names what it saw. A fixed ten
+		// seconds was enough on an idle machine and not enough on a busy one:
+		// each check is a socket round-trip plus three clients reconnecting with
+		// backoff, and when the deadline passed the message said only that some
+		// watcher was missing, which is not enough to tell "slow" from "never".
+		var missing []string
+		deadline := time.Now().Add(30 * time.Second)
+		for {
 			info, err := handoff.Info(ctx, sock)
-			if err != nil {
-				return false
-			}
-			seen := map[string]bool{}
-			for _, c := range info.Clients {
-				for _, r := range c.Resumes {
-					seen[r] = true
+			if err == nil {
+				seen := map[string]bool{}
+				for _, c := range info.Clients {
+					for _, r := range c.Resumes {
+						seen[r] = true
+					}
 				}
-			}
-			for _, r := range resumes {
-				if !seen[r] {
-					return false
+				missing = missing[:0]
+				for _, r := range resumes {
+					if !seen[r] {
+						missing = append(missing, r)
+					}
 				}
+				if len(missing) == 0 {
+					break
+				}
+			} else {
+				missing = []string{"daemon-info failed: " + err.Error()}
 			}
-			return true
-		}, 10*time.Second, 20*time.Millisecond, "round %d: every watcher must re-attach with its resume id", round)
-		_ = srv
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: watchers never re-attached after %s: %v (last report: %v)",
+					round, 30*time.Second, missing, srv.clients.snapshotExcept(nil))
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
 
 		// Give the streams a moment to settle, then check nobody was replayed.
 		time.Sleep(100 * time.Millisecond)

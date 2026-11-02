@@ -18,6 +18,11 @@ Description=gh-monitor daemon socket
 [Socket]
 # Must match the daemon's socket path: $XDG_RUNTIME_DIR/gh-monitor.sock.
 ListenStream=%t/gh-monitor.sock
+# Name the unit that serves this socket. Without it systemd pairs the socket
+# with gh-monitor.service — derived from the socket's own name — which is not
+# the unit this repository ships, so the first connect would try to start a
+# service that does not exist and no daemon would ever answer.
+Service=gh-monitor-daemon.service
 # No RemoveOnStop: the path belongs to the service manager while this unit is
 # active, and the daemon serves on it. Unlinking it on a stop of this unit
 # alone would leave a running daemon behind a socket nobody can reach. systemd

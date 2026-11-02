@@ -825,7 +825,9 @@ func TestDaemon_ActivatedSocketIsUsedAndKept(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp(shortTmpDir(), "ghm-activated-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "activated.sock")
 	l, err := net.Listen("unix", path)
 	require.NoError(t, err)

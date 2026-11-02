@@ -49,6 +49,15 @@ func Listeners(env Env) ([]net.Listener, error) {
 	_ = env.Unset(NamesEnv)
 
 	out := make([]net.Listener, 0, n)
+	// Anything adopted before a failure is closed on the way out: a half-adopted
+	// set is dropped by the caller, and a listener nobody holds is a descriptor
+	// nobody can release.
+	fail := func(err error) ([]net.Listener, error) {
+		for _, l := range out {
+			_ = l.Close()
+		}
+		return nil, err
+	}
 	for i := 0; i < n; i++ {
 		fd := uintptr(firstFD + i)
 		name := ""
@@ -57,7 +66,7 @@ func Listeners(env Env) ([]net.Listener, error) {
 		}
 		f := env.File(fd, name)
 		if f == nil {
-			return nil, fmt.Errorf("activation: no descriptor %d", fd)
+			return fail(fmt.Errorf("activation: no descriptor %d", fd))
 		}
 		// net.FileListener dups the descriptor; f.Close then closes the
 		// inherited one, so the process does not keep two per activated
@@ -69,10 +78,10 @@ func Listeners(env Env) ([]net.Listener, error) {
 		l, err := net.FileListener(f)
 		closeErr := f.Close()
 		if err != nil {
-			return nil, fmt.Errorf("activation: descriptor %d is not a listener: %w", fd, err)
+			return fail(fmt.Errorf("activation: descriptor %d is not a listener: %w", fd, err))
 		}
 		if closeErr != nil {
-			return nil, fmt.Errorf("activation: descriptor %d: %w", fd, closeErr)
+			return fail(fmt.Errorf("activation: descriptor %d: %w", fd, closeErr))
 		}
 		out = append(out, l)
 	}

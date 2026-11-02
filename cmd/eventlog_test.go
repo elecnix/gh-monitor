@@ -140,6 +140,10 @@ func TestMonitor_EventLogOffByDefault(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	t.Setenv("HOME", home)
+	// Windows derives the cache dir from %LocalAppData%, not HOME: without this
+	// the default path lands in the real temp tree and the sandbox assertion
+	// below fails on every Windows run.
+	t.Setenv("LocalAppData", home)
 	t.Setenv("GH_HOST", "")
 
 	originalFactory := apiClientFactory

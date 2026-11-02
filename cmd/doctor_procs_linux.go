@@ -151,7 +151,11 @@ func procAge(pid int) time.Duration {
 		return 0
 	}
 	const hz = 100 // USER_HZ; the kernel reports start times in these ticks
-	return time.Duration(upSec*float64(time.Second)) - time.Duration(ticks)*time.Second/hz
+	// Multiply after dividing: time.Second/hz is exactly 10ms, and the other
+	// order computes ticks*1e9 first, which overflows int64 once a host has
+	// been up about three years — every age would then wrap to garbage and
+	// --reap would judge the wrong watchers.
+	return time.Duration(upSec*float64(time.Second)) - time.Duration(ticks)*(time.Second/hz)
 }
 
 // describeArgv renders the interesting part of a watcher's command line.

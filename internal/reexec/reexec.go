@@ -129,6 +129,12 @@ func RuntimePath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("locate executable: %w", err)
 	}
+	// A resident process already runs the copy. Deriving a name from its own
+	// identity would fingerprint the copy and return a path nothing ever wrote,
+	// so the answer is simply where it lives.
+	if isRuntimeCopy(exe) {
+		return exe, nil
+	}
 	return CopyPathFor(exe)
 }
 
@@ -196,11 +202,17 @@ func pruneCopies(dir, keep string) {
 	}
 	cutoff := time.Now().Add(-copyRetentionAge)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), copyPattern) || strings.Contains(e.Name(), ".tmp-") {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), copyPattern) {
 			continue
 		}
+		// Interrupted copies are debris whichever build they came from. Their
+		// name carries that build's key, so the per-build reclaim in
+		// copyExecutable never matches one left by a build that has since been
+		// upgraded away — which is exactly when it would otherwise sit there
+		// forever.
 		full := filepath.Join(dir, e.Name())
-		if full == keep {
+		if full == keep || strings.HasPrefix(e.Name(), filepath.Base(keep)+".tmp-") {
+			// The live copy and this build's own in-flight writes stay.
 			continue
 		}
 		info, err := e.Info()

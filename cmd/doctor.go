@@ -94,9 +94,13 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 			case errors.Is(infoErr, handoff.ErrUnsupported):
 				_, _ = fmt.Fprintf(out, "daemon: the resident daemon predates `daemon-info`, so its clients cannot be listed\n")
 			default:
-				if _, err := ipc.Dial(socket); err != nil {
+				// The probe's connection is closed either way: on success it is a
+				// live daemon that did not answer, and holding the socket open for
+				// the rest of the command would be a descriptor nobody owns.
+				if probe, err := ipc.Dial(socket); err != nil {
 					_, _ = fmt.Fprintf(out, "daemon: none listening on %s\n", socket)
 				} else {
+					_ = probe.Close()
 					_, _ = fmt.Fprintf(out, "daemon: listening on %s but did not answer (%v)\n", socket, infoErr)
 				}
 			}

@@ -19,7 +19,7 @@ import (
 // socket, a second Listen must fail (not os.Remove the live socket and steal
 // the path), so at most one daemon ever serves a given socket.
 func TestListen_RejectsLiveSocket(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-listen-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-listen-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "d.sock")
@@ -42,7 +42,7 @@ func TestListen_RejectsLiveSocket(t *testing.T) {
 // TestListen_ReclaimsStaleSocket verifies a stale socket (no live daemon) is
 // removed and reused, so a crashed daemon does not block the next start.
 func TestListen_ReclaimsStaleSocket(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-stale-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-stale-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "d.sock")
@@ -62,7 +62,7 @@ func TestListen_ReclaimsStaleSocket(t *testing.T) {
 
 // TestWaitReady_Timeout verifies WaitReady gives up when nothing binds.
 func TestWaitReady_Timeout(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-wait-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-wait-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "never.sock")
@@ -98,4 +98,14 @@ func TestListen_AcceptsAPathUnderTheLimit(t *testing.T) {
 	l, err := Listen(path)
 	require.NoError(t, err)
 	_ = l.Close()
+}
+
+// shortTmp is where socket fixtures create their directory: darwin caps a Unix
+// socket path at 104 bytes and TMPDIR there is a long /var/folders/... path,
+// so a socket built on t.TempDir() cannot be bound at all.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }
