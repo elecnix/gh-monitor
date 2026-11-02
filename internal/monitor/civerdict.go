@@ -525,6 +525,16 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *Anno
 		for j := range c.Suites.Nodes {
 			suite := &c.Suites.Nodes[j]
 			for _, run := range suite.CheckRuns.Nodes {
+				// The filter runs first: a check the operator excluded cannot make
+				// the payload "truncated", or a muted check would keep warning that
+				// annotations may be missing from a set nobody asked for.
+				if run.Name != "" && !seenChecks[strings.ToLower(run.Name)] {
+					seenChecks[strings.ToLower(run.Name)] = true
+					observed = append(observed, run.Name)
+				}
+				if !checks.Allows(run.Name) {
+					continue
+				}
 				runAnns := run.Annotations
 				if runAnns.TotalCount >= 10 && !truncated {
 					truncated = true
@@ -535,13 +545,6 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *Anno
 					if url == "" {
 						url = run.Permalink
 					}
-				}
-				if run.Name != "" && !seenChecks[strings.ToLower(run.Name)] {
-					seenChecks[strings.ToLower(run.Name)] = true
-					observed = append(observed, run.Name)
-				}
-				if !checks.Allows(run.Name) {
-					continue
 				}
 				for _, ann := range runAnns.Nodes {
 					if !levels.Allows(ann.Level) {

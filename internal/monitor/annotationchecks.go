@@ -189,6 +189,13 @@ func (a *AnnotationChecks) Names() []string {
 	if a == nil {
 		return nil
 	}
+	// A deny-only filter has no allow list at all: it means "every check except
+	// these", so it serialises as nil — every check — and the exclusions travel
+	// in ExcludedNames. Serialising it as ["none"] would cross the boundary as a
+	// deliberate mute and silence the watch the operator just narrowed.
+	if a.allowed == nil && len(a.excluded) > 0 {
+		return nil
+	}
 	if len(a.allowed) == 0 {
 		return []string{"none"}
 	}

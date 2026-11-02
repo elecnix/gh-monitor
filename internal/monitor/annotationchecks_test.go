@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -210,4 +211,25 @@ func TestAnnotationChecks_Unmatched(t *testing.T) {
 		"an explicit mute is not a typo: there is nothing to match")
 	assert.Nil(t, (*AnnotationChecks)(nil).Unmatched(observed),
 		"no filter excludes nothing and matches nothing to report")
+}
+
+// TestAnnotationChecks_DenyOnlyFilterRoundTrips is the muting bug a review
+// caught: a filter holding only exclusions has no allow list, which is "every
+// check except these" — but Names() used to serialise an empty allow list as
+// ["none"], so the filter crossed the process boundary as a deliberate mute and
+// silenced the watch it had just been asked to narrow.
+func TestAnnotationChecks_DenyOnlyFilterRoundTrips(t *testing.T) {
+	f := NewAnnotationFilter(nil, []string{"lint"})
+	assert.False(t, f.IsNone(), "a deny-only filter mutes nothing by itself")
+
+	assert.Nil(t, f.Names(), `no allow list means every check, not "none"`)
+	assert.Equal(t, []string{"lint"}, f.ExcludedNames())
+
+	// Rebuild from the wire form, exactly as the daemon does.
+	parsed, err := ParseAnnotationChecks(strings.Join(f.Names(), ","))
+	require.NoError(t, err)
+	back := NewAnnotationFilter(parsed.Names(), f.ExcludedNames())
+	assert.False(t, back.Allows("lint"), "the exclusion survives the round trip")
+	assert.True(t, back.Allows("test"), "and everything else stays allowed")
+	assert.False(t, back.IsNone(), "the round trip must not turn a narrowing into a mute")
 }

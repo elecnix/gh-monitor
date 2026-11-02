@@ -50,6 +50,37 @@ func Diff(prev *PRStatus, curr *PRStatus) []Event {
 	return diffImpl(prev, curr, false)
 }
 
+// annotationFilterEvents reports an annotation filter that matches nothing, once:
+// on the first poll, and again only if the unmatched set appears or changes. A
+// notice every poll would become the noise this filter exists to remove.
+func annotationFilterEvents(prev, curr *PRStatus) []Event {
+	if len(curr.AnnotationFilterUnmatched) == 0 {
+		return nil
+	}
+	if prev != nil && sameStrings(prev.AnnotationFilterUnmatched, curr.AnnotationFilterUnmatched) {
+		return nil
+	}
+	return []Event{{
+		Type: EventDegraded,
+		Notice: fmt.Sprintf("⚠️ annotation filter matches no check on this payload: %s not seen; the checks here are %s. Fix --annotation-checks or the annotationChecks preference.",
+			strings.Join(curr.AnnotationFilterUnmatched, ", "),
+			strings.Join(curr.ObservedChecks, ", ")),
+	}}
+}
+
+// sameStrings reports whether a and b hold the same names in the same order.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // DiffRetrigger is like Diff but diffs the thread and general-comment portions
 // against an EMPTY baseline, so every currently-open unresolved thread and
 // general comment re-emits on each poll (the retriggerComments preference).
@@ -60,8 +91,16 @@ func DiffRetrigger(prev *PRStatus, curr *PRStatus) []Event {
 }
 
 func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
-	if prev == nil || curr == nil {
+	if curr == nil {
 		return nil
+	}
+	// A wrong filter must be reported on the first poll too. The rest of the diff
+	// is silent on the first poll because everything would read as new; this is
+	// not a change, it is a statement about the configuration, and waiting for a
+	// previous poll to compare against would leave the most common case — a typo
+	// present from the start — unreported forever.
+	if prev == nil {
+		return annotationFilterEvents(nil, curr)
 	}
 
 	// Under retrigger, threads/comments diff against an empty baseline so open
@@ -132,14 +171,7 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 	// A filter that matches nothing must say so. Silence and a typo look
 	// identical from here otherwise, and the operator's next move — waiting for
 	// annotations that can never arrive — is the wrong one.
-	if len(curr.AnnotationFilterUnmatched) > 0 && len(prev.AnnotationFilterUnmatched) == 0 {
-		events = append(events, Event{
-			Type: EventDegraded,
-			Notice: fmt.Sprintf("⚠️ annotation filter matches no check on this payload: %s not seen; the checks here are %s. Fix --annotation-checks or the annotationChecks preference.",
-				strings.Join(curr.AnnotationFilterUnmatched, ", "),
-				strings.Join(curr.ObservedChecks, ", ")),
-		})
-	}
+	events = append(events, annotationFilterEvents(prev, curr)...)
 
 	if newAnn := diffAnnotations(prev.CheckAnnotations, curr.CheckAnnotations); len(newAnn) > 0 {
 		evt := Event{Type: EventCheckAnnotations, Annotations: newAnn}

@@ -381,11 +381,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// make the flag able to only WIDEN an allowlist, never narrow it, so an
 	// agent could not ask for "only check X" for one probe when the stored
 	// list names more.
-	runOpts.AnnotationChecks, err = monitor.ParseAnnotationChecks(strings.Join(p.AnnotationChecks, ","))
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(opts.AnnotationChecks) != "" {
+	// The stored list is parsed as a list, never joined and re-split: a check name
+	// can contain a comma (a matrix job such as "CI / test (node 20), lint"), and
+	// joining would cut it in two.
+	runOpts.AnnotationChecks = monitor.NewAnnotationFilter(p.AnnotationChecks, nil)
+	if cmd.Flags().Changed("annotation-checks") {
+		// An explicitly empty flag clears the stored list; an absent one leaves it
+		// in force. Only Changed() can tell those apart.
 		runOpts.AnnotationChecks, err = monitor.ParseAnnotationChecks(opts.AnnotationChecks)
 		if err != nil {
 			return err
@@ -393,9 +395,14 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 	// The deny list composes with whatever allow list is in force, flag or
 	// preference: an exclusion is statement about one check, not about the set.
-	excluded := monitor.ParseAnnotationExclude(strings.Join(p.AnnotationExcludeChecks, ","))
-	if strings.TrimSpace(opts.AnnotationExcludeChecks) != "" {
+	var excluded *monitor.AnnotationChecks
+	if cmd.Flags().Changed("annotation-exclude-checks") {
 		excluded = monitor.ParseAnnotationExclude(opts.AnnotationExcludeChecks)
+	} else {
+		excluded = monitor.NewAnnotationFilter(nil, p.AnnotationExcludeChecks)
+		if len(excluded.ExcludedNames()) == 0 {
+			excluded = nil
+		}
 	}
 	if excluded != nil {
 		runOpts.AnnotationChecks = monitor.NewAnnotationFilter(runOpts.AnnotationChecks.Names(), excluded.Names())

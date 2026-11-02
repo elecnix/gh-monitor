@@ -563,3 +563,20 @@ func TestDiff_AnnotationFilterThatMatchesNothingSaysSo(t *testing.T) {
 		assert.NotEqualf(t, EventDegraded, ev.Type, "the warning is not re-emitted every poll")
 	}
 }
+
+// TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll: a typo present from the
+// very first poll is the common case, and the first poll is exactly where the
+// rest of the diff is silent. Waiting for a previous snapshot to compare against
+// would mean the mistake is never reported.
+func TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll(t *testing.T) {
+	curr := &PRStatus{
+		AnnotationFilterUnmatched: []string{"tst"},
+		ObservedChecks:            []string{"lint"},
+	}
+	events := Diff(nil, curr)
+	require.Len(t, events, 1, "the first poll must carry the warning")
+	assert.Contains(t, events[0].Notice, "tst")
+
+	// And every later poll with the same wrong filter stays quiet.
+	assert.Empty(t, Diff(curr, curr), "the warning is not repeated")
+}
