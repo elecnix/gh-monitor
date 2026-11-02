@@ -183,3 +183,20 @@ func TestListen_RecordsItsOwner(t *testing.T) {
 	_, err = os.Stat(OwnerPath(sock))
 	assert.True(t, os.IsNotExist(err))
 }
+
+// TestListen_ReadsAMalformedOwnerRecordAsNoOwner covers pids that signal
+// process groups instead of naming a process.
+func TestListen_ReadsAMalformedOwnerRecordAsNoOwner(t *testing.T) {
+	for _, record := range []string{"0", "-1", "", "abc"} {
+		dir, err := os.MkdirTemp(shortTmp(), "ghmon-bad-*.d")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+		sock := filepath.Join(dir, "d.sock")
+		staleSocketFile(t, sock)
+		require.NoError(t, os.WriteFile(OwnerPath(sock), []byte(record), 0o600))
+
+		l, err := Listen(sock)
+		require.NoError(t, err, "record %q", record)
+		_ = l.Close()
+	}
+}

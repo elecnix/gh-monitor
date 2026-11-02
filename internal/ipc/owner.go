@@ -23,18 +23,26 @@ func OwnerPath(socket string) string { return socket + ".pid" }
 // bind; a successor that adopted the listening socket from a predecessor calls
 // it, because Listen never ran for it.
 func ClaimOwner(socket string) error {
-	if err := os.WriteFile(OwnerPath(socket), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-		return fmt.Errorf("record the daemon owning %s: %w", socket, err)
-	}
-	return nil
+	return withOwnerLock(socket, func() error {
+		if err := os.WriteFile(OwnerPath(socket), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+			return fmt.Errorf("record the daemon owning %s: %w", socket, err)
+		}
+		return nil
+	})
 }
 
 // ReleaseOwner removes the record when it still names this process. After a
 // handoff it names the successor, and removing that would hide a live daemon.
+//
+// The read and the removal happen under the same lock as ClaimOwner's write,
+// so a successor that claims between them cannot have its record removed.
 func ReleaseOwner(socket string) {
-	if pid, ok := recordedOwner(socket); ok && pid == os.Getpid() {
-		_ = os.Remove(OwnerPath(socket))
-	}
+	_ = withOwnerLock(socket, func() error {
+		if pid, ok := recordedOwner(socket); ok && pid == os.Getpid() {
+			return os.Remove(OwnerPath(socket))
+		}
+		return nil
+	})
 }
 
 // recordedOwner reads the pid from the record.

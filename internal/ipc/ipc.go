@@ -66,7 +66,7 @@ func Listen(path string) (net.Listener, error) {
 		// gives, so the recorded owner decides: unlinking its socket would
 		// strand it on a path nobody can reach.
 		if ownerAlive(path) {
-			return nil, fmt.Errorf("socket %s refused a connection but its recorded owner is still running: %w", path, ErrLiveDaemon)
+			return nil, fmt.Errorf("socket %s refused a connection but its recorded owner is still running (if that pid is not a gh-monitor daemon, delete %s): %w", path, OwnerPath(path), ErrLiveDaemon)
 		}
 		// Stale socket from a crashed daemon — safe to reclaim.
 		_ = os.Remove(path)
