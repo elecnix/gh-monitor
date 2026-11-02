@@ -360,8 +360,15 @@ func TestLauncher_MultipleEntriesIndependent(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	// Let broken settle into its slow retry, then cancel to release healthy.
+	//
+	// The window is generous because the assertion below is about the ordering of
+	// log lines, not about speed: each retry is a real process spawn, and on a
+	// loaded machine three spawns plus their backoffs can take longer than 200ms.
+	// A fixed sleep that expires early fails with the third failure missing, which
+	// says "the machine was busy", not "supervision is broken" — the distinction
+	// the assertion cannot make from the log alone.
 	go func() {
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		cancel()
 	}()
 	_ = l.Run(ctx)
