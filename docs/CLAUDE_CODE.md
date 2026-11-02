@@ -66,7 +66,7 @@ Notification text is templated and user-overridable. Edit:
 ${XDG_CONFIG_HOME:-~/.config}/gh-monitor/preferences.json
 ```
 
-Each template is a string with `{token}` placeholders (e.g. `{prLabel}`, `{failingChecks}`, `{commitAuthor}`). A template value with no `{token}` is rejected; set a key to `null` to reset it to the built-in default. Non-template config keys `ignoredBots` (author logins to silence) and `retriggerComments` live in the same file. See the `monitor` section of the [README](../README.md) for the token and key list.
+Each template is a string with `{token}` placeholders (e.g. `{prLabel}`, `{failingChecks}`, `{commitAuthor}`). A template value with no `{token}` is rejected; set a key to `null` to reset it to the built-in default. A clause wrapped in `[[…]]` is optional: it is dropped when every `{token}` inside it renders empty, and kept otherwise — that is how the `new-commit` message names the commit's co-authors without rendering an empty "co-authored by" clause. The `[[…]]` markers only mean anything around a recognized `{token}`; anything else stays literal text. Non-template config keys `ignoredBots` (author logins to silence) and `retriggerComments` live in the same file. See the `monitor` section of the [README](../README.md) for the token and key list.
 
 ## Auto-start on `gh pr create`
 

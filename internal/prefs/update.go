@@ -123,6 +123,9 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 				if !hasToken(*val) {
 					return Preferences{}, fmt.Errorf("template %q has no {token}: %q", k, *val)
 				}
+				if hasUnclosedSegment(*val) {
+					return Preferences{}, fmt.Errorf("template %q has an unclosed [[segment]]: %q", k, *val)
+				}
 				stored.Templates[k] = val
 			}
 		case "ignoredBots":
@@ -306,6 +309,9 @@ func mergeStored(stored storedPreferences) Preferences {
 			continue
 		}
 		if !hasToken(*val) {
+			continue
+		}
+		if hasUnclosedSegment(*val) {
 			continue
 		}
 		prefs.Templates[key] = *val

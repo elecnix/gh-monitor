@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -113,7 +114,7 @@ var defaultTemplates = map[string]string{
 	"review-approved":          "✅ {prLabel} was approved by {reviewAuthor}",
 	"review-changes-requested": "⛔ {reviewAuthor} requested changes on {prLabel}",
 	"review-dismissed":         "🔄 Review dismissed on {prLabel}",
-	"new-commit":               "📝 New commit {commitShortOid} pushed to {prLabel} by {commitAuthor}. Review the PR description to ensure it still reflects the latest changes.",
+	"new-commit":               "📝 New commit {commitShortOid} pushed to {prLabel}[[ by {commitAuthor}]][[, co-authored by {commitCoauthors}]]. Review the PR description to ensure it still reflects the latest changes.",
 	"merged":                   "🔀 PR {prLabel} was merged. Monitoring stopped.",
 	"closed":                   "❌ PR {prLabel} was closed. Monitoring stopped.",
 	"first-poll":               "📡 Monitoring {prLabel} ({pollMode})",
@@ -295,20 +296,144 @@ var recognizedTokens = map[string]bool{
 // tokenRE matches a single {token} placeholder. The token name is captured.
 var tokenRE = regexp.MustCompile(`\{([a-zA-Z]+)\}`)
 
-// Interpolate replaces each recognized {token} with vars[token]. Unrecognized
-// tokens, and recognized tokens absent from vars, are left literally in place.
+// tokenStartRE matches a {token} placeholder at the start of the string it is
+// applied to, so a scan can tell "a token starts here" from "a token starts
+// further along".
+var tokenStartRE = regexp.MustCompile(`^\{([a-zA-Z]+)\}`)
+
+// Interpolate replaces each recognized {token} with vars[token], and drops
+// every optional segment whose tokens all render empty.
+//
+// An optional segment is written [[…]] and holds a clause that is only
+// meaningful when it has something to name. The built-in new-commit message
+// says "by alice, co-authored by bob" and must not say "co-authored by " when
+// the commit carries no Co-authored-by trailer.
+//
+// A segment is dropped when every {token} inside it resolves to an empty
+// value: the token is recognized and either absent from vars or mapped to "".
+// A token that is not recognized never resolves to an empty value — it is left
+// literal, exactly as outside a segment, so a typo stays visible instead of
+// silently vanishing.
+//
+// The [[…]] markers only mean anything around a recognized {token}. A [[…]]
+// holding no recognized token is literal text, markers included, so a
+// template that merely mentions brackets ("see [[1]]") keeps reading the way
+// its author wrote it.
+//
+// Segments nest, so a clause that depends on two values can be written
+// [[… {a} … [[… {b} …]] …]] and is dropped only when both are empty. A
+// segment is kept when any token inside it — including one inside a nested
+// segment — resolves to a non-empty value, so a nested clause that still has
+// something to say keeps the clause around it alive.
+//
+// Unrecognized tokens, and recognized tokens absent from vars, are left
+// literally in place.
 func Interpolate(template string, vars map[string]string) string {
-	return tokenRE.ReplaceAllStringFunc(template, func(match string) string {
-		name := match[1 : len(match)-1] // strip { }
+	return renderText(template, vars)
+}
+
+// renderText renders a piece of template text: recognized tokens are
+// substituted, and every optional segment it holds is resolved.
+func renderText(s string, vars map[string]string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if strings.HasPrefix(s[i:], "[[") {
+			body, next, closed := readSegment(s, i+2)
+			if !closed {
+				// An unclosed "[[" is literal text, and the tokens after it
+				// still render. Validate rejects such a template, so it
+				// never reaches a consumer.
+				b.WriteString("[[")
+				i += 2
+				continue
+			}
+			if !holdsRecognizedToken(body) {
+				// Not a segment: literal text, markers included.
+				b.WriteString(s[i:next])
+				i = next
+				continue
+			}
+			if keepSegment(body, vars) {
+				b.WriteString(renderText(body, vars))
+			}
+			i = next
+			continue
+		}
+		if strings.HasPrefix(s[i:], "{") {
+			// A token only counts when it starts here: a "{owner}" further
+			// along the string is not this position's token.
+			if m := tokenStartRE.FindString(s[i:]); m != "" {
+				name := m[1 : len(m)-1] // strip { }
+				if recognizedTokens[name] {
+					if val, ok := vars[name]; ok {
+						b.WriteString(val)
+						i += len(m)
+						continue
+					}
+				}
+				// An unrecognized token, or a recognized one with no value,
+				// stays literal.
+				b.WriteString(m)
+				i += len(m)
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// holdsRecognizedToken reports whether s contains at least one recognized
+// {token}. It is what makes "[[…]]" a segment rather than literal text.
+func holdsRecognizedToken(s string) bool {
+	for _, t := range tokenRE.FindAllStringSubmatch(s, -1) {
+		if recognizedTokens[t[1]] {
+			return true
+		}
+	}
+	return false
+}
+
+// keepSegment reports whether an optional segment's clause is worth keeping.
+// A segment whose tokens all resolve to an empty value has nothing to name
+// and is dropped. A segment holding an unrecognized token is kept, so a typo
+// stays visible.
+func keepSegment(body string, vars map[string]string) bool {
+	for _, t := range tokenRE.FindAllStringSubmatch(body, -1) {
+		name := t[1]
 		if !recognizedTokens[name] {
-			return match
+			return true
 		}
-		val, ok := vars[name]
-		if !ok {
-			return match
+		if val, ok := vars[name]; ok && val != "" {
+			return true
 		}
-		return val
-	})
+	}
+	return false
+}
+
+// readSegment reads the body of an optional segment starting at open (the
+// index just after the opening "[["). It returns the body, the index just
+// after the closing "]]", and whether the segment was closed at all. Nesting
+// is tracked, so a "]]" that closes an inner segment does not close this one.
+func readSegment(s string, open int) (body string, next int, closed bool) {
+	depth := 1
+	for i := open; i < len(s); {
+		switch {
+		case strings.HasPrefix(s[i:], "[["):
+			depth++
+			i += 2
+		case strings.HasPrefix(s[i:], "]]"):
+			depth--
+			if depth == 0 {
+				return s[open:i], i + 2, true
+			}
+			i += 2
+		default:
+			i++
+		}
+	}
+	return s[open:], len(s), false
 }
 
 // hasToken reports whether s contains at least one {…} placeholder.
@@ -316,9 +441,32 @@ func hasToken(s string) bool {
 	return tokenRE.MatchString(s)
 }
 
-// Validate rejects unknown template keys and any template value with no {…}
-// token (pi's safety guardrail against a template that can never interpolate).
-// The non-template config (IgnoredBots, RetriggerComments) is exempt.
+// hasUnclosedSegment reports whether s opens an optional segment it never
+// closes — a "[[" that wraps a recognized {token} with no matching "]]"
+// after it. Such a template keeps its markers literally, so it is rejected
+// rather than rendered as a broken sentence. Nesting is tracked the way
+// readSegment tracks it.
+func hasUnclosedSegment(s string) bool {
+	for i := 0; i < len(s); {
+		if !strings.HasPrefix(s[i:], "[[") {
+			i++
+			continue
+		}
+		body, next, closed := readSegment(s, i+2)
+		if !closed {
+			// The rest of the string is the body. It is a segment only if it
+			// holds a recognized token.
+			return holdsRecognizedToken(body)
+		}
+		i = next
+	}
+	return false
+}
+
+// Validate rejects unknown template keys, any template value with no {…}
+// token (pi's safety guardrail against a template that can never interpolate),
+// and any template with an optional segment that is never closed. The
+// non-template config (IgnoredBots, RetriggerComments) is exempt.
 func Validate(p Preferences) error {
 	for key, tmpl := range p.Templates {
 		if _, ok := defaultTemplates[key]; !ok {
@@ -326,6 +474,9 @@ func Validate(p Preferences) error {
 		}
 		if !hasToken(tmpl) {
 			return fmt.Errorf("template %q has no {token}: %q", key, tmpl)
+		}
+		if hasUnclosedSegment(tmpl) {
+			return fmt.Errorf("template %q has an unclosed [[segment]]: %q", key, tmpl)
 		}
 	}
 	return nil

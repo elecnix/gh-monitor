@@ -92,7 +92,16 @@ Template tokens: {owner} {repo} {number} {host} {prLabel} {prUrl}
 {reviewAuthor} {commitOid} {commitShortOid} {commitUrl} {commitAuthor}
 {commitCoauthors} {commitMessageHeadline} {issueState} {issueTitle}
 {issueComments} {runId} {runName} {runNumber} {runEvent} {runStatus}
-{runConclusion} {runBranch} {runUrl}.`,
+{runConclusion} {runBranch} {runUrl}.
+
+A clause may be wrapped in [[...]] to make it optional: the segment is
+dropped when every {token} inside it renders empty, and kept otherwise. The
+built-in new-commit message uses it, so a commit with no co-authors reads
+"... pushed to owner/repo#42 by alice." and never "..., co-authored by .".
+Segments nest, so [[... {a} ... [[... {b} ...]] ...]] is dropped only when
+both tokens are empty. The markers only mean anything around a recognized
+{token}: a [[...]] holding none is literal text, and one holding an unknown
+token is kept, so a typo stays visible.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPrefsGet(cmd, opts)
