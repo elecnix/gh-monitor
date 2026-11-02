@@ -18,6 +18,7 @@ import (
 	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
 	"github.com/elecnix/gh-monitor/internal/activation"
+	"github.com/elecnix/gh-monitor/internal/handoff"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -461,8 +462,11 @@ func startDaemonCommand(t *testing.T, sock string, interval string) (stop func()
 		require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
 		select {
 		case <-doneCh:
-		case <-time.After(10 * time.Second):
-			t.Fatal("daemon did not stop after SIGTERM")
+		case <-time.After(30 * time.Second):
+			// A daemon stop is a cycle, not an event: the accept loop closes, the
+			// launcher gets up to five seconds to reap its children, and clients
+			// drain. Ten seconds held on an idle machine and not on a loaded one.
+			t.Fatal("daemon did not stop within 30s of SIGTERM")
 		}
 	}, doneCh
 }
@@ -696,7 +700,11 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 	// The watcher must ride across: a loud break, a reconnect, and then only
 	// the delta — never a replay of the state it was already shown.
 	var sawDegraded, sawReconnect, sawReplay, sawDelta bool
-	deadline := time.After(10 * time.Second)
+	// Generous, because this is a daemon cycle: a socket handoff, a client
+	// noticing the break, and three reconnect attempts with backoff. Ten seconds
+	// is enough on an idle machine and not on a loaded one — which is where it
+	// was found, at exactly 10.00s.
+	deadline := time.After(30 * time.Second)
 	for done := false; !done; {
 		select {
 		case u, open := <-ch:
@@ -716,14 +724,30 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 				done = true
 			}
 		case <-deadline:
-			t.Fatalf("handoff never completed: degraded=%v reconnected=%v delta=%v",
-				sawDegraded, sawReconnect, sawDelta)
+			// Name the stage that was reached, so "slow" and "never" do not look
+			// the same: without this the message was identical for a watcher that
+			// never noticed the break and one that reconnected but saw no delta.
+			t.Fatalf("handoff did not complete within 30s — reached: break-loud=%v reconnected=%v delta=%v replay=%v; "+
+				"the daemon last reported %d client(s)",
+				sawDegraded, sawReconnect, sawDelta, sawReplay, len(lastClients(sock)))
 		}
 	}
 	assert.True(t, sawDegraded, "the break must be loud, never silent")
 	assert.True(t, sawReconnect, "the watcher must announce it reconnected")
 	assert.True(t, sawDelta, "the watcher must receive the change the new daemon fetched")
 	assert.False(t, sawReplay, "the watcher must not see a second first poll")
+}
+
+// lastClients reports what the daemon on sock says it is serving, for failure
+// messages that must distinguish a stalled handoff from an absent one.
+func lastClients(sock string) []handoff.ClientInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	info, err := handoff.Info(ctx, sock)
+	if err != nil {
+		return nil
+	}
+	return info.Clients
 }
 
 // TestDaemon_ReexecsFromRuntimeCopy verifies the daemon command relaunches
