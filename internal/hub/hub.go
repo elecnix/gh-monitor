@@ -267,9 +267,12 @@ func snapshotOptionsFor(opts backend.WatchOptions) monitor.SnapshotOptions {
 			snapOpts.AnnotationLevels = levels
 		}
 	}
-	if len(opts.AnnotationChecks) > 0 {
+	if len(opts.AnnotationChecks) > 0 || len(opts.AnnotationExcludeChecks) > 0 {
 		if checks, err := monitor.ParseAnnotationChecks(strings.Join(opts.AnnotationChecks, ",")); err == nil {
-			snapOpts.AnnotationChecks = checks
+			excluded := monitor.ParseAnnotationExclude(strings.Join(opts.AnnotationExcludeChecks, ","))
+			// ExcludedNames: the deny list travels in its own accessor, because
+			// Names() is the allow list and would exclude exactly what was allowed.
+			snapOpts.AnnotationChecks = monitor.NewAnnotationFilter(checks.Names(), excluded.ExcludedNames())
 		}
 	}
 	return snapOpts

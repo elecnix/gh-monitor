@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -167,4 +168,92 @@ func joinNames(names []string) string {
 		out += n
 	}
 	return out
+}
+
+// TestAnnotationExclude_WinsOverTheAllowList is the composition Nicolas asked
+// for: "everything except this" must not depend on the allow list being right,
+// so an exclusion applies even when the same name is allow-listed.
+func TestAnnotationExclude_WinsOverTheAllowList(t *testing.T) {
+	// Everything, except lint.
+	all := NewAnnotationFilter(nil, []string{"lint"})
+	assert.False(t, all.Allows("lint"), "an exclusion applies to the unfiltered case too")
+	assert.True(t, all.Allows("test"))
+	assert.True(t, all.Allows("DupDelta"), "matching stays case-insensitive")
+
+	// Both lists, naming the same check: the exclusion wins.
+	both := NewAnnotationFilter([]string{"lint", "test"}, []string{"lint"})
+	assert.False(t, both.Allows("lint"), "an exclusion is more specific than an allow")
+	assert.True(t, both.Allows("test"))
+	assert.False(t, both.Allows("deploy"), "the allow list still bounds what is left")
+
+	// Parsing, and the round trip through the wire form.
+	f := ParseAnnotationExclude(" Lint , ,dupdelta ")
+	assert.Equal(t, []string{"dupdelta", "lint"}, f.ExcludedNames())
+	assert.Equal(t, []string{"dupdelta", "lint"}, ParseAnnotationExclude("dupdelta,lint").ExcludedNames())
+	assert.Nil(t, ParseAnnotationExclude(""), "no exclusion means exclude nothing")
+	assert.Nil(t, ParseAnnotationExclude(" , "), "separators alone name nothing")
+}
+
+// TestAnnotationChecks_Unmatched names the mistake the guard exists for: an
+// allow list whose names appear on no check run. Without this, the operator
+// waits for annotations that can never arrive.
+func TestAnnotationChecks_Unmatched(t *testing.T) {
+	observed := []string{"lint", "test (node 20)", "dupdelta"}
+
+	typo := NewAnnotationChecks("lint", "tst (node 20)")
+	assert.Equal(t, []string{"tst (node 20)"}, typo.Unmatched(observed),
+		"the name that matched nothing is reported, and only that one")
+
+	assert.Empty(t, NewAnnotationChecks("LINT").Unmatched(observed),
+		"matching is case-insensitive here too")
+
+	assert.Nil(t, NewAnnotationChecks().Unmatched(observed),
+		"an explicit mute is not a typo: there is nothing to match")
+	assert.Nil(t, (*AnnotationChecks)(nil).Unmatched(observed),
+		"no filter excludes nothing and matches nothing to report")
+}
+
+// TestAnnotationChecks_DenyOnlyFilterRoundTrips is the muting bug a review
+// caught: a filter holding only exclusions has no allow list, which is "every
+// check except these" — but Names() used to serialise an empty allow list as
+// ["none"], so the filter crossed the process boundary as a deliberate mute and
+// silenced the watch it had just been asked to narrow.
+func TestAnnotationChecks_DenyOnlyFilterRoundTrips(t *testing.T) {
+	f := NewAnnotationFilter(nil, []string{"lint"})
+	assert.False(t, f.IsNone(), "a deny-only filter mutes nothing by itself")
+
+	assert.Nil(t, f.Names(), `no allow list means every check, not "none"`)
+	assert.Equal(t, []string{"lint"}, f.ExcludedNames())
+
+	// Rebuild from the wire form, exactly as the daemon does.
+	parsed, err := ParseAnnotationChecks(strings.Join(f.Names(), ","))
+	require.NoError(t, err)
+	back := NewAnnotationFilter(parsed.Names(), f.ExcludedNames())
+	assert.False(t, back.Allows("lint"), "the exclusion survives the round trip")
+	assert.True(t, back.Allows("test"), "and everything else stays allowed")
+	assert.False(t, back.IsNone(), "the round trip must not turn a narrowing into a mute")
+}
+
+// TestAnnotationExclude_ReachesTheSnapshot is the plumbing bug a review caught:
+// the exclusion list was passed to the filter through Names(), which is the
+// *allow* list — so every allowed check became an excluded one and the deny list
+// did nothing. Asserted through the same call the command makes.
+func TestAnnotationExclude_ReachesTheSnapshot(t *testing.T) {
+	allowed := NewAnnotationChecks("lint", "test")
+	denied := ParseAnnotationExclude("lint")
+
+	f := NewAnnotationFilter(allowed.Names(), denied.ExcludedNames())
+	assert.False(t, f.Allows("lint"), "the denied check is excluded")
+	assert.True(t, f.Allows("test"), "the other allowed check still passes")
+	assert.False(t, f.Allows("deploy"), "and the allow list still bounds the rest")
+}
+
+// TestAnnotationChecks_ZeroValueAllowsEverything: a zero-value filter has no
+// allow map at all, so it means "every check" — the same as nil. Serialising it
+// as "none" would turn a default-constructed struct into a mute.
+func TestAnnotationChecks_ZeroValueAllowsEverything(t *testing.T) {
+	var f AnnotationChecks
+	assert.True(t, f.Allows("anything"))
+	assert.False(t, f.IsNone())
+	assert.Nil(t, f.Names())
 }

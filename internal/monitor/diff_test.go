@@ -536,3 +536,47 @@ func TestDiffRef_MultipleEvents(t *testing.T) {
 	assert.Contains(t, types, EventNewFailingChecks)
 	assert.Contains(t, types, EventNewCommit)
 }
+
+// TestDiff_AnnotationFilterThatMatchesNothingSaysSo is the guard Nicolas asked
+// for: an allow list whose names appear on no check run must announce itself,
+// naming both what it looked for and what was actually there. Silence would be
+// indistinguishable from a quiet PR, and the operator would wait forever.
+func TestDiff_AnnotationFilterThatMatchesNothingSaysSo(t *testing.T) {
+	prev := &PRStatus{}
+	curr := &PRStatus{
+		AnnotationFilterUnmatched: []string{"tst (node 20)"},
+		ObservedChecks:            []string{"lint", "dupdelta"},
+	}
+
+	var notice string
+	for _, ev := range Diff(prev, curr) {
+		if ev.Type == EventDegraded && ev.Notice != "" {
+			notice = ev.Notice
+		}
+	}
+	require.NotEmpty(t, notice, "a filter that matches nothing must produce a notice")
+	assert.Contains(t, notice, "tst (node 20)", "the notice names the filter's own entry")
+	assert.Contains(t, notice, "lint", "and the checks that were actually seen")
+
+	// Said once: the next poll with the same wrong filter must not repeat it.
+	for _, ev := range Diff(curr, curr) {
+		assert.NotEqualf(t, EventDegraded, ev.Type, "the warning is not re-emitted every poll")
+	}
+}
+
+// TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll: a typo present from the
+// very first poll is the common case, and the first poll is exactly where the
+// rest of the diff is silent. Waiting for a previous snapshot to compare against
+// would mean the mistake is never reported.
+func TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll(t *testing.T) {
+	curr := &PRStatus{
+		AnnotationFilterUnmatched: []string{"tst"},
+		ObservedChecks:            []string{"lint"},
+	}
+	events := Diff(nil, curr)
+	require.Len(t, events, 1, "the first poll must carry the warning")
+	assert.Contains(t, events[0].Notice, "tst")
+
+	// And every later poll with the same wrong filter stays quiet.
+	assert.Empty(t, Diff(curr, curr), "the warning is not repeated")
+}

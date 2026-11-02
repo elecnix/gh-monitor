@@ -18,7 +18,12 @@ import (
 // exercises the same load path an operator's own settings take.
 func writeTestPrefs(t *testing.T, prefsJSON string) {
 	t.Helper()
+	// Every write goes through this helper, and it always sets XDG_CONFIG_HOME —
+	// the directory prefs.ConfigDir reads first on every platform. HOME is pinned
+	// too, so even a caller that clears XDG by mistake cannot reach the
+	// developer's real ~/.config.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
 	if prefsJSON == "" {
 		return
 	}
