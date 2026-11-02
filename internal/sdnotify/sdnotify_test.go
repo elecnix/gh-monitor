@@ -17,7 +17,10 @@ import (
 // notification carried.
 func fakeManager(t *testing.T) (addr string, recv func() string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "sdn-*")
+	// A short directory: darwin caps a Unix socket path at 104 bytes and TMPDIR
+	// there is a long /var/folders/... path, so a notification socket built on the
+	// default temp dir cannot be bound.
+	dir, err := os.MkdirTemp(shortTmp(), "sdn-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	addr = filepath.Join(dir, "notify")

@@ -3,10 +3,14 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -236,4 +240,136 @@ func TestHandoff_SuccessorDoesNotOwnAnActivatedPath(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &reported))
 	assert.True(t, reported.SocketActivated,
 		"the next successor must be told the path is the service manager's, or it unlinks it on shutdown")
+}
+
+// TestHandoff_MainPIDIsSentBeforeTheFDPass proves the ordering the design
+// depends on, rather than the message's contents. `Adopt` runs BeforeFD before
+// it asks for the listening socket, and if that ever inverts the predecessor's
+// exit races systemd's SIGCHLD handling — the cgroup kill the notification
+// exists to prevent.
+//
+// Both sides of the race are observed: the notification socket records when
+// MAINPID arrives, and the predecessor records when it is asked for its
+// descriptor. The assertion is on the order of those two events, so a change
+// that sent MAINPID after the fd pass fails here.
+func TestHandoff_MainPIDIsSentBeforeTheFDPass(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var mu sync.Mutex
+	var order []string
+	note := func(what string) {
+		mu.Lock()
+		order = append(order, what)
+		mu.Unlock()
+	}
+
+	// The notification socket is read as the messages arrive, so MAINPID is
+	// stamped in the sequence at the moment it is sent — draining afterwards would
+	// only prove it was sent at some point.
+	dir, derr := os.MkdirTemp(shortTmpDir(), "ghm-notify-*")
+	require.NoError(t, derr)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	addr := filepath.Join(dir, "notify")
+	notifyConn, nerr := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: addr, Net: "unixgram"})
+	require.NoError(t, nerr)
+	t.Cleanup(func() { _ = notifyConn.Close() })
+	t.Setenv(sdnotify.SocketEnv, addr)
+	t.Setenv("INVOCATION_ID", "inv-order")
+
+	notified := make(chan struct{})
+	go func() {
+		defer close(notified)
+		buf := make([]byte, 4096)
+		for {
+			n, rerr := notifyConn.Read(buf)
+			if rerr != nil {
+				return
+			}
+			if strings.Contains(string(buf[:n]), "MAINPID=") {
+				note("mainpid")
+				return
+			}
+		}
+	}()
+
+	sock := shortSocket(t, "ghmon-order-*.d")
+	l, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+
+	h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return openPR(), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+	go func() {
+		for {
+			conn, aerr := l.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				cfg := remote.ServerConfig{
+					Name: DaemonBackendName,
+					Source: backend.SourceFunc(func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+						return nil, errors.New("unused")
+					}),
+					HandleOp: func(_ context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
+						switch req.Op {
+						case handoff.OpInfo:
+							raw, _ := json.Marshal(handoff.DaemonInfo{
+								PID: os.Getpid() + 1, Socket: sock, Supervised: true,
+								InvocationID: "inv-order",
+							})
+							return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+						case handoff.OpHandoff:
+							raw, _ := json.Marshal(h.ExportState())
+							return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+						case handoff.OpHandoffFD:
+							// The predecessor is being asked for its descriptor: this is
+							// the moment MAINPID had to precede.
+							note("fd-pass")
+							if serr := handoff.SendListener(conn.(*net.UnixConn), l); serr != nil {
+								return true, serr
+							}
+							_ = l.Close()
+							return true, nil
+						}
+						return false, nil
+					},
+				}
+				_ = remote.Serve(ctx, c, cfg)
+			}(conn)
+		}
+	}()
+	t.Cleanup(func() { _ = l.Close() })
+
+	d := &daemonRuntime{socket: sock, info: daemonInfo{invocationID: "inv-order", supervised: true}}
+	listener, _, err := d.listenOrAdopt(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	select {
+	case <-notified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no MAINPID notification arrived")
+	}
+
+	mu.Lock()
+	got := append([]string(nil), order...)
+	mu.Unlock()
+	require.Contains(t, got, "mainpid", "the successor must announce itself")
+	require.Contains(t, got, "fd-pass", "and must take the socket")
+	assert.Less(t, indexOf(got, "mainpid"), indexOf(got, "fd-pass"),
+		"MAINPID must be sent before the listening socket changes hands, or the predecessor's exit races the cgroup teardown")
+}
+
+// indexOf returns the position of want in list, or -1.
+func indexOf(list []string, want string) int {
+	for i, v := range list {
+		if v == want {
+			return i
+		}
+	}
+	return -1
 }
