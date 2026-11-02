@@ -127,7 +127,19 @@ func TestMonitor_EventLogRecordsTheSource(t *testing.T) {
 // operator has not turned the event log on — it is strictly opt-in.
 func TestMonitor_EventLogOffByDefault(t *testing.T) {
 	dir := t.TempDir()
+	// The default log location is derived from the user cache directory, which
+	// is *not* XDG_CONFIG_HOME and is not XDG_CACHE_HOME on every platform: on
+	// darwin os.UserCacheDir is $HOME/Library/Caches and ignores XDG entirely.
+	// Isolating only XDG_CONFIG_HOME left this test reading the real user
+	// directory, so it passed on a machine that had never run gh monitor and
+	// failed on a Mac where it runs in production. HOME is isolated too, and
+	// the assertion below checks the path it landed on is inside that sandbox —
+	// if isolation ever stops working, this fails loudly instead of quietly
+	// inspecting somebody's home directory.
+	home := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("HOME", home)
 	t.Setenv("GH_HOST", "")
 
 	originalFactory := apiClientFactory
@@ -148,8 +160,10 @@ func TestMonitor_EventLogOffByDefault(t *testing.T) {
 
 	// The default location must not appear either.
 	def := DefaultEventLogDir()
-	if def != filepath.Join(dir, "events") { // only meaningful when XDG points at the temp dir
-		_, statErr = os.Stat(def)
-		assert.True(t, os.IsNotExist(statErr) || statErr != nil, "default event log dir must not be created when off")
-	}
+	require.NotEqual(t, filepath.Join(dir, "events"), def,
+		"the default location must be reached through the cache dir, not the config dir")
+	assert.True(t, strings.HasPrefix(def, home),
+		"the default log dir %q escaped the sandbox at %q: this test would read the user's real files", def, home)
+	_, statErr = os.Stat(def)
+	assert.True(t, os.IsNotExist(statErr), "default event log dir must not be created when off (%v)", statErr)
 }
