@@ -94,13 +94,21 @@ type CIVerdict struct {
 	Annotations          []AnnotationSummary
 	AnnotationsTruncated bool
 	AnnotationsURL       string
+
+	// ObservedChecks are the check-run names this payload carried, whatever the
+	// filter did with them, and AnnotationFilterUnmatched are the allow-listed
+	// names that matched none of them. An empty unmatched list is silence; a
+	// non-empty one means the filter is wrong, and saying so is the difference
+	// between a quiet watch and a blind one.
+	ObservedChecks            []string
+	AnnotationFilterUnmatched []string
 }
 
 // JudgeCI computes the CI verdict for a head-commit view. It is the single
 // entry point: every classifier below is reached only from here, so no reader
 // can apply a different version of "is CI green".
 func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
-	anns, truncated, url := extractAnnotations(v, opts.AnnotationLevels, opts.AnnotationChecks)
+	anns, truncated, url, observed := extractAnnotations(v, opts.AnnotationLevels, opts.AnnotationChecks)
 	return CIVerdict{
 		Failing:              failingChecks(v),
 		Pending:              pendingChecks(v),
@@ -110,6 +118,9 @@ func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
 		Annotations:          anns,
 		AnnotationsTruncated: truncated,
 		AnnotationsURL:       url,
+
+		ObservedChecks:            observed,
+		AnnotationFilterUnmatched: opts.AnnotationChecks.Unmatched(observed),
 	}
 }
 
@@ -504,9 +515,12 @@ func awaitingChecks(v HeadCommitView, required []string) []string {
 // snapshot-time decisions: an annotation the operator does not want must
 // never reach the snapshot, or it would show up as a "new" annotation in the
 // diff on every poll.
-func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *AnnotationChecks) (annotations []AnnotationSummary, truncated bool, url string) {
+func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *AnnotationChecks) (annotations []AnnotationSummary, truncated bool, url string, observed []string) {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
+	// Every run name is recorded before the filter runs, so a filter that
+	// matches nothing can be told what it failed to match.
+	seenChecks := map[string]bool{}
 	for _, c := range v.Commits {
 		for j := range c.Suites.Nodes {
 			suite := &c.Suites.Nodes[j]
@@ -521,6 +535,10 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *Anno
 					if url == "" {
 						url = run.Permalink
 					}
+				}
+				if run.Name != "" && !seenChecks[strings.ToLower(run.Name)] {
+					seenChecks[strings.ToLower(run.Name)] = true
+					observed = append(observed, run.Name)
 				}
 				if !checks.Allows(run.Name) {
 					continue
@@ -546,5 +564,5 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *Anno
 			}
 		}
 	}
-	return out, truncated, url
+	return out, truncated, url, observed
 }

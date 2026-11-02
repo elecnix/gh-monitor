@@ -168,3 +168,46 @@ func joinNames(names []string) string {
 	}
 	return out
 }
+
+// TestAnnotationExclude_WinsOverTheAllowList is the composition Nicolas asked
+// for: "everything except this" must not depend on the allow list being right,
+// so an exclusion applies even when the same name is allow-listed.
+func TestAnnotationExclude_WinsOverTheAllowList(t *testing.T) {
+	// Everything, except lint.
+	all := NewAnnotationFilter(nil, []string{"lint"})
+	assert.False(t, all.Allows("lint"), "an exclusion applies to the unfiltered case too")
+	assert.True(t, all.Allows("test"))
+	assert.True(t, all.Allows("DupDelta"), "matching stays case-insensitive")
+
+	// Both lists, naming the same check: the exclusion wins.
+	both := NewAnnotationFilter([]string{"lint", "test"}, []string{"lint"})
+	assert.False(t, both.Allows("lint"), "an exclusion is more specific than an allow")
+	assert.True(t, both.Allows("test"))
+	assert.False(t, both.Allows("deploy"), "the allow list still bounds what is left")
+
+	// Parsing, and the round trip through the wire form.
+	f := ParseAnnotationExclude(" Lint , ,dupdelta ")
+	assert.Equal(t, []string{"dupdelta", "lint"}, f.ExcludedNames())
+	assert.Equal(t, []string{"dupdelta", "lint"}, ParseAnnotationExclude("dupdelta,lint").ExcludedNames())
+	assert.Nil(t, ParseAnnotationExclude(""), "no exclusion means exclude nothing")
+	assert.Nil(t, ParseAnnotationExclude(" , "), "separators alone name nothing")
+}
+
+// TestAnnotationChecks_Unmatched names the mistake the guard exists for: an
+// allow list whose names appear on no check run. Without this, the operator
+// waits for annotations that can never arrive.
+func TestAnnotationChecks_Unmatched(t *testing.T) {
+	observed := []string{"lint", "test (node 20)", "dupdelta"}
+
+	typo := NewAnnotationChecks("lint", "tst (node 20)")
+	assert.Equal(t, []string{"tst (node 20)"}, typo.Unmatched(observed),
+		"the name that matched nothing is reported, and only that one")
+
+	assert.Empty(t, NewAnnotationChecks("LINT").Unmatched(observed),
+		"matching is case-insensitive here too")
+
+	assert.Nil(t, NewAnnotationChecks().Unmatched(observed),
+		"an explicit mute is not a typo: there is nothing to match")
+	assert.Nil(t, (*AnnotationChecks)(nil).Unmatched(observed),
+		"no filter excludes nothing and matches nothing to report")
+}

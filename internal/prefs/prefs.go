@@ -73,12 +73,17 @@ type Preferences struct {
 	IgnoredBots []string          `json:"ignoredBots"`
 	// AnnotationChecks names the checks whose annotations are reported.
 	// Empty means every check.
-	AnnotationChecks      []string `json:"annotationChecks"`
-	RetriggerComments     bool     `json:"retriggerComments"`
-	SelfUpdate            string   `json:"selfUpdate,omitempty"`
-	PollInterval          string   `json:"pollInterval,omitempty"`
-	IdlePollCeiling       string   `json:"idlePollCeiling,omitempty"`
-	PollWhenBrokerHealthy bool     `json:"pollWhenBrokerHealthy"`
+	AnnotationChecks []string `json:"annotationChecks"`
+	// AnnotationExcludeChecks names checks whose annotations are never
+	// reported, whatever the allow list says. It is the defence against a
+	// typo in AnnotationChecks silently matching nothing: "everything except
+	// this" cannot go blind by misspelling a check that does not exist.
+	AnnotationExcludeChecks []string `json:"annotationExcludeChecks"`
+	RetriggerComments       bool     `json:"retriggerComments"`
+	SelfUpdate              string   `json:"selfUpdate,omitempty"`
+	PollInterval            string   `json:"pollInterval,omitempty"`
+	IdlePollCeiling         string   `json:"idlePollCeiling,omitempty"`
+	PollWhenBrokerHealthy   bool     `json:"pollWhenBrokerHealthy"`
 	// CoveredSafetyInterval is how long a repository a sub-daemon covers may
 	// go without an event before the daemon fetches an active watch on it
 	// once. Unset means DefaultCoveredSafetyInterval; "0" or "false" turns
@@ -159,15 +164,16 @@ func DefaultPreferences() Preferences {
 		templates[k] = v
 	}
 	return Preferences{
-		Templates:             templates,
-		IgnoredBots:           []string{},
-		AnnotationChecks:      []string{},
-		RetriggerComments:     false,
-		SelfUpdate:            "",
-		PollInterval:          "",
-		IdlePollCeiling:       "",
-		PollWhenBrokerHealthy: true,
-		ReactOnNotify:         true,
+		Templates:               templates,
+		IgnoredBots:             []string{},
+		AnnotationChecks:        []string{},
+		AnnotationExcludeChecks: []string{},
+		RetriggerComments:       false,
+		SelfUpdate:              "",
+		PollInterval:            "",
+		IdlePollCeiling:         "",
+		PollWhenBrokerHealthy:   true,
+		ReactOnNotify:           true,
 	}
 }
 
@@ -580,17 +586,18 @@ func legacyPath(baseDir string) (string, error) {
 // JSON null is distinguishable from an absent key: null resets that key to
 // default, absent leaves the default untouched.
 type storedPreferences struct {
-	Templates             map[string]*string `json:"templates"`
-	IgnoredBots           []string           `json:"ignoredBots"`
-	AnnotationChecks      []string           `json:"annotationChecks"`
-	RetriggerComments     *bool              `json:"retriggerComments,omitempty"`
-	SelfUpdate            *string            `json:"selfUpdate,omitempty"`
-	PollInterval          *string            `json:"pollInterval,omitempty"`
-	IdlePollCeiling       *string            `json:"idlePollCeiling,omitempty"`
-	PollWhenBrokerHealthy *bool              `json:"pollWhenBrokerHealthy,omitempty"`
-	CoveredSafetyInterval *string            `json:"coveredSafetyInterval,omitempty"`
-	ReactOnNotify         *bool              `json:"reactOnNotify,omitempty"`
-	EventLog              *EventLogConfig    `json:"eventLog,omitempty"`
+	Templates               map[string]*string `json:"templates"`
+	IgnoredBots             []string           `json:"ignoredBots"`
+	AnnotationChecks        []string           `json:"annotationChecks"`
+	AnnotationExcludeChecks []string           `json:"annotationExcludeChecks"`
+	RetriggerComments       *bool              `json:"retriggerComments,omitempty"`
+	SelfUpdate              *string            `json:"selfUpdate,omitempty"`
+	PollInterval            *string            `json:"pollInterval,omitempty"`
+	IdlePollCeiling         *string            `json:"idlePollCeiling,omitempty"`
+	PollWhenBrokerHealthy   *bool              `json:"pollWhenBrokerHealthy,omitempty"`
+	CoveredSafetyInterval   *string            `json:"coveredSafetyInterval,omitempty"`
+	ReactOnNotify           *bool              `json:"reactOnNotify,omitempty"`
+	EventLog                *EventLogConfig    `json:"eventLog,omitempty"`
 }
 
 // Load starts from DefaultPreferences and overlays the JSON file if present.

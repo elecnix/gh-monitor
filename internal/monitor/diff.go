@@ -1,5 +1,10 @@
 package monitor
 
+import (
+	"fmt"
+	"strings"
+)
+
 // CarryForwardShed retains the last-known values for surfaces the current
 // snapshot's tier no longer fetches (listed in curr.ShedSurfaces, a typed
 // Surfaces vocabulary — see surface.go), so Diff sees "not watched" rather
@@ -124,6 +129,18 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 	}
 
 	// New check-run annotations.
+	// A filter that matches nothing must say so. Silence and a typo look
+	// identical from here otherwise, and the operator's next move — waiting for
+	// annotations that can never arrive — is the wrong one.
+	if len(curr.AnnotationFilterUnmatched) > 0 && len(prev.AnnotationFilterUnmatched) == 0 {
+		events = append(events, Event{
+			Type: EventDegraded,
+			Notice: fmt.Sprintf("⚠️ annotation filter matches no check on this payload: %s not seen; the checks here are %s. Fix --annotation-checks or the annotationChecks preference.",
+				strings.Join(curr.AnnotationFilterUnmatched, ", "),
+				strings.Join(curr.ObservedChecks, ", ")),
+		})
+	}
+
 	if newAnn := diffAnnotations(prev.CheckAnnotations, curr.CheckAnnotations); len(newAnn) > 0 {
 		evt := Event{Type: EventCheckAnnotations, Annotations: newAnn}
 		if curr.AnnotationsTruncated {

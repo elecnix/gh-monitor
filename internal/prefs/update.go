@@ -13,7 +13,7 @@ import (
 // validation; this slice exists so the error message and DaemonReadKeys cannot
 // name a key the switch would reject.
 var validPrefKeys = []string{
-	"templates", "ignoredBots", "annotationChecks", "retriggerComments", "selfUpdate",
+	"templates", "ignoredBots", "annotationChecks", "annotationExcludeChecks", "retriggerComments", "selfUpdate",
 	"pollInterval", "idlePollCeiling", "coveredSafetyInterval", "pollWhenBrokerHealthy",
 	"reactOnNotify", "eventLog",
 }
@@ -160,6 +160,21 @@ func UpdateFile(baseDir string, overrides []byte) (Preferences, error) {
 					}
 				}
 				stored.AnnotationChecks = checks
+			}
+		case "annotationExcludeChecks":
+			if string(v) == "null" {
+				stored.AnnotationExcludeChecks = []string{}
+			} else {
+				var checks []string
+				if err := json.Unmarshal(v, &checks); err != nil {
+					return Preferences{}, fmt.Errorf("parse annotationExcludeChecks: %w", err)
+				}
+				for _, c := range checks {
+					if strings.TrimSpace(c) == "" {
+						return Preferences{}, fmt.Errorf("invalid annotationExcludeChecks entry %q: a check name cannot be blank", c)
+					}
+				}
+				stored.AnnotationExcludeChecks = checks
 			}
 		case "retriggerComments":
 			if string(v) == "null" {
@@ -341,6 +356,9 @@ func mergeStored(stored storedPreferences) Preferences {
 	}
 	if stored.IgnoredBots != nil {
 		prefs.IgnoredBots = stored.IgnoredBots
+	}
+	if stored.AnnotationExcludeChecks != nil {
+		prefs.AnnotationExcludeChecks = stored.AnnotationExcludeChecks
 	}
 	if stored.AnnotationChecks != nil {
 		prefs.AnnotationChecks = stored.AnnotationChecks

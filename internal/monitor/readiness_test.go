@@ -32,7 +32,9 @@ func TestFetchReadiness(t *testing.T) {
 								State:            "OPEN",
 								Mergeable:        "MERGEABLE",
 								MergeStateStatus: "CLEAN",
-								Author:           struct{ Login string `json:"login"` }{Login: "alice"},
+								Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"},
 							},
 						},
 					},
@@ -64,7 +66,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 45,
 							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-25"},
 							Nodes: []ReadinessPR{
-								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+								{Number: 1, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"}},
 							},
 						},
 					},
@@ -79,7 +83,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 45,
 							PageInfo:   PageInfo{HasNextPage: false},
 							Nodes: []ReadinessPR{
-								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+								{Number: 2, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "bob"}},
 							},
 						},
 					},
@@ -121,7 +127,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 41,
 							PageInfo:   PageInfo{HasNextPage: true, EndCursor: "cursor-12"},
 							Nodes: []ReadinessPR{
-								{Number: 1, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "alice"}},
+								{Number: 1, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "alice"}},
 							},
 						},
 					},
@@ -138,7 +146,9 @@ func TestFetchReadiness(t *testing.T) {
 							TotalCount: 41,
 							PageInfo:   PageInfo{HasNextPage: false},
 							Nodes: []ReadinessPR{
-								{Number: 2, State: "OPEN", Author: struct{ Login string `json:"login"` }{Login: "bob"}},
+								{Number: 2, State: "OPEN", Author: struct {
+									Login string `json:"login"`
+								}{Login: "bob"}},
 							},
 						},
 					},
@@ -167,7 +177,9 @@ func makeReadinessPR(number int, author string, mergeable string, mergeStateStat
 		State:            "OPEN",
 		Mergeable:        mergeable,
 		MergeStateStatus: mergeStateStatus,
-		Author:           struct{ Login string `json:"login"` }{Login: author},
+		Author: struct {
+			Login string `json:"login"`
+		}{Login: author},
 	}
 }
 
@@ -262,7 +274,9 @@ func makeReadinessPRWithConflict(number int, author string) ReadinessPR {
 func makeReadinessPRWithReviewChanges(number int, author string) ReadinessPR {
 	rp := makeReadinessPRWithCI(number, author, "MERGEABLE", "CLEAN")
 	rp.Reviews = ReviewNodes{Nodes: []Review{
-		{State: "CHANGES_REQUESTED", Author: struct{ Login string `json:"login"` }{Login: "reviewer"}},
+		{State: "CHANGES_REQUESTED", Author: struct {
+			Login string `json:"login"`
+		}{Login: "reviewer"}},
 	}}
 	return rp
 }
@@ -558,10 +572,10 @@ func TestReadinessReport_FormatZeroOpen(t *testing.T) {
 func TestReadinessReport_Reconcile(t *testing.T) {
 	t.Run("clean report passes", func(t *testing.T) {
 		report := &ReadinessReport{
-			Open:  3,
-			Ready: []PRReadiness{{Number: 1}},
+			Open:     3,
+			Ready:    []PRReadiness{{Number: 1}},
 			NotReady: []PRReadiness{{Number: 2}},
-			Others: []PRReadiness{{Number: 3}},
+			Others:   []PRReadiness{{Number: 3}},
 		}
 		assert.Empty(t, report.Reconcile())
 	})
@@ -577,8 +591,8 @@ func TestReadinessReport_Reconcile(t *testing.T) {
 
 	t.Run("duplicate across buckets fails", func(t *testing.T) {
 		report := &ReadinessReport{
-			Open:  2,
-			Ready: []PRReadiness{{Number: 1}},
+			Open:     2,
+			Ready:    []PRReadiness{{Number: 1}},
 			NotReady: []PRReadiness{{Number: 1}},
 		}
 		err := report.Reconcile()

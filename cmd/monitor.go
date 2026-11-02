@@ -44,6 +44,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds, or 'any' for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first)")
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().StringVar(&opts.AnnotationChecks, "annotation-checks", "", "Comma-separated check names whose annotations to surface (default: every check)")
+	cmd.Flags().StringVar(&opts.AnnotationExcludeChecks, "annotation-exclude-checks", "", "Comma-separated check names whose annotations to suppress, whoever allows them")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
 	cmd.Flags().StringVar(&opts.Instance, "instance", "", "Named instance identifier for resumable cursor (issue #32)")
@@ -70,12 +71,16 @@ type monitorOptions struct {
 	// AnnotationChecks is the comma-separated list of check names whose
 	// annotations the watch surfaces. Empty means every check.
 	AnnotationChecks string
-	Once             bool
-	Text             bool
-	Instance         string
-	FromBeginning    bool
-	Viewer           string
-	Backend          backendOptions
+	// AnnotationExcludeChecks is the comma-separated deny list. It wins over the
+	// allow list, so "everything except lint" works, and a typo in the allow
+	// list is not the only defence against silence.
+	AnnotationExcludeChecks string
+	Once                    bool
+	Text                    bool
+	Instance                string
+	FromBeginning           bool
+	Viewer                  string
+	Backend                 backendOptions
 }
 
 func (o *monitorOptions) Validate() error {
@@ -386,6 +391,15 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			return err
 		}
 	}
+	// The deny list composes with whatever allow list is in force, flag or
+	// preference: an exclusion is statement about one check, not about the set.
+	excluded := monitor.ParseAnnotationExclude(strings.Join(p.AnnotationExcludeChecks, ","))
+	if strings.TrimSpace(opts.AnnotationExcludeChecks) != "" {
+		excluded = monitor.ParseAnnotationExclude(opts.AnnotationExcludeChecks)
+	}
+	if excluded != nil {
+		runOpts.AnnotationChecks = monitor.NewAnnotationFilter(runOpts.AnnotationChecks.Names(), excluded.Names())
+	}
 
 	write := func(n monitor.Notification) error {
 		var err error
@@ -489,16 +503,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 
 	watchOpts := backend.WatchOptions{
-		Interval:         runOpts.Interval,
-		Timeout:          time.Duration(opts.Timeout) * time.Second,
-		Once:             opts.Once,
-		Since:            cursorPosition,
-		IgnoredAuthors:   runOpts.Prefs.IgnoredBots,
-		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
-		AnnotationLevels: runOpts.AnnotationLevels.Names(),
-		AnnotationChecks: runOpts.AnnotationChecks.Names(),
-		Baseline:         cursorSnapshot,
-		ResumeID:         resumeID,
+		Interval:                runOpts.Interval,
+		Timeout:                 time.Duration(opts.Timeout) * time.Second,
+		Once:                    opts.Once,
+		Since:                   cursorPosition,
+		IgnoredAuthors:          runOpts.Prefs.IgnoredBots,
+		RepeatUnresolved:        runOpts.Prefs.RetriggerComments,
+		AnnotationLevels:        runOpts.AnnotationLevels.Names(),
+		AnnotationChecks:        runOpts.AnnotationChecks.Names(),
+		AnnotationExcludeChecks: runOpts.AnnotationChecks.ExcludedNames(),
+		Baseline:                cursorSnapshot,
+		ResumeID:                resumeID,
 	}
 	if seededBaseline != "" {
 		watchOpts.Baseline = seededBaseline
