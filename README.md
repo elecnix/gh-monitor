@@ -670,7 +670,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "annotationChecks": ["check", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "annotationChecks": ["check", …], "annotationExcludeChecks": ["check", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 #### Optional template segments
 

@@ -367,3 +367,37 @@ func TestHeadCommitViewOf_EmptyPullRequestYieldsAnEmptyView(t *testing.T) {
 	assert.Empty(t, HeadCommitViewOf(nil).Commits)
 	assert.Empty(t, HeadCommitViewOf(&PullRequest{}).Commits)
 }
+
+// TestJudgeCI_DroppedSuitesDoNotAccuseTheFilter: when GitHub reports more suites
+// than the page carried, the check a filter names may be in the part that never
+// arrived. Accusing the filter there sends the operator to fix something that is
+// correct — the same reasoning as a truncated annotation set, and a separate
+// condition from it.
+func TestJudgeCI_DroppedSuitesDoNotAccuseTheFilter(t *testing.T) {
+	pr := &PullRequest{
+		State: "OPEN",
+		Commits: CommitNodes{Nodes: []Commit{{Commit: CommitDetails{
+			// One suite present, two reported: the second was cut off.
+			CheckSuites: SuiteNodes{
+				TotalCount: 2,
+				Nodes: []CheckSuite{{
+					Status: "COMPLETED", Conclusion: "SUCCESS",
+					App:       AppInfo{Name: "ci"},
+					CheckRuns: RunNodes{Nodes: []CheckRun{{Name: "lint", Status: "COMPLETED"}}},
+				}},
+			},
+		}}}},
+	}
+	verdict := JudgeCI(HeadCommitViewOf(pr), CIVerdictOptions{
+		AnnotationChecks: NewAnnotationChecks("secret-job"),
+	})
+	assert.Empty(t, verdict.AnnotationFilterUnmatched,
+		"an incomplete payload cannot prove the filter wrong")
+
+	// The complete payload may, and does.
+	pr.Commits.Nodes[0].Commit.CheckSuites.TotalCount = 1
+	verdict = JudgeCI(HeadCommitViewOf(pr), CIVerdictOptions{
+		AnnotationChecks: NewAnnotationChecks("secret-job"),
+	})
+	assert.Equal(t, []string{"secret-job"}, verdict.AnnotationFilterUnmatched)
+}

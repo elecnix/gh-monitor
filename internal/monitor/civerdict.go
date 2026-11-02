@@ -124,7 +124,7 @@ func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
 		// the payload is truncated, the matching check may simply be in the part
 		// that was cut off, and a false accusation sends the operator to fix a
 		// filter that is correct.
-		AnnotationFilterUnmatched: unmatchedUnless(truncated, opts.AnnotationChecks, observed),
+		AnnotationFilterUnmatched: unmatchedUnless(truncated || suitesDropped(v), opts.AnnotationChecks, observed),
 	}
 }
 
@@ -519,10 +519,26 @@ func awaitingChecks(v HeadCommitView, required []string) []string {
 // snapshot-time decisions: an annotation the operator does not want must
 // never reach the snapshot, or it would show up as a "new" annotation in the
 // diff on every poll.
+// suitesDropped reports whether the payload carried fewer suites than GitHub
+// said it had, which means some check runs never reached us. It is the same
+// fact as Truncated for this purpose: an absent check cannot prove a filter
+// wrong, because the check that matches may be in the part that was cut off. The
+// two are separate conditions — Truncated covers runs and annotations within a
+// suite, this covers whole suites — and a filter can be falsely accused by
+// either.
+func suitesDropped(v HeadCommitView) bool {
+	for _, c := range v.Commits {
+		if c.Suites.TotalCount > len(c.Suites.Nodes) {
+			return true
+		}
+	}
+	return false
+}
+
 // unmatchedUnless suppresses the unmatched-filter report when the payload that
 // would prove it is incomplete.
-func unmatchedUnless(truncated bool, filter *AnnotationChecks, observed []string) []string {
-	if truncated {
+func unmatchedUnless(incomplete bool, filter *AnnotationChecks, observed []string) []string {
+	if incomplete {
 		return nil
 	}
 	return filter.Unmatched(observed)
