@@ -233,3 +233,27 @@ func TestAnnotationChecks_DenyOnlyFilterRoundTrips(t *testing.T) {
 	assert.True(t, back.Allows("test"), "and everything else stays allowed")
 	assert.False(t, back.IsNone(), "the round trip must not turn a narrowing into a mute")
 }
+
+// TestAnnotationExclude_ReachesTheSnapshot is the plumbing bug a review caught:
+// the exclusion list was passed to the filter through Names(), which is the
+// *allow* list — so every allowed check became an excluded one and the deny list
+// did nothing. Asserted through the same call the command makes.
+func TestAnnotationExclude_ReachesTheSnapshot(t *testing.T) {
+	allowed := NewAnnotationChecks("lint", "test")
+	denied := ParseAnnotationExclude("lint")
+
+	f := NewAnnotationFilter(allowed.Names(), denied.ExcludedNames())
+	assert.False(t, f.Allows("lint"), "the denied check is excluded")
+	assert.True(t, f.Allows("test"), "the other allowed check still passes")
+	assert.False(t, f.Allows("deploy"), "and the allow list still bounds the rest")
+}
+
+// TestAnnotationChecks_ZeroValueAllowsEverything: a zero-value filter has no
+// allow map at all, so it means "every check" — the same as nil. Serialising it
+// as "none" would turn a default-constructed struct into a mute.
+func TestAnnotationChecks_ZeroValueAllowsEverything(t *testing.T) {
+	var f AnnotationChecks
+	assert.True(t, f.Allows("anything"))
+	assert.False(t, f.IsNone())
+	assert.Nil(t, f.Names())
+}

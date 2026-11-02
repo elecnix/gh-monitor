@@ -405,7 +405,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 	}
 	if excluded != nil {
-		runOpts.AnnotationChecks = monitor.NewAnnotationFilter(runOpts.AnnotationChecks.Names(), excluded.Names())
+		// ExcludedNames, not Names: Names() is the allow list, and passing it as
+		// the deny list turned every allowed check into an excluded one.
+		runOpts.AnnotationChecks = monitor.NewAnnotationFilter(runOpts.AnnotationChecks.Names(), excluded.ExcludedNames())
 	}
 
 	write := func(n monitor.Notification) error {

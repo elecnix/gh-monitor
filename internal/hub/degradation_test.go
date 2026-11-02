@@ -201,4 +201,3 @@ func TestDegradation_ConcurrentFailAndRecoverHoldsTheInvariant(t *testing.T) {
 		<-done
 	}
 }
-

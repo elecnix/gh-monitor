@@ -119,8 +119,12 @@ func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
 		AnnotationsTruncated: truncated,
 		AnnotationsURL:       url,
 
-		ObservedChecks:            observed,
-		AnnotationFilterUnmatched: opts.AnnotationChecks.Unmatched(observed),
+		ObservedChecks: observed,
+		// Only a complete payload may accuse the filter of matching nothing: when
+		// the payload is truncated, the matching check may simply be in the part
+		// that was cut off, and a false accusation sends the operator to fix a
+		// filter that is correct.
+		AnnotationFilterUnmatched: unmatchedUnless(truncated, opts.AnnotationChecks, observed),
 	}
 }
 
@@ -515,6 +519,15 @@ func awaitingChecks(v HeadCommitView, required []string) []string {
 // snapshot-time decisions: an annotation the operator does not want must
 // never reach the snapshot, or it would show up as a "new" annotation in the
 // diff on every poll.
+// unmatchedUnless suppresses the unmatched-filter report when the payload that
+// would prove it is incomplete.
+func unmatchedUnless(truncated bool, filter *AnnotationChecks, observed []string) []string {
+	if truncated {
+		return nil
+	}
+	return filter.Unmatched(observed)
+}
+
 func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *AnnotationChecks) (annotations []AnnotationSummary, truncated bool, url string, observed []string) {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
