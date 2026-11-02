@@ -26,6 +26,8 @@ func runtimeRoot(t *testing.T) string {
 	// isolated only XDG left its sandbox and read the real user directory.
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CACHE_HOME", dir)
+	// Windows derives its cache dir from %LocalAppData%, not HOME.
+	t.Setenv("LocalAppData", dir)
 	return dir
 }
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -218,8 +219,21 @@ func TestHandoff_SuccessorDoesNotOwnAnActivatedPath(t *testing.T) {
 	assert.True(t, d.inheritedActivated,
 		"the successor must learn that the path belongs to the service manager, or its shutdown unlinks the unit's socket")
 
-	// And it must keep saying so, so the next successor in a chain of
-	// upgrades inherits the same fact.
-	assert.True(t, d.socketActivated || d.inheritedActivated,
-		"what runDaemon reports for this start must include the inherited fact")
+	// And it must keep saying so, so the next successor in a chain of upgrades
+	// inherits the same fact. Asserted through the report a successor would
+	// actually read, not by re-reading the same field that was just set — a
+	// check that cannot fail is not a check.
+	srv := &daemonServer{
+		socket:          sock,
+		socketActivated: d.socketActivated || d.inheritedActivated,
+		info:            d.info,
+		started:         time.Now(),
+		clients:         newClientRegistry(),
+	}
+	raw, err := daemonInfoJSON(ctx, srv, srv.started)
+	require.NoError(t, err)
+	var reported handoff.DaemonInfo
+	require.NoError(t, json.Unmarshal(raw, &reported))
+	assert.True(t, reported.SocketActivated,
+		"the next successor must be told the path is the service manager's, or it unlinks it on shutdown")
 }

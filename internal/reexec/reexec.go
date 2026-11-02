@@ -188,7 +188,13 @@ func isRuntimeCopy(path string) bool {
 	if err != nil {
 		return false
 	}
-	return filepath.Dir(path) == dir && strings.HasPrefix(filepath.Base(path), copyPattern)
+	if !strings.HasPrefix(filepath.Base(path), copyPattern) {
+		return false
+	}
+	// Compare directories by identity, not by string: os.Executable resolves
+	// symlinks (on darwin /tmp is /private/tmp), so a string comparison against
+	// RuntimeDir would miss and every launch would copy the copy again.
+	return sameFile(filepath.Dir(path), dir)
 }
 
 // pruneCopies removes runtime copies that are not keep, once they have gone
@@ -202,7 +208,14 @@ func pruneCopies(dir, keep string) {
 	}
 	cutoff := time.Now().Add(-copyRetentionAge)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), copyPattern) {
+		if e.IsDir() {
+			continue
+		}
+		// The pre-content-addressing copy was a single fixed name; a machine
+		// that upgraded from it keeps one forever otherwise, because no launch
+		// ever asks for that path again.
+		legacy := e.Name() == strings.TrimSuffix(copyPattern, "-")
+		if !legacy && !strings.HasPrefix(e.Name(), copyPattern) {
 			continue
 		}
 		// Interrupted copies are debris whichever build they came from. Their
