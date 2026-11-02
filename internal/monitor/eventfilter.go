@@ -84,7 +84,7 @@ func (f *EventFilter) Allows(typ string) bool {
 	if f == nil {
 		return true
 	}
-	return f.allowed[strings.ToLower(strings.TrimSpace(typ))]
+	return allowlisted(f.allowed, typ)
 }
 
 // String renders the allowlist as a sorted, comma-separated list for logs and

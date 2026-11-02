@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -48,12 +46,7 @@ func ackPRWithThread() obj {
 // subject IDs the command made.
 func runAckWatch(t *testing.T, prefsJSON string, extraArgs ...string) (stdout, stderr string, reacted []string) {
 	t.Helper()
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	if prefsJSON != "" {
-		cfgDir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "gh-monitor")
-		require.NoError(t, os.MkdirAll(cfgDir, 0o755))
-		require.NoError(t, os.WriteFile(filepath.Join(cfgDir, "preferences.json"), []byte(prefsJSON), 0o644))
-	}
+	writeTestPrefs(t, prefsJSON)
 	t.Setenv("GH_HOST", "")
 	originalFactory := apiClientFactory
 	defer func() { apiClientFactory = originalFactory }()

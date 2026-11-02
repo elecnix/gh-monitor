@@ -43,6 +43,8 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
 	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds, or 'any' for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first)")
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
+	cmd.Flags().StringVar(&opts.AnnotationChecks, "annotation-checks", "", "Comma-separated check names whose annotations to surface (default: every check)")
+	cmd.Flags().StringVar(&opts.AnnotationExcludeChecks, "annotation-exclude-checks", "", "Comma-separated check names whose annotations to suppress, whoever allows them")
 	cmd.Flags().BoolVar(&opts.Once, "once", false, "Fetch once, emit the current actionable state, and exit")
 	cmd.Flags().BoolVar(&opts.Text, "text", false, "Emit the rendered message per event instead of NDJSON")
 	cmd.Flags().StringVar(&opts.Instance, "instance", "", "Named instance identifier for resumable cursor (issue #32)")
@@ -52,26 +54,33 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 }
 
 type monitorOptions struct {
-	Repo          string
-	Pull          int
-	Ref           string
-	Baseline      string
-	Commit        string
-	Issue         int
-	RunID         int
-	Selector      string
-	Interval      int
-	Timeout       int
-	IgnoredBots   string
-	Events        string
-	Until         string
-	Annotations   string
-	Once          bool
-	Text          bool
-	Instance      string
-	FromBeginning bool
-	Viewer        string
-	Backend       backendOptions
+	Repo        string
+	Pull        int
+	Ref         string
+	Baseline    string
+	Commit      string
+	Issue       int
+	RunID       int
+	Selector    string
+	Interval    int
+	Timeout     int
+	IgnoredBots string
+	Events      string
+	Until       string
+	Annotations string
+	// AnnotationChecks is the comma-separated list of check names whose
+	// annotations the watch surfaces. Empty means every check.
+	AnnotationChecks string
+	// AnnotationExcludeChecks is the comma-separated deny list. It wins over the
+	// allow list, so "everything except lint" works, and a typo in the allow
+	// list is not the only defence against silence.
+	AnnotationExcludeChecks string
+	Once                    bool
+	Text                    bool
+	Instance                string
+	FromBeginning           bool
+	Viewer                  string
+	Backend                 backendOptions
 }
 
 // repoOnly reports whether the invocation names a repository and no target.
@@ -368,6 +377,45 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		runOpts.AnnotationLevels = levels
 	}
 
+	// --annotation-checks: a per-check-name filter applied at snapshot time,
+	// next to the level filter. Omitted (nil) → every check.
+	//
+	// The flag and the preference key are the same setting, and the flag
+	// WINS when it is set: an explicit per-invocation value replaces the
+	// stored one, the way every other flag in this command does. The
+	// alternative — unioning the flag's names with the stored ones — would
+	// make the flag able to only WIDEN an allowlist, never narrow it, so an
+	// agent could not ask for "only check X" for one probe when the stored
+	// list names more.
+	// The stored list is parsed as a list, never joined and re-split: a check name
+	// can contain a comma (a matrix job such as "CI / test (node 20), lint"), and
+	// joining would cut it in two.
+	runOpts.AnnotationChecks = monitor.NewAnnotationFilter(p.AnnotationChecks, nil)
+	if cmd.Flags().Changed("annotation-checks") {
+		// An explicitly empty flag clears the stored list; an absent one leaves it
+		// in force. Only Changed() can tell those apart.
+		runOpts.AnnotationChecks, err = monitor.ParseAnnotationChecks(opts.AnnotationChecks)
+		if err != nil {
+			return err
+		}
+	}
+	// The deny list composes with whatever allow list is in force, flag or
+	// preference: an exclusion is statement about one check, not about the set.
+	var excluded *monitor.AnnotationChecks
+	if cmd.Flags().Changed("annotation-exclude-checks") {
+		excluded = monitor.ParseAnnotationExclude(opts.AnnotationExcludeChecks)
+	} else {
+		excluded = monitor.NewAnnotationFilter(nil, p.AnnotationExcludeChecks)
+		if len(excluded.ExcludedNames()) == 0 {
+			excluded = nil
+		}
+	}
+	if excluded != nil {
+		// ExcludedNames, not Names: Names() is the allow list, and passing it as
+		// the deny list turned every allowed check into an excluded one.
+		runOpts.AnnotationChecks = monitor.NewAnnotationFilter(runOpts.AnnotationChecks.Names(), excluded.ExcludedNames())
+	}
+
 	write := func(n monitor.Notification) error {
 		var err error
 		if opts.Text {
@@ -470,15 +518,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	}
 
 	watchOpts := backend.WatchOptions{
-		Interval:         runOpts.Interval,
-		Timeout:          time.Duration(opts.Timeout) * time.Second,
-		Once:             opts.Once,
-		Since:            cursorPosition,
-		IgnoredAuthors:   runOpts.Prefs.IgnoredBots,
-		RepeatUnresolved: runOpts.Prefs.RetriggerComments,
-		AnnotationLevels: runOpts.AnnotationLevels.Names(),
-		Baseline:         cursorSnapshot,
-		ResumeID:         resumeID,
+		Interval:                runOpts.Interval,
+		Timeout:                 time.Duration(opts.Timeout) * time.Second,
+		Once:                    opts.Once,
+		Since:                   cursorPosition,
+		IgnoredAuthors:          runOpts.Prefs.IgnoredBots,
+		RepeatUnresolved:        runOpts.Prefs.RetriggerComments,
+		AnnotationLevels:        runOpts.AnnotationLevels.Names(),
+		AnnotationChecks:        runOpts.AnnotationChecks.Names(),
+		AnnotationExcludeChecks: runOpts.AnnotationChecks.ExcludedNames(),
+		Baseline:                cursorSnapshot,
+		ResumeID:                resumeID,
 	}
 	if seededBaseline != "" {
 		watchOpts.Baseline = seededBaseline

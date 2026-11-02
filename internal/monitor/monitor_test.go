@@ -228,20 +228,6 @@ func TestSnapshot_NoChecksMeansNoSuccess(t *testing.T) {
 }
 
 func TestSnapshot_CheckAnnotations(t *testing.T) {
-	mkAnn := func(path, level, title, message string, line int) Annotation {
-		return Annotation{
-			Path:    path,
-			Level:   level,
-			Title:   title,
-			Message: message,
-			Location: AnnotationLocation{
-				Start: struct {
-					Line int `json:"line"`
-				}{Line: line},
-			},
-		}
-	}
-
 	t.Run("extracts warning annotation", func(t *testing.T) {
 		pr := &PullRequest{
 			Commits: CommitNodes{Nodes: []Commit{{
@@ -256,7 +242,7 @@ func TestSnapshot_CheckAnnotations(t *testing.T) {
 							Conclusion: "SUCCESS",
 							Status:     "COMPLETED",
 							Annotations: AnnotationNodes{Nodes: []Annotation{
-								mkAnn("src/main.go", "WARNING", "deprecated API", "Foo is deprecated, use Bar", 42),
+								mkAnnotation("src/main.go", "WARNING", "deprecated API", "Foo is deprecated, use Bar", 42),
 							}},
 						}}},
 					}}},
@@ -272,33 +258,6 @@ func TestSnapshot_CheckAnnotations(t *testing.T) {
 		assert.Equal(t, "WARNING", a.Level)
 	})
 
-	t.Run("filters notice-level annotations", func(t *testing.T) {
-		pr := &PullRequest{
-			Commits: CommitNodes{Nodes: []Commit{{
-				Commit: CommitDetails{
-					Oid: "abc",
-					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
-						Status:     "COMPLETED",
-						Conclusion: "SUCCESS",
-						App:        AppInfo{Name: "CI"},
-						CheckRuns: RunNodes{Nodes: []CheckRun{{
-							Name:       "build",
-							Conclusion: "SUCCESS",
-							Status:     "COMPLETED",
-							Annotations: AnnotationNodes{Nodes: []Annotation{
-								mkAnn(".github/cache", "NOTICE", "cache miss", "...", 0),
-								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
-							}},
-						}}},
-					}}},
-				},
-			}}},
-		}
-		s := Snapshot(pr, SnapshotOptions{})
-		require.Len(t, s.CheckAnnotations, 1)
-		assert.Equal(t, "WARNING", s.CheckAnnotations[0].Level)
-	})
-
 	t.Run("empty when no annotations", func(t *testing.T) {
 		pr := &PullRequest{
 			Commits: CommitNodes{Nodes: []Commit{{
@@ -312,112 +271,170 @@ func TestSnapshot_CheckAnnotations(t *testing.T) {
 		assert.Empty(t, s.CheckAnnotations)
 	})
 
-	t.Run("notice included when AnnotationLevels allows it", func(t *testing.T) {
-		pr := &PullRequest{
-			Commits: CommitNodes{Nodes: []Commit{{
-				Commit: CommitDetails{
-					Oid: "abc",
-					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
-						Status:     "COMPLETED",
-						Conclusion: "SUCCESS",
-						App:        AppInfo{Name: "CI"},
-						CheckRuns: RunNodes{Nodes: []CheckRun{{
-							Name:       "build",
-							Conclusion: "SUCCESS",
-							Status:     "COMPLETED",
-							Annotations: AnnotationNodes{Nodes: []Annotation{
-								mkAnn("cache", "NOTICE", "cache miss", "...", 0),
-								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
-							}},
-						}}},
-					}}},
-				},
-			}}},
+	// The level filter, over one run that posted a NOTICE and a WARNING:
+	// the default admits the WARNING and drops the NOTICE, an explicit
+	// filter that allows NOTICE admits both, and "none" admits neither.
+	t.Run("the level filter decides which levels survive", func(t *testing.T) {
+		pr := mkAnnotatedPR(CheckRun{
+			Name:       "build",
+			Conclusion: "SUCCESS",
+			Status:     "COMPLETED",
+			Annotations: AnnotationNodes{Nodes: []Annotation{
+				mkAnnotation("cache", "NOTICE", "cache miss", "...", 0),
+				mkAnnotation("src/x.go", "WARNING", "lint", "unused var", 5),
+			}},
+		})
+		cases := []struct {
+			name   string
+			levels *AnnotationLevels
+			want   []string
+		}{
+			{"the default drops NOTICE", nil, []string{"WARNING"}},
+			{"an explicit filter admits NOTICE", NewAnnotationLevels("notice", "warning", "failure"), []string{"NOTICE", "WARNING"}},
+			{"none drops every level", NewAnnotationLevels(), nil},
 		}
-		s := Snapshot(pr, SnapshotOptions{AnnotationLevels: NewAnnotationLevels("notice", "warning", "failure")})
-		require.Len(t, s.CheckAnnotations, 2)
-		levels := make([]string, len(s.CheckAnnotations))
-		for i, a := range s.CheckAnnotations {
-			levels[i] = a.Level
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := Snapshot(pr, SnapshotOptions{AnnotationLevels: tc.levels})
+				var levels []string
+				for _, a := range s.CheckAnnotations {
+					levels = append(levels, a.Level)
+				}
+				assert.Equal(t, tc.want, levels)
+			})
 		}
-		assert.Contains(t, levels, "NOTICE")
-		assert.Contains(t, levels, "WARNING")
-	})
-
-	t.Run("notice still dropped by default", func(t *testing.T) {
-		pr := &PullRequest{
-			Commits: CommitNodes{Nodes: []Commit{{
-				Commit: CommitDetails{
-					Oid: "abc",
-					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
-						Status:     "COMPLETED",
-						Conclusion: "SUCCESS",
-						App:        AppInfo{Name: "CI"},
-						CheckRuns: RunNodes{Nodes: []CheckRun{{
-							Name:       "build",
-							Conclusion: "SUCCESS",
-							Status:     "COMPLETED",
-							Annotations: AnnotationNodes{Nodes: []Annotation{
-								mkAnn("cache", "NOTICE", "cache miss", "...", 0),
-								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
-							}},
-						}}},
-					}}},
-				},
-			}}},
-		}
-		s := Snapshot(pr, SnapshotOptions{}) // nil AnnotationLevels = default (warning+failure)
-		require.Len(t, s.CheckAnnotations, 1)
-		assert.Equal(t, "WARNING", s.CheckAnnotations[0].Level)
 	})
 
 	t.Run("none drops all annotation levels", func(t *testing.T) {
-		pr := &PullRequest{
-			Commits: CommitNodes{Nodes: []Commit{{
-				Commit: CommitDetails{
-					Oid: "abc",
-					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
-						Status:     "COMPLETED",
-						Conclusion: "SUCCESS",
-						App:        AppInfo{Name: "CI"},
-						CheckRuns: RunNodes{Nodes: []CheckRun{{
-							Name:       "build",
-							Conclusion: "SUCCESS",
-							Status:     "COMPLETED",
-							Annotations: AnnotationNodes{Nodes: []Annotation{
-								mkAnn("src/x.go", "WARNING", "lint", "unused var", 5),
-								mkAnn("src/y.go", "FAILURE", "security", "CVE", 10),
-							}},
-						}}},
-					}}},
-				},
-			}}},
-		}
+		pr := mkAnnotatedPR(CheckRun{
+			Name:       "build",
+			Conclusion: "SUCCESS",
+			Status:     "COMPLETED",
+			Annotations: AnnotationNodes{Nodes: []Annotation{
+				mkAnnotation("src/x.go", "WARNING", "lint", "unused var", 5),
+				mkAnnotation("src/y.go", "FAILURE", "security", "CVE", 10),
+			}},
+		})
 		s := Snapshot(pr, SnapshotOptions{AnnotationLevels: NewAnnotationLevels()}) // empty = none
 		assert.Empty(t, s.CheckAnnotations)
 	})
 }
 
-func TestSnapshot_CheckAnnotations_Truncation(t *testing.T) {
-	mkAnn := func(path, level, title, message string, line int) Annotation {
-		return Annotation{
-			Path:    path,
-			Level:   level,
-			Title:   title,
-			Message: message,
-			Location: AnnotationLocation{
-				Start: struct {
-					Line int `json:"line"`
-				}{Line: line},
-			},
-		}
-	}
+// TestSnapshot_CheckAnnotations_CheckNameFilter pins the per-check-name
+// filter: only the annotations of the named checks survive, and the rest of
+// the snapshot is untouched.
+//
+// The case it exists for (issue #110): a pull request carries the same
+// deprecation warning from six workflow jobs plus one duplication finding
+// from the check the consumer actually watches. With the filter in place the
+// finding is the only thing that reaches the diff.
+func TestSnapshot_CheckAnnotations_CheckNameFilter(t *testing.T) {
+	// Two checks on the same suite: the one the consumer watches, and the
+	// noisy one that reports the same warning from every job.
+	pr := mkAnnotatedPR(
+		mkAnnotatedRun("dupdelta", "src/dup.go", "duplication", "clone of src/orig.go", 12),
+		mkAnnotatedRun("lint", "src/x.go", "deprecated API", "Foo is deprecated, use Bar", 5),
+	)
 
+	t.Run("nil filter keeps every check", func(t *testing.T) {
+		s := Snapshot(pr, SnapshotOptions{})
+		require.Len(t, s.CheckAnnotations, 2)
+	})
+
+	t.Run("named check keeps only its annotations", func(t *testing.T) {
+		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+		require.Len(t, s.CheckAnnotations, 1)
+		// The surviving annotation is the one the named check posted, whole:
+		// its check name, its path, its line, its level and its message all
+		// come from that check's run.
+		assert.Equal(t, AnnotationSummary{
+			CheckName: "dupdelta",
+			Path:      "src/dup.go",
+			Line:      12,
+			Level:     "WARNING",
+			Title:     "duplication",
+			Message:   "clone of src/orig.go",
+		}, s.CheckAnnotations[0])
+	})
+
+	// The three ways a filter can admit nothing. Each is a different
+	// reason, so each is a row rather than a repeated block.
+	t.Run("a filter that admits nothing", func(t *testing.T) {
+		cases := []struct {
+			name    string
+			allow   []string
+			wantMsg string
+		}{
+			{"a prefix of the check name does not match", []string{"dup"}, "a prefix must not match a check name"},
+			{"none wins over any other name", []string{"none", "dupdelta"}, "\"none\" must drop every check"},
+			{"a name the pull request never ran", []string{"no-such-check"}, "an unmatched name must not admit every check"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks(tc.allow...)})
+				assert.Empty(t, s.CheckAnnotations, tc.wantMsg)
+			})
+		}
+	})
+
+	t.Run("the level filter still applies alongside the name filter", func(t *testing.T) {
+		// A NOTICE from the named check is still dropped by the default
+		// level filter: the two filters are independent, and an annotation
+		// survives only when BOTH pass.
+		noticePR := &PullRequest{
+			Commits: CommitNodes{Nodes: []Commit{{
+				Commit: CommitDetails{
+					Oid: "abc",
+					CheckSuites: SuiteNodes{Nodes: []CheckSuite{{
+						Status:     "COMPLETED",
+						Conclusion: "SUCCESS",
+						App:        AppInfo{Name: "CI"},
+						CheckRuns: RunNodes{Nodes: []CheckRun{{
+							Name:       "dupdelta",
+							Conclusion: "SUCCESS",
+							Status:     "COMPLETED",
+							Annotations: AnnotationNodes{Nodes: []Annotation{
+								mkAnnotation("src/dup.go", "NOTICE", "cache miss", "...", 1),
+								mkAnnotation("src/dup.go", "WARNING", "duplication", "clone", 12),
+							}},
+						}}},
+					}}},
+				},
+			}}},
+		}
+		s := Snapshot(noticePR, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+		require.Len(t, s.CheckAnnotations, 1)
+		assert.Equal(t, "WARNING", s.CheckAnnotations[0].Level)
+
+		// With the level filter widened, both survive.
+		s = Snapshot(noticePR, SnapshotOptions{
+			AnnotationLevels: NewAnnotationLevels("notice", "warning", "failure"),
+			AnnotationChecks: NewAnnotationChecks("dupdelta"),
+		})
+		assert.Len(t, s.CheckAnnotations, 2)
+	})
+
+	t.Run("the rest of the snapshot is untouched", func(t *testing.T) {
+		s := Snapshot(pr, SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+		// The check outcomes are not annotations, so the filter must not
+		// touch them: both checks ran and passed, and both must still be
+		// reported as successful.
+		//
+		// The comparison is order-independent: SuccessfulChecks is built
+		// from a map, so its order is not fixed. An ordered assertion here
+		// would fail on some runs and not others.
+		assert.ElementsMatch(t, []string{"dupdelta", "lint"}, s.SuccessfulChecks)
+		assert.Empty(t, s.FailingChecks)
+		assert.Empty(t, s.PendingChecks)
+	})
+}
+
+func TestSnapshot_CheckAnnotations_Truncation(t *testing.T) {
 	// Build a slice of N annotations (all WARNING).
 	mkAnns := func(n int) []Annotation {
 		anns := make([]Annotation, n)
 		for i := 0; i < n; i++ {
-			anns[i] = mkAnn("src/file.go", "WARNING", "lint", "unused var", i+1)
+			anns[i] = mkAnnotation("src/file.go", "WARNING", "lint", "unused var", i+1)
 		}
 		return anns
 	}

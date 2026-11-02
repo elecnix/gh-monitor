@@ -66,6 +66,12 @@ type CIVerdictOptions struct {
 	// filter ("none") drops all annotations.
 	AnnotationLevels *AnnotationLevels
 
+	// AnnotationChecks filters which check runs' annotations are collected.
+	// A nil value collects every check; a non-nil filter keeps only the
+	// annotations whose check name it allows, matched case-insensitively on
+	// the whole name.
+	AnnotationChecks *AnnotationChecks
+
 	// RequiredChecks are the branch-ruleset contexts that must exist for
 	// CI to be green. Empty means the ruleset was not available to this
 	// reader and no awaiting set is computed.
@@ -88,13 +94,21 @@ type CIVerdict struct {
 	Annotations          []AnnotationSummary
 	AnnotationsTruncated bool
 	AnnotationsURL       string
+
+	// ObservedChecks are the check-run names this payload carried, whatever the
+	// filter did with them, and AnnotationFilterUnmatched are the allow-listed
+	// names that matched none of them. An empty unmatched list is silence; a
+	// non-empty one means the filter is wrong, and saying so is the difference
+	// between a quiet watch and a blind one.
+	ObservedChecks            []string
+	AnnotationFilterUnmatched []string
 }
 
 // JudgeCI computes the CI verdict for a head-commit view. It is the single
 // entry point: every classifier below is reached only from here, so no reader
 // can apply a different version of "is CI green".
 func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
-	anns, truncated, url := extractAnnotations(v, opts.AnnotationLevels)
+	anns, truncated, url, observed := extractAnnotations(v, opts.AnnotationLevels, opts.AnnotationChecks)
 	return CIVerdict{
 		Failing:              failingChecks(v),
 		Pending:              pendingChecks(v),
@@ -104,6 +118,13 @@ func JudgeCI(v HeadCommitView, opts CIVerdictOptions) CIVerdict {
 		Annotations:          anns,
 		AnnotationsTruncated: truncated,
 		AnnotationsURL:       url,
+
+		ObservedChecks: observed,
+		// Only a complete payload may accuse the filter of matching nothing: when
+		// the payload is truncated, the matching check may simply be in the part
+		// that was cut off, and a false accusation sends the operator to fix a
+		// filter that is correct.
+		AnnotationFilterUnmatched: unmatchedUnless(truncated || suitesDropped(v), opts.AnnotationChecks, observed),
 	}
 }
 
@@ -488,17 +509,61 @@ func awaitingChecks(v HeadCommitView, required []string) []string {
 }
 
 // extractAnnotations collects annotations from all check runs across all
-// check suites of the head commit, filtered by levels. It also detects
-// truncation: when any check run has totalCount >= 10 (the per-step GitHub
-// cap) or totalCount > len(nodes) (our first: 50 page is full), the returned
-// truncated flag is true and the URL points to the first such run's permalink.
-func extractAnnotations(v HeadCommitView, levels *AnnotationLevels) (annotations []AnnotationSummary, truncated bool, url string) {
+// check suites of the head commit, filtered by levels and by check name. It
+// also detects truncation: when any check run has totalCount >= 10 (the
+// per-step GitHub cap) or totalCount > len(nodes) (our first: 50 page is
+// full), the returned truncated flag is true and the URL points to the first
+// such run's permalink.
+//
+// The check-name filter runs next to the level filter because both are
+// snapshot-time decisions: an annotation the operator does not want must
+// never reach the snapshot, or it would show up as a "new" annotation in the
+// diff on every poll.
+// suitesDropped reports whether the payload carried fewer suites than GitHub
+// said it had, which means some check runs never reached us. It is the same
+// fact as Truncated for this purpose: an absent check cannot prove a filter
+// wrong, because the check that matches may be in the part that was cut off. The
+// two are separate conditions — Truncated covers runs and annotations within a
+// suite, this covers whole suites — and a filter can be falsely accused by
+// either.
+func suitesDropped(v HeadCommitView) bool {
+	for _, c := range v.Commits {
+		if c.Suites.TotalCount > len(c.Suites.Nodes) {
+			return true
+		}
+	}
+	return false
+}
+
+// unmatchedUnless suppresses the unmatched-filter report when the payload that
+// would prove it is incomplete.
+func unmatchedUnless(incomplete bool, filter *AnnotationChecks, observed []string) []string {
+	if incomplete {
+		return nil
+	}
+	return filter.Unmatched(observed)
+}
+
+func extractAnnotations(v HeadCommitView, levels *AnnotationLevels, checks *AnnotationChecks) (annotations []AnnotationSummary, truncated bool, url string, observed []string) {
 	var out []AnnotationSummary
 	seen := map[string]bool{}
+	// Every run name is recorded before the filter runs, so a filter that
+	// matches nothing can be told what it failed to match.
+	seenChecks := map[string]bool{}
 	for _, c := range v.Commits {
 		for j := range c.Suites.Nodes {
 			suite := &c.Suites.Nodes[j]
 			for _, run := range suite.CheckRuns.Nodes {
+				// The filter runs first: a check the operator excluded cannot make
+				// the payload "truncated", or a muted check would keep warning that
+				// annotations may be missing from a set nobody asked for.
+				if run.Name != "" && !seenChecks[strings.ToLower(run.Name)] {
+					seenChecks[strings.ToLower(run.Name)] = true
+					observed = append(observed, run.Name)
+				}
+				if !checks.Allows(run.Name) {
+					continue
+				}
 				runAnns := run.Annotations
 				if runAnns.TotalCount >= 10 && !truncated {
 					truncated = true
@@ -531,5 +596,5 @@ func extractAnnotations(v HeadCommitView, levels *AnnotationLevels) (annotations
 			}
 		}
 	}
-	return out, truncated, url
+	return out, truncated, url, observed
 }

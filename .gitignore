@@ -8,3 +8,4 @@ TASKS.md
 /gh-monitor
 *.exe
 .pi/
+.prospect-progress

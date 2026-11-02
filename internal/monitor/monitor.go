@@ -699,6 +699,13 @@ type PRStatus struct {
 	// CheckAnnotations holds the combined annotations from all completed
 	// check runs (filtered to WARNING + FAILURE levels).
 	CheckAnnotations []AnnotationSummary `json:"check_annotations,omitempty"`
+
+	// AnnotationFilterUnmatched names the allow-listed checks that matched no
+	// check run in the payload, and ObservedChecks names those it could have
+	// matched. A filter that matches nothing is a mistake, not a quiet watch: it
+	// is reported once, with the names to correct it against.
+	AnnotationFilterUnmatched []string `json:"annotation_filter_unmatched,omitempty"`
+	ObservedChecks            []string `json:"observed_checks,omitempty"`
 	// AwaitingChecks lists required status checks (from the branch ruleset)
 	// that are entirely absent from the check-suites/status payload — they
 	// have not been created yet. An absent required check is a distinct state
@@ -743,6 +750,12 @@ type SnapshotOptions struct {
 	// failure). An empty filter ("none") drops all annotations.
 	AnnotationLevels *AnnotationLevels
 
+	// AnnotationChecks controls which check runs' annotations are included
+	// in the snapshot. A nil value includes every check. A non-nil filter
+	// keeps only the annotations whose check name it allows, matched
+	// case-insensitively on the whole name.
+	AnnotationChecks *AnnotationChecks
+
 	// RulesetChecks is the result of FetchRequiredChecks for the repo.
 	// When nil, AwaitingChecks is not computed (the ruleset was not
 	// fetched — e.g. ref/commit targets that lack a PR context).
@@ -772,6 +785,7 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 	// degrades loudly via RulesetError rather than assuming nothing is required.
 	var requiredChecks []string
 	rulesetErr := ""
+
 	if opts.RulesetChecks != nil {
 		rulesetErr = opts.RulesetChecks.Error
 		if rulesetErr == "" {
@@ -782,25 +796,28 @@ func Snapshot(pr *PullRequest, opts SnapshotOptions) *PRStatus {
 	// CI is judged in one place, over the head commit's suites and statuses.
 	ci := JudgeCI(HeadCommitViewOf(pr), CIVerdictOptions{
 		AnnotationLevels: opts.AnnotationLevels,
+		AnnotationChecks: opts.AnnotationChecks,
 		RequiredChecks:   requiredChecks,
 	})
 
 	status := &PRStatus{
-		State:                pr.State,
-		Merged:               pr.Merged,
-		Conflict:             pr.Mergeable == "CONFLICTING",
-		UnresolvedThreads:    []ThreadSummary{},
-		GeneralComments:      []GeneralComment{},
-		FailingChecks:        ci.Failing,
-		PendingChecks:        ci.Pending,
-		SuccessfulChecks:     ci.Successful,
-		AwaitingChecks:       ci.Awaiting,
-		TruncatedSuites:      ci.Truncated,
-		CheckAnnotations:     ci.Annotations,
-		AnnotationsTruncated: ci.AnnotationsTruncated,
-		AnnotationsURL:       ci.AnnotationsURL,
-		RulesetError:         rulesetErr,
-		ShedSurfaces:         opts.Tier.ShedSurfaces(),
+		State:                     pr.State,
+		Merged:                    pr.Merged,
+		Conflict:                  pr.Mergeable == "CONFLICTING",
+		UnresolvedThreads:         []ThreadSummary{},
+		GeneralComments:           []GeneralComment{},
+		FailingChecks:             ci.Failing,
+		PendingChecks:             ci.Pending,
+		SuccessfulChecks:          ci.Successful,
+		AwaitingChecks:            ci.Awaiting,
+		TruncatedSuites:           ci.Truncated,
+		CheckAnnotations:          ci.Annotations,
+		AnnotationFilterUnmatched: ci.AnnotationFilterUnmatched,
+		ObservedChecks:            ci.ObservedChecks,
+		AnnotationsTruncated:      ci.AnnotationsTruncated,
+		AnnotationsURL:            ci.AnnotationsURL,
+		RulesetError:              rulesetErr,
+		ShedSurfaces:              opts.Tier.ShedSurfaces(),
 	}
 
 	for _, t := range pr.ReviewThreads.Nodes {

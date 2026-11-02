@@ -32,3 +32,44 @@ func mkPR(state string, merged bool, oid string, failing []string) *PullRequest 
 		Commits: CommitNodes{Nodes: []Commit{mkCommit(oid, failing)}},
 	}
 }
+
+// mkAnnotation builds one check-run annotation.
+func mkAnnotation(path, level, title, message string, line int) Annotation {
+	return Annotation{
+		Path:    path,
+		Level:   level,
+		Title:   title,
+		Message: message,
+		Location: AnnotationLocation{
+			Start: struct {
+				Line int `json:"line"`
+			}{Line: line},
+		},
+	}
+}
+
+// mkAnnotatedPR builds a PR whose single finished suite carries the named
+// check runs, each with one warning-level annotation.
+//
+// It is the fixture the check-name filter is about: one check a consumer
+// watches, and one that posts the same warning from every workflow job.
+func mkAnnotatedPR(runs ...CheckRun) *PullRequest {
+	commit := mkCommit("abc", nil)
+	commit.Commit.CheckSuites.Nodes[0].CheckRuns = RunNodes{Nodes: runs}
+	return &PullRequest{
+		State:   "OPEN",
+		Commits: CommitNodes{Nodes: []Commit{commit}},
+	}
+}
+
+// mkAnnotatedRun builds a completed check run carrying one annotation.
+func mkAnnotatedRun(name, path, title, message string, line int) CheckRun {
+	return CheckRun{
+		Name:       name,
+		Status:     "COMPLETED",
+		Conclusion: "SUCCESS",
+		Annotations: AnnotationNodes{TotalCount: 1, Nodes: []Annotation{
+			mkAnnotation(path, "WARNING", title, message, line),
+		}},
+	}
+}

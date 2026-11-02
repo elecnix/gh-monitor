@@ -221,6 +221,36 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget 
 	return h
 }
 
+// snapshotOptionsFor turns a watch's options into the snapshot options every
+// consumer of that watch distills with.
+//
+// The annotation filters are PARSED here rather than taken as strings, so
+// "none" keeps meaning "report no annotations" on the far side of the wire:
+// a filter that reached the daemon as a bare list of names would lose the
+// distinction between "these checks" and "no checks at all". An empty option
+// leaves the filter unset, which is the default — every check, every level
+// the caller asked for.
+//
+// Both the watch path and the one-shot read go through here, so the two can
+// never drift apart in what they filter.
+func snapshotOptionsFor(opts backend.WatchOptions) monitor.SnapshotOptions {
+	snapOpts := monitor.SnapshotOptions{IgnoredBots: opts.IgnoredAuthors}
+	if len(opts.AnnotationLevels) > 0 {
+		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
+			snapOpts.AnnotationLevels = levels
+		}
+	}
+	if len(opts.AnnotationChecks) > 0 || len(opts.AnnotationExcludeChecks) > 0 {
+		if checks, err := monitor.ParseAnnotationChecks(strings.Join(opts.AnnotationChecks, ",")); err == nil {
+			excluded := monitor.ParseAnnotationExclude(strings.Join(opts.AnnotationExcludeChecks, ","))
+			// ExcludedNames: the deny list travels in its own accessor, because
+			// Names() is the allow list and would exclude exactly what was allowed.
+			snapOpts.AnnotationChecks = monitor.NewAnnotationFilter(checks.Names(), excluded.ExcludedNames())
+		}
+	}
+	return snapOpts
+}
+
 // Subscribe registers a consumer for the target named by t and returns a
 // channel of updates plus a cancel function. The consumer receives the
 // poller's current snapshot immediately (as a first-poll against an empty
@@ -260,13 +290,7 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 	ro := monitor.RunOptions{Identity: identity}
 	ro.Prefs.RetriggerComments = opts.RepeatUnresolved
 
-	snapOpts := monitor.SnapshotOptions{IgnoredBots: opts.IgnoredAuthors}
-	if len(opts.AnnotationLevels) > 0 {
-		// Parsed, so "none" keeps meaning "report no annotations".
-		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
-			snapOpts.AnnotationLevels = levels
-		}
-	}
+	snapOpts := snapshotOptionsFor(opts)
 
 	sub := &sub{
 		distill:    traits.distill(t, opts),
@@ -426,12 +450,7 @@ func (h *Hub) Once(ctx context.Context, t backend.Target, opts backend.WatchOpti
 	ro := monitor.RunOptions{Identity: identity}
 	ro.Prefs.RetriggerComments = opts.RepeatUnresolved
 
-	snapOpts := monitor.SnapshotOptions{IgnoredBots: opts.IgnoredAuthors}
-	if len(opts.AnnotationLevels) > 0 {
-		if levels, err := monitor.ParseAnnotationLevels(strings.Join(opts.AnnotationLevels, ",")); err == nil {
-			snapOpts.AnnotationLevels = levels
-		}
-	}
+	snapOpts := snapshotOptionsFor(opts)
 	if h.rulesetFn != nil && keyOf(identity).kind == backend.KindPR {
 		if rs, err := h.rulesetFn(identity.Owner, identity.Repo); err == nil && rs != nil && rs.Error == "" {
 			snapOpts.RulesetChecks = rs
@@ -1511,8 +1530,6 @@ func (p *poller) applyTier(tier monitor.QueryTier) {
 	}
 	p.broadcast(monitor.Event{Type: monitor.EventDegraded, Notice: msg})
 }
-
-
 
 // broadcast fans a loop-level event out to every subscriber. Sends are
 // non-blocking: a consumer that has not drained its previous notice drops the

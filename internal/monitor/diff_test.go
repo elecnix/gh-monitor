@@ -322,6 +322,35 @@ func TestDiff_CheckAnnotations(t *testing.T) {
 		assert.Nil(t, findEvent(events, EventNewFailingChecks), "should not fire failing-checks for annotations")
 	})
 
+	t.Run("a filtered-out check never reaches the diff, so it never re-fires", func(t *testing.T) {
+		// The check-name filter runs at snapshot time, so a check the
+		// operator did not ask for is absent from CheckAnnotations
+		// altogether. That is what keeps the noise from re-firing on every
+		// poll: the diff only ever sees the annotations the filter kept.
+		//
+		// The snapshot below is what Snapshot produces for a PR carrying
+		// both checks under a "dupdelta"-only filter.
+		prev := &PRStatus{}
+		curr := Snapshot(mkAnnotatedPR(
+			mkAnnotatedRun("dupdelta", "src/dup.go", "duplication", "clone", 12),
+			mkAnnotatedRun("lint", "src/x.go", "deprecated", "Foo is deprecated", 5),
+		), SnapshotOptions{AnnotationChecks: NewAnnotationChecks("dupdelta")})
+
+		// The lint annotation never reached the snapshot.
+		require.Len(t, curr.CheckAnnotations, 1)
+		assert.Equal(t, "dupdelta", curr.CheckAnnotations[0].CheckName)
+
+		// So the first diff fires on the duplication finding alone.
+		e := findEvent(Diff(prev, curr), EventCheckAnnotations)
+		require.NotNil(t, e)
+		require.Len(t, e.Annotations, 1)
+		assert.Equal(t, "dupdelta", e.Annotations[0].CheckName)
+
+		// And the next poll, with the same annotations, fires nothing: the
+		// lint annotation is not in the snapshot to be "new" again.
+		assert.Nil(t, findEvent(Diff(curr, curr), EventCheckAnnotations))
+	})
+
 	t.Run("notice-level annotations reach diff unchanged (filtering is at snapshot time)", func(t *testing.T) {
 		prev := &PRStatus{}
 		curr := &PRStatus{
@@ -506,4 +535,48 @@ func TestDiffRef_MultipleEvents(t *testing.T) {
 	types := eventTypes(DiffRef(prev, curr))
 	assert.Contains(t, types, EventNewFailingChecks)
 	assert.Contains(t, types, EventNewCommit)
+}
+
+// TestDiff_AnnotationFilterThatMatchesNothingSaysSo is the guard Nicolas asked
+// for: an allow list whose names appear on no check run must announce itself,
+// naming both what it looked for and what was actually there. Silence would be
+// indistinguishable from a quiet PR, and the operator would wait forever.
+func TestDiff_AnnotationFilterThatMatchesNothingSaysSo(t *testing.T) {
+	prev := &PRStatus{}
+	curr := &PRStatus{
+		AnnotationFilterUnmatched: []string{"tst (node 20)"},
+		ObservedChecks:            []string{"lint", "dupdelta"},
+	}
+
+	var notice string
+	for _, ev := range Diff(prev, curr) {
+		if ev.Type == EventDegraded && ev.Notice != "" {
+			notice = ev.Notice
+		}
+	}
+	require.NotEmpty(t, notice, "a filter that matches nothing must produce a notice")
+	assert.Contains(t, notice, "tst (node 20)", "the notice names the filter's own entry")
+	assert.Contains(t, notice, "lint", "and the checks that were actually seen")
+
+	// Said once: the next poll with the same wrong filter must not repeat it.
+	for _, ev := range Diff(curr, curr) {
+		assert.NotEqualf(t, EventDegraded, ev.Type, "the warning is not re-emitted every poll")
+	}
+}
+
+// TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll: a typo present from the
+// very first poll is the common case, and the first poll is exactly where the
+// rest of the diff is silent. Waiting for a previous snapshot to compare against
+// would mean the mistake is never reported.
+func TestDiff_AnnotationFilterTypoReportedOnTheFirstPoll(t *testing.T) {
+	curr := &PRStatus{
+		AnnotationFilterUnmatched: []string{"tst"},
+		ObservedChecks:            []string{"lint"},
+	}
+	events := Diff(nil, curr)
+	require.Len(t, events, 1, "the first poll must carry the warning")
+	assert.Contains(t, events[0].Notice, "tst")
+
+	// And every later poll with the same wrong filter stays quiet.
+	assert.Empty(t, Diff(curr, curr), "the warning is not repeated")
 }
