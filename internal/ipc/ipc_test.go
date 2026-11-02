@@ -109,3 +109,77 @@ func shortTmp() string {
 	}
 	return os.TempDir()
 }
+
+// staleSocketFile leaves a socket file that refuses every connection: bound,
+// listening, then closed without unlinking. A daemon whose accept queue is
+// full refuses connections the same way on macOS, so the dial alone cannot
+// tell the two apart.
+func staleSocketFile(t *testing.T, sock string) {
+	t.Helper()
+	l, err := net.Listen("unix", sock)
+	require.NoError(t, err)
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	require.NoError(t, l.Close())
+	_, err = os.Stat(sock)
+	require.NoError(t, err)
+}
+
+// TestListen_KeepsARefusedSocketWhoseOwnerIsAlive is the guard against the
+// successor that steals the path from a daemon that is alive but not
+// accepting. The old daemon keeps running on an orphaned socket and every
+// client that reaches it sees a hello and then a broken pipe.
+func TestListen_KeepsARefusedSocketWhoseOwnerIsAlive(t *testing.T) {
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-owner-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
+	staleSocketFile(t, sock)
+	// The parent process stands in for a live daemon: any process but this one.
+	require.NoError(t, os.WriteFile(OwnerPath(sock), []byte(strconv.Itoa(os.Getppid())), 0o600))
+
+	_, err = Listen(sock)
+	require.ErrorIs(t, err, ErrLiveDaemon)
+	_, statErr := os.Stat(sock)
+	assert.NoError(t, statErr, "a socket with a live owner must not be unlinked")
+}
+
+// TestListen_ReclaimsARefusedSocketWhoseOwnerIsGone keeps the crash case
+// working: the owner record names a process that no longer exists.
+func TestListen_ReclaimsARefusedSocketWhoseOwnerIsGone(t *testing.T) {
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-gone-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
+	staleSocketFile(t, sock)
+	require.NoError(t, os.WriteFile(OwnerPath(sock), []byte("2147483646"), 0o600))
+
+	l, err := Listen(sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+}
+
+// TestListen_RecordsItsOwner lets the next starter tell a wedged daemon from a
+// dead one, and ReleaseOwner leaves a successor's record alone.
+func TestListen_RecordsItsOwner(t *testing.T) {
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-rec-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
+
+	l, err := Listen(sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	raw, err := os.ReadFile(OwnerPath(sock))
+	require.NoError(t, err)
+	assert.Equal(t, strconv.Itoa(os.Getpid()), strings.TrimSpace(string(raw)))
+
+	require.NoError(t, os.WriteFile(OwnerPath(sock), []byte("2147483646"), 0o600))
+	ReleaseOwner(sock)
+	_, err = os.Stat(OwnerPath(sock))
+	assert.NoError(t, err, "ReleaseOwner must not remove a record that names another process")
+
+	require.NoError(t, ClaimOwner(sock))
+	ReleaseOwner(sock)
+	_, err = os.Stat(OwnerPath(sock))
+	assert.True(t, os.IsNotExist(err))
+}
