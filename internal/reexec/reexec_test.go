@@ -63,8 +63,21 @@ func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
 	if !strings.HasPrefix(rd, dir) {
 		t.Fatalf("RuntimeDir() = %q escaped the sandbox at %q: this test would read the user's real cache", rd, dir)
 	}
-	if rd != filepath.Join(dir, "gh-monitor") {
-		t.Fatalf("RuntimeDir() = %q, want %q", rd, filepath.Join(dir, "gh-monitor"))
+	// Compare against the platform's own answer, never a path spelled out here.
+	// darwin's cache dir is $HOME/Library/Caches and ignores XDG_CACHE_HOME (the
+	// Apple convention, not a defect), Windows reads %LocalAppData% — so a
+	// literal expectation is a Linux expectation wearing a portable test's
+	// clothes. The contract is: inside the sandbox, named gh-monitor, under
+	// whatever this platform calls its cache directory.
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("os.UserCacheDir: %v", err)
+	}
+	if want := filepath.Join(cache, "gh-monitor"); rd != want {
+		t.Fatalf("RuntimeDir() = %q, want the platform's cache dir %q", rd, want)
+	}
+	if filepath.Base(rd) != "gh-monitor" {
+		t.Fatalf("RuntimeDir() = %q, want it to end in gh-monitor", rd)
 	}
 	if filepath.Dir(got) != rd || !strings.HasPrefix(filepath.Base(got), copyPattern) {
 		t.Fatalf("RuntimePath() = %q, want a content-addressed copy in %q", got, rd)
