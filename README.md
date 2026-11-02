@@ -223,6 +223,7 @@ The `owner/repo#number` shorthand is the same cross-reference form GitHub's own 
 - `--until <kind,kind>` - Comma-separated event kinds, or `any` for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first). Same syntax and validation as `--events`.
 - `--annotation-levels <level,level>` - Annotation levels to surface: `notice`, `warning`, `failure`, or `none`. Default: `warning,failure`. Case-insensitive; unknown values are rejected. `none` drops all annotation events.
 - `--annotation-checks <check,check>` - Check names whose annotations to surface. Default: every check. Case-insensitive, matched on the whole check name. `none` drops all annotation events. The flag overrides the `annotationChecks` preference.
+- `--annotation-exclude-checks <check,check>` - Check names whose annotations to suppress. Applied before the allow list, so it wins even when the same name is allowed: "everything except this" does not depend on getting the allow list right.
 - `--once` - Fetch once, emit the current actionable state, and exit
 - `--text` - Emit the rendered message per event instead of NDJSON
 
@@ -277,6 +278,17 @@ gh monitor prefs set '{"annotationChecks": ["dupdelta"]}'
 ```
 
 `--annotation-checks` overrides the stored value when it is set, the way every other flag in the command does; an empty stored list means "every check". `none` drops all annotations, and `gh monitor prefs set '{"annotationChecks": null}'` clears the stored list.
+
+`--annotation-exclude-checks` (preference `annotationExcludeChecks`) is the deny list, and it composes with the allow list rather than replacing it: an excluded check is dropped whatever the allow list says. It exists because an allow list is a single point of failure — one typo in a check name and the watch goes silent, with nothing to distinguish that from a quiet pull request.
+
+So the mistake is reported instead of hidden. When an allow-listed name matches no check run in the payload, the watch emits one `degraded` notice naming the names that matched nothing and the checks that were actually seen:
+
+```
+⚠️ annotation filter matches no check on this payload: tst (node 20) not seen;
+the checks here are lint, dupdelta. Fix --annotation-checks or the annotationChecks preference.
+```
+
+It is said once per watch, not every poll, and `none` is not reported — a deliberate mute is not a typo.
 
 Both filters are applied when the snapshot is built, not when the event is emitted, so a filtered-out annotation never reaches the diff and never re-fires as "new" on a later poll.
 
@@ -658,7 +670,7 @@ gh monitor prefs reset
 gh monitor prefs path
 ```
 
-The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "annotationChecks": ["check", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
+The document shape is `{ "templates": {"<event-kind>": "<template>" | null}, "ignoredBots": ["login", …], "annotationChecks": ["check", …], "annotationExcludeChecks": ["check", …], "retriggerComments": false, "selfUpdate": "30m" | "1" | "" | null, "pollInterval": "10m" | "" | null, "idlePollCeiling": "6h" | "" | null, "pollWhenBrokerHealthy": true | false | null, "reactOnNotify": true | false | null, "eventLog": {"dir": "/path", "keepDays": 10} | null }`. Event kinds and template tokens are listed in `gh monitor prefs --help`. A `--config-dir <dir>` flag overrides the config location (handy for testing).
 
 #### Optional template segments
 

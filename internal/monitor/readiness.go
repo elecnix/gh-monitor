@@ -136,14 +136,14 @@ type PRReadiness struct {
 
 // ReadinessReport is a repo-wide merge-readiness snapshot.
 type ReadinessReport struct {
-	Owner   string
-	Repo    string
-	Open    int
-	Viewer  string
-	Ready   []PRReadiness
+	Owner    string
+	Repo     string
+	Open     int
+	Viewer   string
+	Ready    []PRReadiness
 	NotReady []PRReadiness
-	Others  []PRReadiness
-	Unknown []PRReadiness
+	Others   []PRReadiness
+	Unknown  []PRReadiness
 
 	// Degraded is set when the fetch failed — no classification performed.
 	Degraded        bool
