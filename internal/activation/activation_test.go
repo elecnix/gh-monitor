@@ -17,7 +17,7 @@ import (
 // shape a passed descriptor arrives in.
 func boundListener(t *testing.T) (string, *os.File) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "act-*")
+	dir, err := os.MkdirTemp(shortTmp(), "act-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "d.sock")
@@ -169,4 +169,14 @@ func TestListeners_ClosesTheDescriptorWhenAdoptionFails(t *testing.T) {
 	require.Error(t, err, "a pipe is not a listener")
 	assert.ErrorIs(t, syscall.Fstat(inherited, &syscall.Stat_t{}), syscall.EBADF,
 		"an adopted-but-rejected descriptor must not be leaked either")
+}
+
+// shortTmp is where short-lived sockets and their directories are created: darwin
+// caps a Unix socket path at 104 bytes and TMPDIR there is a long
+// /var/folders/... path that leaves almost no room.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }

@@ -47,6 +47,9 @@ func IsAbsent(err error) bool {
 // stale socket (connection refused) is removed and reused. This makes
 // concurrent autostart spawners safe — at most one daemon binds the path.
 func Listen(path string) (net.Listener, error) {
+	if err := checkPathLen(path); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(path); err == nil {
 		// A socket file is present. Probe it before touching it.
 		if c, derr := net.Dial("unix", path); derr == nil {
@@ -68,10 +71,25 @@ func Listen(path string) (net.Listener, error) {
 	return l, nil
 }
 
+// checkPathLen refuses a socket path the platform cannot bind. Without it the
+// failure is `bind: invalid argument`, which names neither the length nor the
+// limit, and a long user name or a deep $XDG_RUNTIME_DIR produces exactly that
+// on a machine where nothing is wrong with gh-monitor.
+func checkPathLen(path string) error {
+	if limit := maxPathLen(); len(path) >= limit {
+		return fmt.Errorf("socket path is %d bytes, over this platform's limit of %d (including the terminating NUL): %s\nSet GH_MONITOR_SOCK to a shorter path, or point XDG_RUNTIME_DIR somewhere shorter",
+			len(path), limit, path)
+	}
+	return nil
+}
+
 // Dial connects to a daemon socket with a short timeout. It returns an error
 // satisfying errors.Is(os.ErrNotExist) when no socket is present, so callers
 // can fall back to in-process polling.
 func Dial(path string) (net.Conn, error) {
+	if err := checkPathLen(path); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(path); err != nil {
 		return nil, err // os.ErrNotExist when no daemon
 	}

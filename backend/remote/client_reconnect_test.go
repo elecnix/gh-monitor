@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -27,7 +28,13 @@ type rawWatchServer struct {
 
 func startRawWatchServer(t *testing.T, resumable bool) *rawWatchServer {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "d.sock")
+	// A short directory, not t.TempDir(): darwin's TMPDIR is a long
+	// /var/folders/... path and a Unix socket path is capped at 104 bytes there,
+	// so the bind fails with EINVAL rather than anything about length.
+	dir, err := os.MkdirTemp("/tmp", "ghm-remote-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
 	ln, err := net.Listen("unix", sock)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ln.Close() })

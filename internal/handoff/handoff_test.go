@@ -23,7 +23,7 @@ import (
 // shortPath keeps unix socket paths under macOS's ~104-byte limit.
 func shortPath(t *testing.T, prefix string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", prefix)
+	dir, err := os.MkdirTemp(shortTmp(), prefix)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "d.sock")
@@ -507,4 +507,14 @@ func TestAdoptAnnouncesForADaemonThatCannotDescribeItself(t *testing.T) {
 	assert.Equal(t, socket, got.Socket)
 	assert.Zero(t, got.PID, "and it is described honestly, with no invented pid")
 	assert.Error(t, err, "the state read still fails, so the handoff does not complete")
+}
+
+// shortTmp is where short-lived sockets and their directories are created: darwin
+// caps a Unix socket path at 104 bytes and TMPDIR there is a long
+// /var/folders/... path that leaves almost no room.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }

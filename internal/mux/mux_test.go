@@ -19,7 +19,7 @@ import (
 // socket paths near 104 bytes and t.TempDir() eats most of that.
 func shortSock(t *testing.T, name string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "ghm-mux-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghm-mux-*.d")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,3 +550,13 @@ var (
 	_ backend.Source = RoutingSource{}
 	_                = errors.New
 )
+
+// shortTmp is where short-lived sockets and their directories are created: darwin
+// caps a Unix socket path at 104 bytes and TMPDIR there is a long
+// /var/folders/... path that leaves almost no room.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
+}

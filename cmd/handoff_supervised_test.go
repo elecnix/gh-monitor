@@ -26,7 +26,7 @@ import (
 // messages it received.
 func notifySocket(t *testing.T) (addr string, drain func() []string) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "notify-*")
+	dir, err := os.MkdirTemp(shortTmpDir(), "notify-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	addr = filepath.Join(dir, "notify")

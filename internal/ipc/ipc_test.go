@@ -5,6 +5,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,4 +70,32 @@ func TestWaitReady_Timeout(t *testing.T) {
 	err = WaitReady(context.Background(), sock, 300*time.Millisecond)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "did not come up")
+}
+
+// TestListen_RejectsAPathOverThePlatformLimit is the failure a real machine
+// produces with a long user name or a deep $XDG_RUNTIME_DIR: bind answers
+// EINVAL, which says nothing about length. The check names the length, the
+// limit and the path instead.
+func TestListen_RejectsAPathOverThePlatformLimit(t *testing.T) {
+	dir := t.TempDir()
+	long := filepath.Join(dir, strings.Repeat("d", maxPathLen()))
+	_, err := Listen(long)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "socket path is")
+	assert.Contains(t, err.Error(), strconv.Itoa(maxPathLen()), "the message must name the limit")
+	assert.Contains(t, err.Error(), "GH_MONITOR_SOCK", "and the way out of it")
+}
+
+// TestListen_AcceptsAPathUnderTheLimit keeps the guard from being stricter than
+// the kernel: a path the platform can bind must still bind.
+func TestListen_AcceptsAPathUnderTheLimit(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "ghm-ipc-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "d.sock")
+	require.Less(t, len(path), maxPathLen())
+
+	l, err := Listen(path)
+	require.NoError(t, err)
+	_ = l.Close()
 }

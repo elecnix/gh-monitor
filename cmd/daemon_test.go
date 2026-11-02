@@ -35,7 +35,7 @@ import (
 // daemon's, and a --once read attaches to any daemon already listening there
 // (issue #114). Tests that want a daemon set their own with t.Setenv.
 func init() {
-	dir, err := os.MkdirTemp("", "ghmon-nodaemon-*")
+	dir, err := os.MkdirTemp(shortTmpDir(), "ghmon-nodaemon-*")
 	if err != nil {
 		panic(err)
 	}
@@ -76,10 +76,24 @@ func daemonTarget() backend.Target {
 // socket paths near 104 bytes, and t.TempDir() is already most of that.
 func shortSocket(t *testing.T, prefix string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", prefix)
+	// /tmp explicitly, not os.MkdirTemp(""): on darwin TMPDIR is a long
+	// /var/folders/... path and a Unix socket path is capped at 104 bytes, so
+	// the bind answered EINVAL with no hint about length.
+	dir, err := os.MkdirTemp(shortTmpDir(), prefix)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "d.sock")
+}
+
+// shortTmpDir is where short-lived sockets are created: a directory whose path
+// is short enough to hold one on every platform.
+func shortTmpDir() string {
+	if dir := "/tmp"; dir != "" {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+	}
+	return os.TempDir()
 }
 
 // unusedBuiltin is a built-in backend that fails if consulted, so a test
