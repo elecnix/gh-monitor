@@ -182,13 +182,29 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	go func() {
 		select {
 		case <-sigCh:
-			// A supervised install hears its manager's SIGTERM: say so, so the
-			// stop is recorded as a transition rather than a timeout.
-			announceStopping(cmd.ErrOrStderr())
+			// A stop the operator asked for is reported as a stop, so
+			// `systemctl stop` shows the transition instead of an unannounced
+			// disappearance (issue #193). A handoff is not a stop: the
+			// predecessor hands the socket over and exits without this.
+			_ = sdnotify.Stopping()
 			cancel()
 		case <-ctx.Done():
 		}
 	}()
+
+	// The service manager's socket, when there is one, comes first: it decides
+	// the path everything below derives from, and it makes a restart invisible
+	// to clients (issue #193).
+	d := &daemonRuntime{interval: interval, info: daemonInfo{
+		invocationID: os.Getenv("INVOCATION_ID"),
+		supervised:   daemonSupervised(),
+		version:      runningVersion(),
+	}}
+	d.socket = socket
+	if err := d.adoptActivated(ctx, cmd); err != nil {
+		return err
+	}
+	socket = d.socket
 
 	// Sub-daemon backends (issue #88): if the operator configured sub-daemons,
 	// the daemon launches and supervises them as children — but it no longer
@@ -230,13 +246,7 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 		go routes.Run(ctx, mux.ProbeInterval)
 	}
 
-	// Under a service manager, name this process as the unit's main process
-	// *before* the handoff dial below: the predecessor exits as soon as it has
-	// passed its socket over, and a manager that reads that exit first kills the
-	// cgroup — successor included (issue #193).
-	announceSuccessor(socket, cmd.ErrOrStderr())
-
-	listener, adopted, err := listenOrAdopt(ctx, socket)
+	listener, adopted, err := d.openSocket(ctx, cmd)
 	if err != nil {
 		return err
 	}
@@ -256,8 +266,11 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// path (issue #73).
 	var handedOff atomic.Bool
 	defer func() {
-		if !handedOff.Load() {
-			_ = os.Remove(socket)
+		// The path belongs to whoever bound it: a successor after a handoff,
+		// and the service manager when the socket was activated. Removing it
+		// in either case would take the daemon's door off its hinges.
+		if !handedOff.Load() && !d.socketActivated && !d.inheritedActivated {
+			_ = os.Remove(d.socket)
 		}
 	}()
 
@@ -315,29 +328,32 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// daemon on every invocation. It serves until SIGTERM/SIGINT, or until a
 	// successor daemon completes an upgrade handoff.
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon listening on %s (interval %s, idle ceiling %s)",
-		socket, interval, idleCeiling)
+		d.socket, interval, idleCeiling)
 	if pauseWhenHealthy {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), ", timer polling pauses for repositories the broker delivers events for")
 	} else {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 	}
-	// The socket is bound or adopted and the hub is restored, so the daemon can
-	// answer: a Type=notify unit is waiting for exactly this (issue #193).
-	announceReady(cmd.ErrOrStderr())
 	startBrokerTransport(ctx, cmd, h)
 	startUpgradeWatcher(ctx, cmd, socket, interval)
 	startSelfUpdate(ctx, cmd)
 
 	srv := &daemonServer{
-		hub:       h,
-		listener:  listener,
-		routes:    routes,
-		coverage:  coverage,
-		interval:  interval,
-		safety:    prefs.CoveredSafetyInterval(daemonPrefs.CoveredSafetyInterval),
-		handedOff: &handedOff,
-		evlog:     evlog,
-		shutdown:  func() { cancel(); _ = listener.Close() },
+		hub:             h,
+		listener:        listener,
+		routes:          routes,
+		coverage:        coverage,
+		interval:        interval,
+		safety:          prefs.CoveredSafetyInterval(daemonPrefs.CoveredSafetyInterval),
+		handedOff:       &handedOff,
+		evlog:           evlog,
+		socket:          d.socket,
+		socketActivated: d.socketActivated || d.inheritedActivated,
+		info:            d.info,
+		started:         time.Now(),
+		clients:         newClientRegistry(),
+		respawn:         d.spawnSuccessor,
+		shutdown:        func() { cancel(); _ = listener.Close() },
 	}
 
 	var wg sync.WaitGroup
@@ -359,6 +375,12 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 			}(conn)
 		}
 	}()
+
+	// Serving now: announce it once clients can actually be answered, which
+	// is what a Type=notify unit waits for (issue #193).
+	if err := sdnotify.Ready(fmt.Sprintf("serving %s", d.socket)); err != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: %v\n", err)
+	}
 
 	<-ctx.Done()
 	wg.Wait()
@@ -387,11 +409,9 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir
 		// $GH_MONITOR_SOCK wherever it points, so this redirects them without
 		// any change in the sub-daemon binary. gh-monitor keeps the public
 		// socket and routes to these.
-		// NOTIFY_SOCKET is stripped (issue #193): a sub-daemon that reported
-		// READY=1 would mark the unit started before its daemon serves, and one
-		// that reported MAINPID would hand the unit to a process that does not own
-		// the socket.
 		ChildEnv: func(e subdaemon.Entry) []string {
+			// NOTIFY_SOCKET is stripped (issue #193): a sub-daemon must not report
+			// readiness or a main pid for the unit.
 			return append(sdnotify.WithoutNotifyEnv(os.Environ()), "GH_MONITOR_SOCK="+mux.SocketPath(sockDir, e.Name))
 		},
 	}
@@ -407,6 +427,33 @@ var subdaemonLauncherFn = func(entries []subdaemon.Entry, out io.Writer, sockDir
 // the baselines the state carried.
 func (srv *daemonServer) handleHandoffOp(ctx context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
 	switch req.Op {
+	case handoff.OpInfo:
+		raw, err := daemonInfoJSON(ctx, srv, srv.started)
+		if err != nil {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: fmt.Sprintf("encode daemon info: %v", err)})
+			return true, nil
+		}
+		return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+
+	case handoff.OpReload:
+		// The daemon starts its own successor so the successor lands in the
+		// same cgroup and carries the same service invocation. A client that
+		// spawned it would put it in the client's own cgroup, which under a
+		// service manager is a daemon that dies with the unit (issue #193).
+		if srv.respawn == nil {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: errNoSuccessor.Error()})
+			return true, nil
+		}
+		pid, err := srv.respawn()
+		if err != nil {
+			_ = remote.WriteFrame(conn, remote.Frame{Error: err.Error()})
+			return true, nil
+		}
+		raw, _ := json.Marshal(struct {
+			PID int `json:"pid"`
+		}{PID: pid})
+		return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+
 	case handoff.OpHandoff:
 		state := srv.hub.ExportState()
 		if srv.coverage != nil {
@@ -668,29 +715,6 @@ func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.Wat
 	return out, nil
 }
 
-// listenOrAdopt binds the daemon socket. When a live daemon already owns it
-// (the normal state after an upgrade: the old binary is still resident), the
-// new daemon performs an in-memory handoff instead — it receives the old
-// daemon's watching state and its listening socket, and serves in its place
-// with no gap on the path and no file written (issue #73). A handoff that
-// cannot be completed (predecessor too old to speak it, or it stopped
-// answering) returns the original "in use" error, which is today's
-// behaviour.
-func listenOrAdopt(ctx context.Context, socket string) (net.Listener, *hub.State, error) {
-	listener, err := ipc.Listen(socket)
-	if err == nil {
-		return listener, nil, nil
-	}
-	if !errors.Is(err, ipc.ErrLiveDaemon) || ctx == nil {
-		return nil, nil, err
-	}
-	adopted, state, aerr := handoff.Adopt(ctx, socket)
-	if aerr != nil {
-		return nil, nil, fmt.Errorf("%w (upgrade handoff failed: %v)", err, aerr)
-	}
-	return adopted, &state, nil
-}
-
 // daemonServer carries what serving one connection needs beyond the hub: the
 // listener (for the upgrade handoff's fd pass), the shutdown hook that lets a
 // successor daemon take over mid-flight (issue #73), and — when sub-daemons
@@ -705,6 +729,15 @@ type daemonServer struct {
 	handedOff *atomic.Bool
 	evlog     *eventlog.Writer // the daemon's event log; nil when it is off
 	shutdown  func()
+	// socket and info describe this daemon start to a successor and to
+	// `gh monitor doctor`; clients is what it is serving right now; respawn
+	// starts this daemon's successor for a supervised reload (issue #193).
+	socket          string
+	socketActivated bool
+	info            daemonInfo
+	clients         *clientRegistry
+	respawn         func() (int, error)
+	started         time.Time
 }
 
 // serveClient handles one client connection with the shared backend protocol.
@@ -722,6 +755,13 @@ func serveClient(ctx context.Context, srv *daemonServer, conn net.Conn) {
 			OnFailover: daemonFailoverObserver(srv.evlog),
 		}
 	}
+	// Record what this connection asks for, so the daemon can report what it
+	// serves (OpInfo) instead of an operator having to guess.
+	entry := srv.clients.add(handoff.PeerPID(conn))
+	defer srv.clients.remove(entry)
+	ctx = withClientEntry(ctx, entry)
+	src = recordingSource{inner: src, reg: srv.clients, entry: entry}
+
 	cfg := remote.ServerConfig{
 		Name:   DaemonBackendName,
 		Kinds:  backend.AllKinds(),
@@ -767,10 +807,13 @@ func isDisconnect(err error) bool {
 // the real binary.
 var spawnDaemonFn = spawnDaemon
 
+// autostartEnv names the variable that turns daemon auto-start off.
+const autostartEnv = "GH_MONITOR_AUTOSTART"
+
 // daemonAutostart reports whether `gh monitor` clients should spawn a daemon
 // when none is running. Default true; opt out with GH_MONITOR_AUTOSTART=0.
 func daemonAutostart() bool {
-	return os.Getenv("GH_MONITOR_AUTOSTART") != "0"
+	return os.Getenv(autostartEnv) != "0"
 }
 
 // autostartDaemon spawns a daemon (if none is listening) and waits for it to
@@ -778,6 +821,13 @@ func daemonAutostart() bool {
 // ipc.Listen's liveness probe ensures only one daemon binds the socket, and
 // every client's WaitReady still succeeds against the winner.
 func autostartDaemon(ctx context.Context, socket string, interval time.Duration) error {
+	// The policy lives here rather than at each caller: this function starts a
+	// daemon without being asked to, which is exactly what
+	// GH_MONITOR_AUTOSTART=0 forbids — including when the daemon a watch was
+	// riding on has crashed and the client is the only thing left to notice.
+	if !daemonAutostart() {
+		return fmt.Errorf("%s=0: not starting a daemon on %s", autostartEnv, socket)
+	}
 	if err := spawnDaemonFn(socket, interval); err != nil {
 		return err
 	}

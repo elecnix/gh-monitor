@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -403,7 +404,14 @@ func TestParseEndpoint(t *testing.T) {
 }
 
 func TestUnixTransportEndToEnd(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "b.sock")
+	// Short directory: see client_reconnect_test.go — darwin caps a Unix socket
+	// path at 104 bytes and t.TempDir() is most of it.
+	dir, err := os.MkdirTemp("/tmp", "ghm-remote-*")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "b.sock")
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatalf("listen: %v", err)

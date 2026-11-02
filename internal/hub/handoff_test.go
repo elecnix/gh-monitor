@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -280,4 +282,112 @@ func TestRestoreRoundTripsRunLatestAsAStatus(t *testing.T) {
 	require.NotNil(t, restored, "the successor must adopt the carried observation")
 	assert.Equal(t, fetched, restored,
 		"restored as the status the run fetch produced, byte-for-byte")
+}
+
+// TestSubscribe_TakeResumeIsSerialised is the crash the fleet exposed, end to
+// end: several watchers reconnecting at the same instant after one handoff,
+// each claiming the baseline held for it. Subscribe dropped h.mu before
+// calling takeResume, the deletes raced, and a Go map written by two
+// goroutines is a fatal error rather than a lost update — the daemon dies with
+// every other watcher on it.
+//
+// It is a scenario test, not a guard: Go throws only when two claims overlap
+// inside the map operation, which measured at one crash in fifty plain
+// `go test` runs (a `-race` run catches it immediately, and CI does not run
+// -race). TestTakeResumeTakesItsOwnLock is the deterministic guard.
+func TestSubscribe_TakeResumeIsSerialised(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	h1 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h1.Stop)
+
+	// One state carrying many watcher baselines, as a busy daemon's handoff
+	// export does.
+	const watchers = 8
+	opts := testHubOpts()
+	opts.ResumeID = "seed"
+	ch, cancelSeed := h1.SubscribePR(ctx, testHubTarget(), opts)
+	t.Cleanup(cancelSeed)
+	collect(ch, 100*time.Millisecond)
+	state := h1.ExportState()
+	require.Len(t, state.Resumes, 1)
+
+	state.Resumes = state.Resumes[:0]
+	for i := 0; i < watchers; i++ {
+		seed := h1.ExportState().Resumes[0]
+		seed.ResumeID = fmt.Sprintf("watcher-%d", i)
+		state.Resumes = append(state.Resumes, seed)
+	}
+
+	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h2.Stop)
+	require.NoError(t, h2.RestoreState(state))
+
+	// Reconnect every watcher at once, which is what a handoff causes.
+	var wg sync.WaitGroup
+	for i := 0; i < watchers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			o := testHubOpts()
+			o.ResumeID = fmt.Sprintf("watcher-%d", i)
+			c, cancelSub := h2.SubscribePR(ctx, testHubTarget(), o)
+			defer cancelSub()
+			collect(c, 50*time.Millisecond)
+		}(i)
+	}
+	wg.Wait()
+}
+
+
+// TestSubscribe_ResumePathDoesNotDeadlock guards the other direction of the
+// same contract, and it is the failure mode that does not announce itself: if
+// a caller ever locks h.mu around takeResume again — because it is "obvious"
+// that a function touching a map wants the caller to hold the lock — the
+// second lock blocks on a mutex Go will not let it re-take, and the daemon
+// stops serving with no crash and no stack trace.
+//
+// A deadlock shows up here as nothing at all, which is why the assertion is a
+// deadline rather than a value.
+func TestSubscribe_ResumePathDoesNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		return prFixture(nil), nil
+	}, nil, time.Hour, nil)
+	// No t.Cleanup(h.Stop) here on purpose: if the deadlock ever returns, Stop
+	// wants h.mu too and the cleanup would hang the whole binary instead of
+	// failing this one test promptly.
+
+	// Seed a live baseline, so Subscribe takes the takeResume path rather than
+	// skipping it for want of an entry.
+	h.mu.Lock()
+	h.resumes["w1"] = resumeEntry{
+		state:   ResumeState{ResumeID: "w1", Baseline: json.RawMessage(`{"state":"OPEN"}`)},
+		expires: time.Now().Add(time.Minute),
+	}
+	h.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		opts := testHubOpts()
+		opts.ResumeID = "w1"
+		ch, cancelSub := h.SubscribePR(ctx, testHubTarget(), opts)
+		defer cancelSub()
+		collect(ch, 50*time.Millisecond)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Subscribe never returned: the resume path deadlocked, which is what a " +
+			"call-site lock around takeResume looks like now that it locks itself")
+	}
 }

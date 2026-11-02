@@ -2,10 +2,18 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/backend/remote"
+	"github.com/elecnix/gh-monitor/internal/handoff"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -123,4 +131,67 @@ func TestPrefsSetNoWarnForClientSideKeys(t *testing.T) {
 
 	assert.NotContains(t, out.String()+errOut.String(), "reload",
 		"a client-side-only set must not suggest a daemon reload")
+}
+
+// TestReload_RefusesToClaimSuccessWithoutAnIdentifiableSuccessor pins the
+// hardening a review asked for: "a pid different from the resident one" is
+// satisfied by the resident daemon itself when its own report carried no pid,
+// so reload must not accept that as a takeover.
+func TestReload_RefusesToClaimSuccessWithoutAnIdentifiableSuccessor(t *testing.T) {
+	sock := shortSocket(t, "ghmon-reload-unknowable-*.d")
+	t.Setenv("GH_MONITOR_SOCK", sock)
+
+	// A daemon that answers Info with no pid and "starts" a successor it does
+	// not name: the two identities are indistinguishable.
+	origInfo := handoffInfoFn
+	t.Cleanup(func() { handoffInfoFn = origInfo })
+
+	_, err := waitForNewDaemon(t.Context(), sock, 0, 0, 100*time.Millisecond)
+	require.Error(t, err, "with neither pid known, a takeover cannot be verified")
+	assert.Contains(t, err.Error(), "neither pid is known")
+}
+
+// TestWaitForNewDaemonWantsTheReportedPID covers the ordinary path: the daemon
+// named the successor, and only that pid counts as serving.
+func TestWaitForNewDaemonWantsTheReportedPID(t *testing.T) {
+	sock := shortSocket(t, "ghmon-wait-new-*.d")
+
+	l, err := ipc.Listen(sock)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	// Stand in for the successor: answer Info with the pid the daemon named.
+	go func() {
+		ctx := context.Background()
+		for {
+			c, aerr := l.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				cfg := remote.ServerConfig{
+					Name: DaemonBackendName,
+					Source: backend.SourceFunc(func(context.Context, backend.Target, backend.WatchOptions) (<-chan backend.Update, error) {
+						return nil, errors.New("unused")
+					}),
+					HandleOp: func(_ context.Context, conn io.ReadWriter, req remote.Request) (bool, error) {
+						if req.Op != handoff.OpInfo {
+							return false, nil
+						}
+						raw, _ := json.Marshal(handoff.DaemonInfo{PID: 4242, Socket: sock})
+						return true, remote.WriteFrame(conn, remote.Frame{Result: raw})
+					},
+				}
+				_ = remote.Serve(ctx, conn, cfg)
+			}(c)
+		}
+	}()
+
+	got, err := waitForNewDaemon(t.Context(), sock, 111, 4242, 5*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, 4242, got)
+
+	// A different pid than the one the daemon named is not the successor.
+	_, err = waitForNewDaemon(t.Context(), sock, 111, 9999, 200*time.Millisecond)
+	require.Error(t, err, "only the pid the daemon reported may count as the successor")
 }

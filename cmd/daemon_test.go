@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +17,8 @@ import (
 	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/backend/gh"
 	"github.com/elecnix/gh-monitor/backend/remote"
+	"github.com/elecnix/gh-monitor/internal/activation"
+	"github.com/elecnix/gh-monitor/internal/handoff"
 	"github.com/elecnix/gh-monitor/internal/hub"
 	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/monitor"
@@ -33,7 +36,7 @@ import (
 // daemon's, and a --once read attaches to any daemon already listening there
 // (issue #114). Tests that want a daemon set their own with t.Setenv.
 func init() {
-	dir, err := os.MkdirTemp("", "ghmon-nodaemon-*")
+	dir, err := os.MkdirTemp(shortTmpDir(), "ghmon-nodaemon-*")
 	if err != nil {
 		panic(err)
 	}
@@ -74,10 +77,24 @@ func daemonTarget() backend.Target {
 // socket paths near 104 bytes, and t.TempDir() is already most of that.
 func shortSocket(t *testing.T, prefix string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", prefix)
+	// /tmp explicitly, not os.MkdirTemp(""): on darwin TMPDIR is a long
+	// /var/folders/... path and a Unix socket path is capped at 104 bytes, so
+	// the bind answered EINVAL with no hint about length.
+	dir, err := os.MkdirTemp(shortTmpDir(), prefix)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "d.sock")
+}
+
+// shortTmpDir is where short-lived sockets are created: a directory whose path
+// is short enough to hold one on every platform.
+func shortTmpDir() string {
+	if dir := "/tmp"; dir != "" {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+	}
+	return os.TempDir()
 }
 
 // unusedBuiltin is a built-in backend that fails if consulted, so a test
@@ -116,6 +133,15 @@ func startFakeSubdaemon(t *testing.T, ctx context.Context, sockPath string, kind
 // kinds to discovered sub-daemons (issue #88).
 func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry) *daemonServer {
 	t.Helper()
+	return bindTestServerConfigured(t, ctx, h, l, routes, nil)
+}
+
+// bindTestServerConfigured is bindTestServerOnWithRoutes with a hook that runs
+// before the server starts accepting, so a test can shape what the daemon
+// reports (socket activation, supervision) without racing a client that is
+// already talking to it.
+func bindTestServerConfigured(t *testing.T, ctx context.Context, h *hub.Hub, l net.Listener, routes *mux.Registry, configure func(*daemonServer)) *daemonServer {
+	t.Helper()
 	// A derived context is what makes a handoff complete: the successor's fd
 	// pass triggers shutdown, which must close every client connection — the
 	// signal watchers use to reconnect to the successor.
@@ -127,6 +153,15 @@ func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l
 		routes:    routes,
 		handedOff: &handedOff,
 		shutdown:  func() { cancel(); _ = l.Close() },
+		// The real daemon fills these in; the in-process test server does too,
+		// so OpInfo and the client registry are exercised rather than stubbed.
+		socket:  listenerPath(l),
+		clients: newClientRegistry(),
+		started: time.Now(),
+		info:    daemonInfo{version: runningVersion()},
+	}
+	if configure != nil {
+		configure(srv)
 	}
 	var wg sync.WaitGroup
 	t.Cleanup(func() {
@@ -149,6 +184,15 @@ func bindTestServerOnWithRoutes(t *testing.T, ctx context.Context, h *hub.Hub, l
 		}
 	}()
 	return srv
+}
+
+// listenerPath is the path a Unix listener is bound to, for tests that build a
+// daemonServer by hand.
+func listenerPath(l net.Listener) string {
+	if ul, ok := l.(*net.UnixListener); ok {
+		return ul.Addr().String()
+	}
+	return ""
 }
 
 // startTestDaemon wires a hub with a counting fake fetcher to a real Unix
@@ -418,8 +462,11 @@ func startDaemonCommand(t *testing.T, sock string, interval string) (stop func()
 		require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
 		select {
 		case <-doneCh:
-		case <-time.After(10 * time.Second):
-			t.Fatal("daemon did not stop after SIGTERM")
+		case <-time.After(30 * time.Second):
+			// A daemon stop is a cycle, not an event: the accept loop closes, the
+			// launcher gets up to five seconds to reap its children, and clients
+			// drain. Ten seconds held on an idle machine and not on a loaded one.
+			t.Fatal("daemon did not stop within 30s of SIGTERM")
 		}
 	}, doneCh
 }
@@ -653,7 +700,11 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 	// The watcher must ride across: a loud break, a reconnect, and then only
 	// the delta — never a replay of the state it was already shown.
 	var sawDegraded, sawReconnect, sawReplay, sawDelta bool
-	deadline := time.After(10 * time.Second)
+	// Generous, because this is a daemon cycle: a socket handoff, a client
+	// noticing the break, and three reconnect attempts with backoff. Ten seconds
+	// is enough on an idle machine and not on a loaded one — which is where it
+	// was found, at exactly 10.00s.
+	deadline := time.After(30 * time.Second)
 	for done := false; !done; {
 		select {
 		case u, open := <-ch:
@@ -673,14 +724,30 @@ func TestDaemon_UpgradeHandoff(t *testing.T) {
 				done = true
 			}
 		case <-deadline:
-			t.Fatalf("handoff never completed: degraded=%v reconnected=%v delta=%v",
-				sawDegraded, sawReconnect, sawDelta)
+			// Name the stage that was reached, so "slow" and "never" do not look
+			// the same: without this the message was identical for a watcher that
+			// never noticed the break and one that reconnected but saw no delta.
+			t.Fatalf("handoff did not complete within 30s — reached: break-loud=%v reconnected=%v delta=%v replay=%v; "+
+				"the daemon last reported %d client(s)",
+				sawDegraded, sawReconnect, sawDelta, sawReplay, len(lastClients(sock)))
 		}
 	}
 	assert.True(t, sawDegraded, "the break must be loud, never silent")
 	assert.True(t, sawReconnect, "the watcher must announce it reconnected")
 	assert.True(t, sawDelta, "the watcher must receive the change the new daemon fetched")
 	assert.False(t, sawReplay, "the watcher must not see a second first poll")
+}
+
+// lastClients reports what the daemon on sock says it is serving, for failure
+// messages that must distinguish a stalled handoff from an absent one.
+func lastClients(sock string) []handoff.ClientInfo {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	info, err := handoff.Info(ctx, sock)
+	if err != nil {
+		return nil
+	}
+	return info.Clients
 }
 
 // TestDaemon_ReexecsFromRuntimeCopy verifies the daemon command relaunches
@@ -772,4 +839,101 @@ func TestDaemon_NeverShutsDownOnIdle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, collectUntil(t, ch, backend.EventFirstPoll), "first-poll",
 		"a client attaching after an idle window must be served immediately")
+}
+
+// TestDaemon_ActivatedSocketIsUsedAndKept is the socket-activation contract:
+// the daemon serves the descriptor the service manager passed, at the path the
+// service manager chose, and never unlinks that path — the unit is still
+// listening on it.
+func TestDaemon_ActivatedSocketIsUsedAndKept(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	dir, err := os.MkdirTemp(shortTmpDir(), "ghm-activated-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "activated.sock")
+	l, err := net.Listen("unix", path)
+	require.NoError(t, err)
+	ul, ok := l.(*net.UnixListener)
+	require.True(t, ok)
+	ul.SetUnlinkOnClose(false)
+
+	f, err := ul.File() // what systemd passes: an inherited descriptor
+	require.NoError(t, err)
+	require.NoError(t, l.Close())
+
+	before := os.Getenv(activation.FDsEnv)
+	t.Cleanup(func() { _ = os.Setenv(activation.FDsEnv, before) })
+
+	d := &daemonRuntime{socket: filepath.Join(dir, "default.sock")}
+	// The test cannot claim fd 3 in a running test binary, so the descriptor
+	// is injected and the environment only has to make Listeners run.
+	origFile := activationProcessFile
+	activationProcessFile = func(uintptr, string) *os.File { return f }
+	t.Cleanup(func() { activationProcessFile = origFile })
+	t.Setenv(activation.FDsEnv, "1")
+	t.Setenv(activation.PIDEnv, "")
+
+	root := newRootCommand()
+	require.NoError(t, d.adoptActivated(ctx, root))
+	require.NotNil(t, d.activated, "an activated listener must be adopted")
+	assert.True(t, d.socketActivated)
+	assert.Equal(t, path, d.socket, "the path must come from the listener, not the flag")
+}
+
+// TestAutostart_RespectsOptOut is the policy a review found could be bypassed:
+// the client's revive hook called autostartDaemon directly, so a crash of the
+// daemon let a client spawn a replacement even with auto-start forbidden. The
+// check lives in autostartDaemon now, so every caller inherits it.
+func TestAutostart_RespectsOptOut(t *testing.T) {
+	t.Setenv("GH_MONITOR_AUTOSTART", "0")
+
+	origSpawn := spawnDaemonFn
+	t.Cleanup(func() { spawnDaemonFn = origSpawn })
+	spawned := 0
+	spawnDaemonFn = func(string, time.Duration) error { spawned++; return nil }
+
+	err := autostartDaemon(context.Background(), shortSocket(t, "ghmon-noauto-*.d"), time.Minute)
+	require.Error(t, err, "auto-start is forbidden by the environment")
+	assert.Contains(t, err.Error(), "GH_MONITOR_AUTOSTART")
+	assert.Zero(t, spawned, "nothing may be spawned when auto-start is off")
+}
+
+// A daemon may announce itself to a service manager only when one listens and
+// the daemon sits in that manager's service cgroup. A daemon an operator
+// started from a shell (`gh monitor reload` spawns one) can inherit
+// $NOTIFY_SOCKET and still not belong to the unit; naming it would take the
+// unit away from the daemon the manager supervises (issue #193).
+func TestDaemonSupervised(t *testing.T) {
+	cases := []struct {
+		name       string
+		notify     string
+		inCgroup   bool
+		supervised bool
+	}{
+		{"no manager", "", true, false},
+		{"manager, inside the service cgroup", "/run/notify", true, true},
+		{"manager's variable inherited by a shell-started daemon", "/run/notify", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NOTIFY_SOCKET", tc.notify)
+			prev := sdSupervisedFn
+			sdSupervisedFn = func() bool { return tc.inCgroup }
+			t.Cleanup(func() { sdSupervisedFn = prev })
+			assert.Equal(t, tc.supervised, daemonSupervised())
+		})
+	}
+}
+
+// Sub-daemons are launched without the notification socket, so none can report
+// readiness or a main pid for the unit.
+func TestSubdaemonChildEnvDropsNotifySocket(t *testing.T) {
+	t.Setenv("NOTIFY_SOCKET", "/run/notify")
+	l := subdaemonLauncherFn(nil, io.Discard, t.TempDir())
+	env := l.ChildEnv(subdaemon.Entry{Name: "broker-subscriber"})
+	for _, kv := range env {
+		assert.False(t, strings.HasPrefix(kv, "NOTIFY_SOCKET="), "child inherited %q", kv)
+	}
 }

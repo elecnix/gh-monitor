@@ -21,7 +21,13 @@ func runtimeRoot(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
+	// HOME matters as much as the XDG variables: os.UserCacheDir ignores them
+	// on darwin and derives $HOME/Library/Caches instead, so a test that
+	// isolated only XDG left its sandbox and read the real user directory.
+	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CACHE_HOME", dir)
+	// Windows derives its cache dir from %LocalAppData%, not HOME.
+	t.Setenv("LocalAppData", dir)
 	return dir
 }
 
@@ -31,9 +37,12 @@ func TestRuntimePathPrefersXDGRuntimeDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
 	}
-	want := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "gh-monitor", "gh-monitor")
-	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+	dir, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if filepath.Dir(got) != dir || !strings.HasPrefix(filepath.Base(got), copyPattern) {
+		t.Fatalf("RuntimePath() = %q, want a content-addressed copy in %q", got, dir)
 	}
 }
 
@@ -41,13 +50,47 @@ func TestRuntimePathFallsBackToCacheDir(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("XDG_CACHE_HOME", dir)
+	// This is the branch that broke on macOS: os.UserCacheDir ignores
+	// XDG_CACHE_HOME there and uses $HOME/Library/Caches, so without HOME the
+	// test compared against the user's real cache directory.
+	t.Setenv("HOME", dir)
 	got, err := RuntimePath()
 	if err != nil {
 		t.Fatalf("RuntimePath: %v", err)
 	}
-	want := filepath.Join(dir, "gh-monitor", "gh-monitor")
-	if got != want {
-		t.Fatalf("RuntimePath() = %q, want %q", got, want)
+	rd, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	// The sandbox promise only applies where the platform actually reads one of
+	// the variables the sandbox sets: darwin reads HOME, Linux XDG_CACHE_HOME,
+	// Windows %LocalAppData% — and a platform that ignores all three (or an
+	// environment whose variable survives t.Setenv under another casing) would
+	// fail the guard while the product is behaving correctly. The comparison
+	// below is against os.UserCacheDir() either way, so the test still checks the
+	// contract; this guard only fires when it can prove the sandbox held.
+	cacheDir, cacheErr := os.UserCacheDir()
+	if cacheErr == nil && strings.HasPrefix(cacheDir, dir) && !strings.HasPrefix(rd, dir) {
+		t.Fatalf("RuntimeDir() = %q escaped the sandbox at %q: this test would read the user's real cache", rd, dir)
+	}
+	// Compare against the platform's own answer, never a path spelled out here.
+	// darwin's cache dir is $HOME/Library/Caches and ignores XDG_CACHE_HOME (the
+	// Apple convention, not a defect), Windows reads %LocalAppData% — so a
+	// literal expectation is a Linux expectation wearing a portable test's
+	// clothes. The contract is: inside the sandbox, named gh-monitor, under
+	// whatever this platform calls its cache directory.
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatalf("os.UserCacheDir: %v", err)
+	}
+	if want := filepath.Join(cache, "gh-monitor"); rd != want {
+		t.Fatalf("RuntimeDir() = %q, want the platform's cache dir %q", rd, want)
+	}
+	if filepath.Base(rd) != "gh-monitor" {
+		t.Fatalf("RuntimeDir() = %q, want it to end in gh-monitor", rd)
+	}
+	if filepath.Dir(got) != rd || !strings.HasPrefix(filepath.Base(got), copyPattern) {
+		t.Fatalf("RuntimePath() = %q, want a content-addressed copy in %q", got, rd)
 	}
 }
 
@@ -58,18 +101,25 @@ func TestMaybeReexecOptOutEnv(t *testing.T) {
 		t.Fatalf("MaybeReexec with opt-out: %v", err)
 	}
 	// Nothing may have been copied.
-	if _, err := os.Stat(filepath.Join(dir, "gh-monitor", "gh-monitor")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("opt-out run must not create the runtime copy; stat err = %v", err)
+	entries, err := os.ReadDir(filepath.Join(dir, "gh-monitor"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("opt-out run must not create a runtime copy, found %d entries", len(entries))
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read runtime dir: %v", err)
 	}
 }
 
 func TestMaybeReexecSkipsWhenAlreadyRuntimeCopy(t *testing.T) {
-	dir := runtimeRoot(t)
+	runtimeRoot(t)
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
+	rt, err := CopyPathFor(exe)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(rt), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -127,15 +177,20 @@ func requireOnlyRuntimeCopy(t *testing.T, rt string) {
 
 func TestMaybeReexecCopiesAndExecs(t *testing.T) {
 	dir := runtimeRoot(t)
-	rt := filepath.Join(dir, "gh-monitor", "gh-monitor")
-
-	runReexecHelper(t, os.Args[0], dir)
-
-	// The runtime copy must exist, be executable, and match the original.
 	orig, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
+	// The copy's name comes from the binary's identity, so it is computed here
+	// rather than assumed: a fixed path is exactly what this package stopped
+	// using.
+	rt, err := CopyPathFor(orig)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
+
+	runReexecHelper(t, os.Args[0], dir)
+
 	want, err := os.ReadFile(orig)
 	if err != nil {
 		t.Fatalf("read original: %v", err)
@@ -197,10 +252,6 @@ func TestReexecHelperProcess(t *testing.T) {
 	if os.Getenv(helperEnv) == "" {
 		t.Skip("helper process for TestMaybeReexecCopiesAndExecs")
 	}
-	rt, err := RuntimePath()
-	if err != nil {
-		t.Fatalf("RuntimePath: %v", err)
-	}
 	if err := MaybeReexec(); err != nil {
 		t.Fatalf("MaybeReexec: %v", err)
 	}
@@ -208,12 +259,21 @@ func TestReexecHelperProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	if after != rt {
-		t.Errorf("running from %q, want the runtime copy %q", after, rt)
+	// The copy's own name is keyed by the copy's identity, which differs from
+	// the binary it was made from, so on the second entry CopyPathFor(after)
+	// names a copy that does not exist. What must hold is where the process
+	// lives: a content-addressed copy in the runtime directory, not the
+	// installed binary.
+	dir, err := RuntimeDir()
+	if err != nil {
+		t.Fatalf("RuntimeDir: %v", err)
+	}
+	if filepath.Dir(after) != dir || !strings.HasPrefix(filepath.Base(after), copyPattern) {
+		t.Errorf("running from %q, want a runtime copy in %q", after, dir)
 	}
 	procExe, err := os.Readlink("/proc/self/exe")
-	if err == nil && procExe != rt {
-		t.Errorf("/proc/self/exe = %q, want %q", procExe, rt)
+	if err == nil && procExe != after {
+		t.Errorf("/proc/self/exe = %q, want %q", procExe, after)
 	}
 	fmt.Println("REEXEC-OK")
 }

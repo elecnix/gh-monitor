@@ -9,8 +9,11 @@
 //
 // The visible signature of a launcher that exited is a changed parent pid:
 // the OS reassigns the child to a new parent (init, launchd, or the user
-// service manager) when the old parent exits. A goroutine polls os.Getppid()
-// and closes Done when it differs from the pid captured at start. Polling
+// service manager) when the old parent exits. A goroutine polls the launcher
+// pid and closes Done when it differs from the pid captured at start. The
+// launcher is resolved past wrapper processes — `gh` forks the extension and
+// waits, so the watch's own parent never changes and watching os.Getppid()
+// alone missed every watch started through the CLI (see launcher.go). Polling
 // rather than prctl(PR_SET_PDEATHSIG, SIGTERM) is deliberate: PDEATHSIG
 // observes the parent's main thread, which a multi-threaded launcher (Node,
 // .NET) exits long before its process ends, so it would stop healthy watches.
@@ -49,6 +52,9 @@ type Guard struct {
 	ppidFn func() int
 	// interval is the poll cadence.
 	interval time.Duration
+	// resolvedFn reports whether the current pid came from the same source as
+	// the baseline: the walk, not the parent-pid fallback.
+	resolvedFn func() bool
 	// done closes when the launcher is gone.
 	done chan struct{}
 	// stopc and stopOnce back Stop, which tests use to release the poll
@@ -64,16 +70,43 @@ type Guard struct {
 // anything reads it.
 func New(interval time.Duration, ppidFn func() int) *Guard {
 	return &Guard{
-		ppidFn:   ppidFn,
-		interval: interval,
-		done:     make(chan struct{}),
-		stopc:    make(chan struct{}),
+		ppidFn: ppidFn,
+		// An injected poller has one source by construction, so by default every
+		// reading is comparable to the baseline. Start overrides this with the
+		// check that matters in production.
+		resolvedFn: func() bool { return true },
+		interval:   interval,
+		done:       make(chan struct{}),
+		stopc:      make(chan struct{}),
 	}
 }
 
-// Start polls this process's real parent pid for its change.
+// Start polls the launcher pid for its change: the first non-wrapper ancestor
+// of this process, or the immediate parent when the walk cannot be done.
 func Start(interval time.Duration) *Guard {
-	return New(interval, os.Getppid).Start()
+	g := New(interval, LauncherPID)
+	// Only a walk that still resolves yields a pid comparable to the baseline.
+	// A walk that has started failing yields the parent-pid fallback, which is a
+	// different question and must not be read as "my launcher exited".
+	g.resolvedFn = func() bool { return ResolveLauncher(os.Getpid(), procParentOf) > 0 }
+	return g.Start()
+}
+
+// LauncherPID is the pid whose exit means the launcher that started this
+// watch is gone. It falls back to the immediate parent whenever the process
+// tree cannot be inspected, which is the guard's behaviour without the walk.
+//
+// Callers must compare like with like: a walk that succeeds once and fails
+// later switches pid sources, and the guard would read that switch as "my
+// launcher exited" and stop a healthy watch. Guard.Start captures the baseline
+// through this function and keeps it; the poll only reports a change when the
+// walk still resolves, so a transient unreadable /proc is silence rather than a
+// stop.
+func LauncherPID() int {
+	if pid := ResolveLauncher(os.Getpid(), procParentOf); pid > 0 {
+		return pid
+	}
+	return os.Getppid()
 }
 
 // Start captures the parent pid and launches the poll loop. The first read
@@ -106,10 +139,19 @@ func (g *Guard) Start() *Guard {
 				case <-g.stopc:
 					return
 				case <-ticker.C:
-					if cur := g.ppidFn(); cur != ppid && cur != 0 {
-						close(g.done)
-						return
+					cur := g.ppidFn()
+					// A read that fails, or a walk that suddenly cannot resolve,
+					// yields a pid from a different source than the baseline. That
+					// is not evidence the launcher left, so it is skipped rather
+					// than compared.
+					if cur == 0 || cur == ppid {
+						continue
 					}
+					if !g.resolvedFn() {
+						continue
+					}
+					close(g.done)
+					return
 				}
 			}
 		}(baseline)

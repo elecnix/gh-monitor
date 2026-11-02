@@ -11,11 +11,20 @@ import (
 )
 
 // runtimeCopyOf points RuntimePath at a scratch directory and names the file the
-// resident copy lands on.
+// resident copy lands on. The name is content-addressed, so it is asked for
+// rather than assumed.
 func runtimeCopyOf(t *testing.T) (dir, rt string) {
 	t.Helper()
 	dir = runtimeRoot(t)
-	return dir, filepath.Join(dir, "gh-monitor", "gh-monitor")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	rt, err = CopyPathFor(exe)
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
+	return dir, rt
 }
 
 // prepareRuntime is the starting point of every copyExecutable test: a scratch
@@ -39,7 +48,13 @@ func prepareRuntime(t *testing.T) (runtimeDir, rt, src string) {
 // of zero writes a small file; anything larger is sparse and costs no disk.
 func leaveCopy(t *testing.T, runtimeDir, name string, size int64, age time.Duration) string {
 	t.Helper()
-	path := filepath.Join(runtimeDir, "gh-monitor.tmp-"+name)
+	// Debris is named after the copy it was interrupted while writing, and the
+	// copy's name is content-addressed: one build's debris is not another's.
+	dst, err := CopyPathFor(mustExecutable(t))
+	if err != nil {
+		t.Fatalf("CopyPathFor: %v", err)
+	}
+	path := filepath.Join(runtimeDir, filepath.Base(dst)+".tmp-"+name)
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatal(err)
@@ -236,4 +251,14 @@ func TestCopyExecutableRefusesAnUnhealthyRuntimeDir(t *testing.T) {
 		t.Fatalf("error %q should name %s, so the operator knows where to look", err, runtimeDir)
 	}
 	requireGone(t, rt)
+}
+
+// mustExecutable is os.Executable with a test-friendly failure mode.
+func mustExecutable(t *testing.T) string {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return exe
 }

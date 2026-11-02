@@ -19,7 +19,7 @@ import (
 
 func socketPath(t *testing.T, prefix string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", prefix)
+	dir, err := os.MkdirTemp(shortTmp(), prefix)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return filepath.Join(dir, "s.sock")
@@ -370,4 +370,14 @@ func TestNewConnClosesTheConnectionItOwns(t *testing.T) {
 			}
 		})
 	}
+}
+
+// shortTmp is where short-lived sockets and their directories are created: darwin
+// caps a Unix socket path at 104 bytes and TMPDIR there is a long
+// /var/folders/... path that leaves almost no room.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }

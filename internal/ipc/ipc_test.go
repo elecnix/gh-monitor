@@ -5,6 +5,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +19,7 @@ import (
 // socket, a second Listen must fail (not os.Remove the live socket and steal
 // the path), so at most one daemon ever serves a given socket.
 func TestListen_RejectsLiveSocket(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-listen-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-listen-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "d.sock")
@@ -40,7 +42,7 @@ func TestListen_RejectsLiveSocket(t *testing.T) {
 // TestListen_ReclaimsStaleSocket verifies a stale socket (no live daemon) is
 // removed and reused, so a crashed daemon does not block the next start.
 func TestListen_ReclaimsStaleSocket(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-stale-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-stale-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "d.sock")
@@ -60,7 +62,7 @@ func TestListen_ReclaimsStaleSocket(t *testing.T) {
 
 // TestWaitReady_Timeout verifies WaitReady gives up when nothing binds.
 func TestWaitReady_Timeout(t *testing.T) {
-	dir, err := os.MkdirTemp("", "ghmon-wait-*.d")
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-wait-*.d")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "never.sock")
@@ -68,4 +70,42 @@ func TestWaitReady_Timeout(t *testing.T) {
 	err = WaitReady(context.Background(), sock, 300*time.Millisecond)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "did not come up")
+}
+
+// TestListen_RejectsAPathOverThePlatformLimit is the failure a real machine
+// produces with a long user name or a deep $XDG_RUNTIME_DIR: bind answers
+// EINVAL, which says nothing about length. The check names the length, the
+// limit and the path instead.
+func TestListen_RejectsAPathOverThePlatformLimit(t *testing.T) {
+	dir := t.TempDir()
+	long := filepath.Join(dir, strings.Repeat("d", maxPathLen()))
+	_, err := Listen(long)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "socket path is")
+	assert.Contains(t, err.Error(), strconv.Itoa(maxPathLen()), "the message must name the limit")
+	assert.Contains(t, err.Error(), "GH_MONITOR_SOCK", "and the way out of it")
+}
+
+// TestListen_AcceptsAPathUnderTheLimit keeps the guard from being stricter than
+// the kernel: a path the platform can bind must still bind.
+func TestListen_AcceptsAPathUnderTheLimit(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "ghm-ipc-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "d.sock")
+	require.Less(t, len(path), maxPathLen())
+
+	l, err := Listen(path)
+	require.NoError(t, err)
+	_ = l.Close()
+}
+
+// shortTmp is where socket fixtures create their directory: darwin caps a Unix
+// socket path at 104 bytes and TMPDIR there is a long /var/folders/... path,
+// so a socket built on t.TempDir() cannot be bound at all.
+func shortTmp() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return os.TempDir()
 }
