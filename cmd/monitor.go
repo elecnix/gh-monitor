@@ -1060,12 +1060,15 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 		if !daemonAutostart() {
 			return false, fmt.Errorf("no shared poller is listening on %s and autostart is disabled (GH_MONITOR_AUTOSTART=0); start one with 'gh monitor daemon'", socket)
 		}
-		if err := autostartDaemon(ctx, socket, interval); err != nil {
+		own, err := autostartDaemon(ctx, socket, interval)
+		if err != nil {
 			return false, fmt.Errorf("could not start the shared poller (%v); start one with 'gh monitor daemon'", err)
 		}
-		// The daemon this watch is about to use was started from this
-		// invocation's own interval, so the request was honoured.
-		started = true
+		// own is true only when this invocation's own daemon won the
+		// socket, so the interval it was given is the one the watch will
+		// run at. A daemon that lost the bind race to a concurrent client
+		// serves the watch instead, at its own cadence (issue #170).
+		started = own
 	}
 
 	transport, err := remote.ParseEndpoint("unix:" + socket)
@@ -1087,7 +1090,10 @@ func attachDaemon(ctx context.Context, reg *backend.Registry, target backend.Tar
 	// client that gave up on the daemon and polled by itself is exactly how
 	// unattached, upgrade-proof pollers accumulated (issue #193).
 	provider.SetRevive(func(rctx context.Context) error {
-		return autostartDaemon(rctx, socket, interval)
+		// A revived daemon is not the watch's first, so who won the socket
+		// no longer decides whether --interval was honoured.
+		_, err := autostartDaemon(rctx, socket, interval)
+		return err
 	})
 	if err := reg.Use(provider); err != nil {
 		return false, fmt.Errorf("register the shared poller: %w", err)
