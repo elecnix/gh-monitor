@@ -107,7 +107,7 @@ func TestMonitor_IntervalSilentWhenThisInvocationStartedTheDaemon(t *testing.T) 
 	// report that it started one, which is what makes the notice silent.
 	origSpawn := spawnDaemonFn
 	t.Cleanup(func() { spawnDaemonFn = origSpawn })
-	spawnDaemonFn = func(socket string, interval time.Duration) error {
+	spawnDaemonFn = func(socket string, interval time.Duration, _ string) error {
 		serveCtx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		h := hub.New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {

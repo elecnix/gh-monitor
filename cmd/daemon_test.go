@@ -369,7 +369,7 @@ func TestAutoStart_SpawnsDaemonWhenAbsent(t *testing.T) {
 
 	var spawned int64
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(socket string, _ time.Duration) error {
+	spawnDaemonFn = func(socket string, _ time.Duration, _ string) error {
 		atomic.AddInt64(&spawned, 1)
 		bindTestServer(t, ctx, h, socket)
 		return nil
@@ -398,7 +398,7 @@ func TestAutoStart_SkipsSpawnWhenDaemonRunning(t *testing.T) {
 
 	var spawned int64
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(string, time.Duration) error {
+	spawnDaemonFn = func(string, time.Duration, string) error {
 		atomic.AddInt64(&spawned, 1)
 		return nil
 	}
@@ -425,7 +425,7 @@ func TestAutoStart_DisabledByEnv(t *testing.T) {
 
 	var spawned int64
 	orig := spawnDaemonFn
-	spawnDaemonFn = func(string, time.Duration) error {
+	spawnDaemonFn = func(string, time.Duration, string) error {
 		atomic.AddInt64(&spawned, 1)
 		return nil
 	}
@@ -892,9 +892,9 @@ func TestAutostart_RespectsOptOut(t *testing.T) {
 	origSpawn := spawnDaemonFn
 	t.Cleanup(func() { spawnDaemonFn = origSpawn })
 	spawned := 0
-	spawnDaemonFn = func(string, time.Duration) error { spawned++; return nil }
+	spawnDaemonFn = func(string, time.Duration, string) error { spawned++; return nil }
 
-	err := autostartDaemon(context.Background(), shortSocket(t, "ghmon-noauto-*.d"), time.Minute)
+	_, err := autostartDaemon(context.Background(), shortSocket(t, "ghmon-noauto-*.d"), time.Minute)
 	require.Error(t, err, "auto-start is forbidden by the environment")
 	assert.Contains(t, err.Error(), "GH_MONITOR_AUTOSTART")
 	assert.Zero(t, spawned, "nothing may be spawned when auto-start is off")

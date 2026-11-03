@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/elecnix/gh-monitor/internal/ipc"
 	"github.com/elecnix/gh-monitor/internal/orphan"
 	"github.com/elecnix/gh-monitor/internal/prefs"
 	"github.com/elecnix/gh-monitor/internal/reexec"
@@ -118,7 +119,11 @@ func buildUpgradeCommand(installed, socket string, interval time.Duration) *exec
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	// A successor starts its own re-exec chain; it does not continue this one.
-	cmd.Env = reexec.ChildEnv()
+	// It takes the socket over from this daemon through the upgrade handoff. It
+	// did not win a bind race, so it must not report an outcome into the file
+	// the client that spawned this daemon is waiting on: the answer there is
+	// about the bind, not about a handoff (issue #170).
+	cmd.Env = ipc.EnvWithBindResult(reexec.ChildEnv(), "")
 	return cmd
 }
 
