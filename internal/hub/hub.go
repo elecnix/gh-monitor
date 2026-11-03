@@ -201,6 +201,9 @@ type BrokerCoverage interface {
 // pollerKey identifies a single poller. Every field a resolver.Identity can
 // distinguish on is part of the key: a ref named "main" and a PR numbered 7
 // in the same repo are different pollers even though they share owner/repo.
+// Owner and repo are lower-cased because GitHub resolves them
+// case-insensitively: PrizmalAI/x#1 and PrizmalAi/x#1 are one pull request, and
+// a key that told them apart polled it once per spelling.
 type pollerKey struct {
 	kind   backend.Kind
 	owner  string
@@ -219,8 +222,8 @@ func keyOf(id resolver.Identity) pollerKey {
 	}
 	return pollerKey{
 		kind:   kind,
-		owner:  id.Owner,
-		repo:   id.Repo,
+		owner:  strings.ToLower(id.Owner),
+		repo:   strings.ToLower(id.Repo),
 		number: id.Number,
 		ref:    id.Ref,
 		sha:    id.CommitSHA,

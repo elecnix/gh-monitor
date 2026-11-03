@@ -1202,3 +1202,63 @@ func TestSubscribe_FirstPollTierNoticeReachesItsFirstSubscriber(t *testing.T) {
 		}
 	}
 }
+
+// TestHub_TenWatchersOfOnePRShareOneFetch pins the operator's rule that a watch
+// is shared and free: ten consumers of one PR cost one fetch, the same as one.
+func TestHub_TenWatchersOfOnePRShareOneFetch(t *testing.T) {
+	var fetches int64
+	snap := prFixture([]string{"ci-build"})
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		atomic.AddInt64(&fetches, 1)
+		return snap, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	chans := make([]<-chan backend.Update, 0, 10)
+	for i := 0; i < 10; i++ {
+		ch, stop := h.SubscribePR(ctx, testHubTarget(), testHubOpts())
+		t.Cleanup(stop)
+		chans = append(chans, ch)
+	}
+	for i, ch := range chans {
+		require.Contains(t, collect(ch, 200*time.Millisecond), "first-poll", "watcher %d", i)
+	}
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&fetches), "ten watchers of one PR must cost one fetch")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	assert.Len(t, h.pollers, 1, "ten watchers of one PR must share one poller")
+}
+
+// TestHub_OwnerAndRepoCaseDoNotSplitAPoller covers the same PR named with
+// different letter case. GitHub treats owner and repository names as
+// case-insensitive, so PrizmalAI/x#1 and PrizmalAi/x#1 are one PR and must
+// share one poller. A case-sensitive key polled it once per spelling.
+func TestHub_OwnerAndRepoCaseDoNotSplitAPoller(t *testing.T) {
+	var fetches int64
+	snap := prFixture([]string{"ci-build"})
+	h := New(func(ctx context.Context, _ resolver.Identity, _ monitor.QueryTier) (any, error) {
+		atomic.AddInt64(&fetches, 1)
+		return snap, nil
+	}, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	for _, spelling := range [][2]string{{"PrizmalAI", "Switch"}, {"PrizmalAi", "Switch"}, {"prizmalai", "switch"}} {
+		tgt := testHubTarget()
+		tgt.Owner, tgt.Repo = spelling[0], spelling[1]
+		ch, stop := h.SubscribePR(ctx, tgt, testHubOpts())
+		t.Cleanup(stop)
+		require.Contains(t, collect(ch, 200*time.Millisecond), "first-poll", "%s/%s", spelling[0], spelling[1])
+	}
+
+	assert.Equal(t, int64(1), atomic.LoadInt64(&fetches), "three spellings of one PR must cost one fetch")
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	assert.Len(t, h.pollers, 1, "three spellings of one PR must share one poller")
+}
