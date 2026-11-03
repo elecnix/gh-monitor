@@ -266,7 +266,10 @@ func runDaemon(cmd *cobra.Command, socket string, interval time.Duration) error 
 	// path (issue #73).
 	var handedOff atomic.Bool
 	defer func() {
-		ipc.ReleaseOwner(d.socket)
+		// The record goes after the path: while it names this process, a
+		// starter that finds the socket refused keeps its hands off, so it
+		// cannot bind a new socket here only to have this exit unlink it.
+		defer ipc.ReleaseOwner(d.socket)
 		// The path belongs to whoever bound it: a successor after a handoff,
 		// and the service manager when the socket was activated. Removing it
 		// in either case would take the daemon's door off its hinges.
