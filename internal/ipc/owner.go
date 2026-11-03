@@ -1,0 +1,77 @@
+package ipc
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// OwnerPath is the file beside a daemon socket that names the process serving
+// it.
+//
+// A dial that is refused cannot tell a dead daemon from a live one that is not
+// accepting: macOS refuses a connect when the accept queue is full, and a
+// crashed daemon's leftover socket file refuses it too. Listen used to read
+// every refusal as "stale" and unlink the path, which left the live daemon
+// running on an orphaned socket while its successor bound a new one. The
+// record is the second witness: a refusal is stale only when the process that
+// wrote it is gone.
+func OwnerPath(socket string) string { return socket + ".pid" }
+
+// ClaimOwner records this process as the one serving socket. Listen does it on
+// bind; a successor that adopted the listening socket from a predecessor calls
+// it, because Listen never ran for it.
+func ClaimOwner(socket string) error {
+	return withOwnerLock(socket, func() error {
+		// Written aside and renamed into place: ownerAlive reads the record
+		// without the lock, and a read between a truncate and a write would
+		// see an empty record, read it as no owner, and let a refused socket
+		// of a live daemon be reclaimed.
+		tmp := OwnerPath(socket) + "." + strconv.Itoa(os.Getpid()) + ".tmp"
+		if err := os.WriteFile(tmp, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+			return fmt.Errorf("record the daemon owning %s: %w", socket, err)
+		}
+		if err := os.Rename(tmp, OwnerPath(socket)); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("record the daemon owning %s: %w", socket, err)
+		}
+		return nil
+	})
+}
+
+// ReleaseOwner removes the record when it still names this process. After a
+// handoff it names the successor, and removing that would hide a live daemon.
+//
+// The read and the removal happen under the same lock as ClaimOwner's write,
+// so a successor that claims between them cannot have its record removed.
+func ReleaseOwner(socket string) {
+	_ = withOwnerLock(socket, func() error {
+		if pid, ok := recordedOwner(socket); ok && pid == os.Getpid() {
+			return os.Remove(OwnerPath(socket))
+		}
+		return nil
+	})
+}
+
+// recordedOwner reads the pid from the record.
+func recordedOwner(socket string) (int, bool) {
+	raw, err := os.ReadFile(OwnerPath(socket))
+	if err != nil {
+		return 0, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return 0, false
+	}
+	return pid, true
+}
+
+// ownerAlive reports whether a process other than this one is recorded as
+// serving socket and still exists. No record means a daemon from before the
+// record existed, or one that never wrote it, and is read as not alive: that
+// is the behaviour Listen always had.
+func ownerAlive(socket string) bool {
+	pid, ok := recordedOwner(socket)
+	return ok && pid != os.Getpid() && processExists(pid)
+}

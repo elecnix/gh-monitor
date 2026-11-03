@@ -22,6 +22,10 @@ import (
 // #73) rather than fail.
 var ErrLiveDaemon = errors.New("socket already in use by a live daemon")
 
+// probeTimeout bounds the liveness dial in Listen. A daemon that does not
+// answer is not one a starter can wait on.
+const probeTimeout = 2 * time.Second
+
 // DefaultSocketPath returns the daemon socket path. It honours
 // $GH_MONITOR_SOCK, then $XDG_RUNTIME_DIR, then a per-user cache dir.
 func DefaultSocketPath() string {
@@ -44,7 +48,8 @@ func IsAbsent(err error) bool {
 // Listen creates and listens on the Unix socket at path. If a socket file
 // already exists, it probes it: a live daemon (Dial succeeds) means another
 // process owns it, so Listen returns an error and the caller backs off; a
-// stale socket (connection refused) is removed and reused. This makes
+// refused connection is stale only when the process recorded as owning the
+// socket is gone (see OwnerPath), and then it is removed and reused. This makes
 // concurrent autostart spawners safe — at most one daemon binds the path.
 func Listen(path string) (net.Listener, error) {
 	if err := checkPathLen(path); err != nil {
@@ -52,9 +57,16 @@ func Listen(path string) (net.Listener, error) {
 	}
 	if _, err := os.Stat(path); err == nil {
 		// A socket file is present. Probe it before touching it.
-		if c, derr := net.Dial("unix", path); derr == nil {
+		c, derr := net.DialTimeout("unix", path, probeTimeout)
+		if derr == nil {
 			_ = c.Close()
 			return nil, fmt.Errorf("socket %s: %w", path, ErrLiveDaemon)
+		}
+		// A refused dial is also what a live daemon that is not accepting
+		// gives, so the recorded owner decides: unlinking its socket would
+		// strand it on a path nobody can reach.
+		if ownerAlive(path) {
+			return nil, fmt.Errorf("socket %s refused a connection but its recorded owner is still running (if that pid is not a gh-monitor daemon, delete %s): %w", path, OwnerPath(path), ErrLiveDaemon)
 		}
 		// Stale socket from a crashed daemon — safe to reclaim.
 		_ = os.Remove(path)
@@ -67,6 +79,10 @@ func Listen(path string) (net.Listener, error) {
 	l, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, fmt.Errorf("listen %s: %w", path, err)
+	}
+	if err := ClaimOwner(path); err != nil {
+		_ = l.Close()
+		return nil, err
 	}
 	return l, nil
 }

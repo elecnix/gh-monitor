@@ -183,6 +183,11 @@ func (d *daemonRuntime) listenOrAdopt(ctx context.Context) (net.Listener, *hub.S
 	if aerr != nil {
 		return nil, nil, fmt.Errorf("%w (upgrade handoff failed: %v)", err, aerr)
 	}
+	// Listen never ran for a successor, so the owner record still names the
+	// predecessor.
+	if cerr := ipc.ClaimOwner(d.socket); cerr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "gh-monitor daemon: %v\n", cerr)
+	}
 	return adopted, &state, nil
 }
 
