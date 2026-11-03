@@ -200,3 +200,12 @@ func TestListen_ReadsAMalformedOwnerRecordAsNoOwner(t *testing.T) {
 		_ = l.Close()
 	}
 }
+
+// TestProcessExists pins the platform probe: this process exists, an unused pid
+// does not, and pids that signal groups or every process are never a process.
+func TestProcessExists(t *testing.T) {
+	assert.True(t, processExists(os.Getpid()))
+	assert.False(t, processExists(2147483646))
+	assert.False(t, processExists(0))
+	assert.False(t, processExists(-1))
+}
