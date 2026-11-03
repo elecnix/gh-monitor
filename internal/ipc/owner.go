@@ -24,7 +24,16 @@ func OwnerPath(socket string) string { return socket + ".pid" }
 // it, because Listen never ran for it.
 func ClaimOwner(socket string) error {
 	return withOwnerLock(socket, func() error {
-		if err := os.WriteFile(OwnerPath(socket), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+		// Written aside and renamed into place: ownerAlive reads the record
+		// without the lock, and a read between a truncate and a write would
+		// see an empty record, read it as no owner, and let a refused socket
+		// of a live daemon be reclaimed.
+		tmp := OwnerPath(socket) + "." + strconv.Itoa(os.Getpid()) + ".tmp"
+		if err := os.WriteFile(tmp, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+			return fmt.Errorf("record the daemon owning %s: %w", socket, err)
+		}
+		if err := os.Rename(tmp, OwnerPath(socket)); err != nil {
+			_ = os.Remove(tmp)
 			return fmt.Errorf("record the daemon owning %s: %w", socket, err)
 		}
 		return nil

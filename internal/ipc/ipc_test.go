@@ -209,3 +209,38 @@ func TestProcessExists(t *testing.T) {
 	assert.False(t, processExists(0))
 	assert.False(t, processExists(-1))
 }
+
+// TestClaimOwner_NeverShowsAnEmptyRecord reads the record while it is
+// rewritten: a reader must see a whole pid every time, never the empty file a
+// truncating write leaves for an instant.
+func TestClaimOwner_NeverShowsAnEmptyRecord(t *testing.T) {
+	dir, err := os.MkdirTemp(shortTmp(), "ghmon-atomic-*.d")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "d.sock")
+	require.NoError(t, ClaimOwner(sock))
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = ClaimOwner(sock)
+			}
+		}
+	}()
+	for i := 0; i < 20000; i++ {
+		_, ok := recordedOwner(sock)
+		if !ok {
+			close(stop)
+			<-done
+			t.Fatalf("read %d saw no usable owner record", i)
+		}
+	}
+	close(stop)
+	<-done
+}
