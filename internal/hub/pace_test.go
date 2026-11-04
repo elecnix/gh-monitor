@@ -78,17 +78,18 @@ func TestPace_ShortBudgetGrantsOldestFirst(t *testing.T) {
 	assert.Positive(t, wait)
 }
 
-func TestPace_NextDelayStretchesWithShrinkingBudget(t *testing.T) {
+func TestPace_IntervalGrowsStrictlyAsBudgetShrinks(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	store := ghcli.NewRateLimitStore()
 	h := paceHub(t, store, &now)
-	ps := addPollers(h, 3, 26)
-	var prev time.Duration
-	for _, remaining := range []int{5000, 1500, 900, 500, 0} {
-		store.Observe("", ghcli.GraphQLHeaders(remaining, 5000, now.Add(time.Hour)), now.Add(time.Duration(remaining)*time.Millisecond))
+	addPollers(h, 3, 26)
+	prev := time.Duration(0)
+	for i, remaining := range []int{5000, 1500, 900, 700, 600} {
+		at := now.Add(time.Duration(i) * time.Second)
+		store.Observe("", ghcli.GraphQLHeaders(remaining, 5000, now.Add(time.Hour)), at)
 		d, _ := h.paceInterval()
-		assert.GreaterOrEqual(t, d, prev, "remaining %d", remaining)
+		assert.Greater(t, d, prev, "remaining %d", remaining)
 		prev = d
-		_ = ps
 	}
+	assert.Greater(t, prev, 10*time.Minute)
 }

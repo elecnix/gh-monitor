@@ -1408,6 +1408,8 @@ func (p *poller) fetchOnce() {
 		}
 	}()
 
+	p.lastRefresh.Store(p.hub.now().UnixNano())
+
 	// While the headers of the last GraphQL response say the budget is spent
 	// until a reset time, a GraphQL call can only fail. Read over REST
 	// without making it.
@@ -1429,7 +1431,6 @@ func (p *poller) fetchOnce() {
 		p.applyTier(tier)
 	}
 
-	p.lastRefresh.Store(p.hub.now().UnixNano())
 	p.lastCost.Store(math.Float64bits(p.budget.PollCost(tier)))
 	curr, err := fetch(ctx, p.identity, tier)
 	p.budget.Spend(tier)

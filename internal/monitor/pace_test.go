@@ -83,3 +83,10 @@ func TestOldestDue_PicksLeastRecentlyRefreshed(t *testing.T) {
 	_, ok = OldestDue(now, []PollCandidate{{ID: 3, LastRefresh: now, Interval: time.Minute}})
 	assert.False(t, ok)
 }
+
+func TestPacer_TinyAvailableBudgetBacksOffToReset(t *testing.T) {
+	p := NewPacer(DefaultPaceConfig)
+	r := paceReading(501, paceT0)
+	p.otherRate = 2.7775e-4 // leaves about 1e-4 points available
+	assert.Equal(t, time.Hour, p.Interval(paceT0, r, paceBase, 20, 26))
+}

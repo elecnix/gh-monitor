@@ -143,7 +143,9 @@ func (s *RateLimitStore) Latest(host, resource string) (RateLimitReading, bool) 
 	}
 	if rose {
 		r.Remaining = best
-		r.Used = r.Limit - best
+		if r.Limit > 0 {
+			r.Used = r.Limit - best
+		}
 	}
 	return r, true
 }

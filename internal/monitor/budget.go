@@ -155,11 +155,15 @@ func (g *BudgetGuard) Stretch(now time.Time) BudgetState {
 // base (the cadence is stretched). Without a current header reading it
 // returns base: a blind guard must not guess. See Pacer for the formula.
 func (g *BudgetGuard) Pace(now time.Time, base time.Duration, pollers int, cost float64) (time.Duration, bool) {
-	if g == nil || g.observed == nil {
+	if g == nil {
 		return base, false
 	}
 	g.mu.Lock()
-	r, ok := g.currentReading("", now)
+	var r ghcli.RateLimitReading
+	ok := g.observed != nil
+	if ok {
+		r, ok = g.currentReading("", now)
+	}
 	g.mu.Unlock()
 	if !ok {
 		return base, false

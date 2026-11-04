@@ -131,14 +131,14 @@ func (p *Pacer) Interval(now time.Time, r ghcli.RateLimitReading, base time.Dura
 	if available <= 0 {
 		return ceiling
 	}
-	d := time.Duration(float64(pollers) * cost * t / available * float64(time.Second))
-	if d < base {
-		return base
+	secs := float64(pollers) * cost * t / available
+	if secs >= ceiling.Seconds() {
+		return ceiling // also covers a quotient too large for a Duration
 	}
-	if d > ceiling || d < 0 {
-		return ceiling
+	if d := time.Duration(secs * float64(time.Second)); d > base {
+		return d
 	}
-	return d
+	return base
 }
 
 // PollCandidate is one poller waiting for a turn.
