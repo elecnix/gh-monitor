@@ -16,9 +16,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
@@ -137,6 +139,14 @@ type Hub struct {
 	// where a poller started too early would already have polled.
 	beforeAttach func()
 
+	// now is the clock pacing reads; tests replace it.
+	now func() time.Time
+
+	// slotMu guards nextSlot, the earliest moment the next paced timer
+	// fetch may start (see grantTurn).
+	slotMu   sync.Mutex
+	nextSlot time.Time
+
 	mu      sync.Mutex
 	pollers map[pollerKey]*poller
 
@@ -249,6 +259,7 @@ func New(fetch FetchFunc, rulesetFn RulesetFunc, interval time.Duration, budget 
 		budget:    budget,
 		pollers:   make(map[pollerKey]*poller),
 		resumes:   make(map[string]resumeEntry),
+		now:       time.Now,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -1084,6 +1095,12 @@ type poller struct {
 	// one, when its first subscriber arrives. Guarded by hub.mu.
 	started bool
 
+	// lastRefresh is when the last fetch attempt started, in unix nanos, and
+	// lastCost the points it was estimated to spend (float bits). Atomic so
+	// the hub can read every poller without taking its lock.
+	lastRefresh atomic.Int64
+	lastCost    atomic.Uint64
+
 	mu          sync.Mutex
 	latest      any               // what the last successful fetch produced: a wire payload, or a status for a kind that distils at the source
 	noChange    int               // consecutive fingerprint-unchanged fetches; drives idle backoff
@@ -1181,6 +1198,10 @@ func (p *poller) run() {
 			return
 		case <-timer.C:
 			if !p.timerPollPaused() {
+				if ok, wait := p.hub.grantTurn(p); !ok {
+					timer.Reset(wait)
+					continue
+				}
 				p.fetchOnce()
 			}
 			delay = p.nextDelay()
@@ -1256,12 +1277,86 @@ func (p *poller) nextDelay() time.Duration {
 		d = monitor.Jittered(errBackoff)
 	}
 	if p.budget != nil {
-		d += p.budget.Stretch(time.Now()).Extra
+		// The budget pace replaces the idle interval once it is longer, and
+		// may exceed the idle ceiling: near exhaustion the right wait is the
+		// time until the reset.
+		pace, _ := p.hub.paceInterval()
+		if pace > ceiling {
+			ceiling = pace
+		}
+		if pace > d {
+			d = pace
+		}
 		if d > ceiling {
 			d = ceiling
 		}
 	}
 	return d
+}
+
+// paceInterval returns the per-poller interval the shared GraphQL budget
+// allows, and whether it is longer than the base interval.
+func (h *Hub) paceInterval() (time.Duration, bool) {
+	if h.budget == nil {
+		return h.interval, false
+	}
+	n, cost := 0, 0.0
+	h.mu.Lock()
+	for _, p := range h.pollers {
+		if p.traits.tiered {
+			n++
+			cost += math.Float64frombits(p.lastCost.Load())
+		}
+	}
+	h.mu.Unlock()
+	if n == 0 {
+		return h.interval, false
+	}
+	return h.budget.Pace(h.now(), h.interval, n, cost/float64(n))
+}
+
+// grantTurn decides whether p may run a timer fetch now. While the budget is
+// ample every poller runs on its own timer. Once the pace is stretched, the
+// hub spaces fetches interval/N apart and gives each slot to the due poller
+// whose last refresh is oldest, so no target starves. A denied poller
+// re-arms for the returned wait. Wake-driven fetches skip this gate.
+func (h *Hub) grantTurn(p *poller) (bool, time.Duration) {
+	pace, stretched := h.paceInterval()
+	if !stretched {
+		return true, 0
+	}
+	now := h.now()
+	h.mu.Lock()
+	self := -1
+	cands := make([]monitor.PollCandidate, 0, len(h.pollers))
+	for _, q := range h.pollers {
+		if !q.traits.tiered || q.timerPollPaused() {
+			continue
+		}
+		if q == p {
+			self = len(cands)
+		}
+		cands = append(cands, monitor.PollCandidate{
+			ID:          len(cands),
+			LastRefresh: time.Unix(0, q.lastRefresh.Load()),
+			Interval:    pace,
+		})
+	}
+	h.mu.Unlock()
+	if self < 0 {
+		return true, 0
+	}
+	gap := pace / time.Duration(len(cands))
+	h.slotMu.Lock()
+	defer h.slotMu.Unlock()
+	if now.Before(h.nextSlot) {
+		return false, monitor.Jittered(h.nextSlot.Sub(now))
+	}
+	if id, ok := monitor.OldestDue(now, cands); ok && id != self {
+		return false, monitor.Jittered(gap)
+	}
+	h.nextSlot = now.Add(gap)
+	return true, 0
 }
 
 // effectiveIdleCeiling returns the configured idle-backoff ceiling, or the
@@ -1334,7 +1429,10 @@ func (p *poller) fetchOnce() {
 		p.applyTier(tier)
 	}
 
+	p.lastRefresh.Store(p.hub.now().UnixNano())
+	p.lastCost.Store(math.Float64bits(p.budget.PollCost(tier)))
 	curr, err := fetch(ctx, p.identity, tier)
+	p.budget.Spend(tier)
 	if err != nil {
 		// A per-query resource-limit error can be beaten by a cheaper query:
 		// retry once one tier down. A rate-limit 403 cannot (every query

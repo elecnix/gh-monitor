@@ -27,8 +27,19 @@ type RateLimitReading struct {
 // for concurrent use.
 type RateLimitStore struct {
 	mu       sync.Mutex
-	readings map[string]RateLimitReading
+	readings map[string][]RateLimitReading // newest last; one reset window per slice
 }
+
+// ReadingFreshness is how far back Latest looks for a higher counter within
+// the newest reading's window. GitHub answers one token with two counters
+// that disagree: one can read 0 while another reads thousands. A single
+// exhausted or stale response must not drive the pace, so when the counters
+// interleave Latest reports the highest remaining among readings no older
+// than this. Real consumption in that span is small next to the discrepancy.
+const ReadingFreshness = 30 * time.Second
+
+// maxReadingHistory bounds the readings kept per host and resource.
+const maxReadingHistory = 16
 
 // GraphQLHeaders builds the X-RateLimit-* headers a GraphQL response
 // carries, with the given remaining count against a limit, and a reset at
@@ -50,7 +61,7 @@ func GraphQLHeaders(remaining, limit int, reset time.Time) http.Header {
 
 // NewRateLimitStore returns an empty store.
 func NewRateLimitStore() *RateLimitStore {
-	return &RateLimitStore{readings: make(map[string]RateLimitReading)}
+	return &RateLimitStore{readings: make(map[string][]RateLimitReading)}
 }
 
 // Observed is the process-wide store that clients without their own Limits
@@ -86,20 +97,55 @@ func (s *RateLimitStore) Observe(host string, headers http.Header, now time.Time
 	if reset, err := strconv.ParseInt(headers.Get("X-RateLimit-Reset"), 10, 64); err == nil {
 		r.Reset = time.Unix(reset, 0)
 	}
+	key := storeKey(host, resource)
 	s.mu.Lock()
-	s.readings[storeKey(host, resource)] = r
+	hist := s.readings[key]
+	if n := len(hist); n > 0 && !hist[n-1].Reset.Equal(r.Reset) {
+		hist = nil // a new window: the old counters describe a spent budget
+	}
+	hist = append(hist, r)
+	if len(hist) > maxReadingHistory {
+		hist = hist[len(hist)-maxReadingHistory:]
+	}
+	s.readings[key] = hist
 	s.mu.Unlock()
 }
 
-// Latest returns the most recent reading for host and resource.
+// Latest returns the freshest reading for host and resource. When readings
+// of one reset window interleave within ReadingFreshness (a rise in
+// remaining), it carries the highest remaining count among them.
 func (s *RateLimitStore) Latest(host, resource string) (RateLimitReading, bool) {
 	if s == nil {
 		return RateLimitReading{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	r, ok := s.readings[storeKey(host, resource)]
-	return r, ok
+	hist := s.readings[storeKey(host, resource)]
+	if len(hist) == 0 {
+		return RateLimitReading{}, false
+	}
+	r := hist[len(hist)-1]
+	// Real consumption only lowers remaining. A rise inside the fresh span
+	// proves two counters are interleaving, so the highest one stands in for
+	// the account. A span that only falls reports its newest reading.
+	best, rose, prev := r.Remaining, false, -1
+	for _, h := range hist {
+		if r.ObservedAt.Sub(h.ObservedAt) > ReadingFreshness {
+			continue
+		}
+		if prev >= 0 && h.Remaining > prev {
+			rose = true
+		}
+		prev = h.Remaining
+		if h.Remaining > best {
+			best = h.Remaining
+		}
+	}
+	if rose {
+		r.Remaining = best
+		r.Used = r.Limit - best
+	}
+	return r, true
 }
 
 // splitIncluded splits the output of `gh api --include` into the response
