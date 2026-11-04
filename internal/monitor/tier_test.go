@@ -48,9 +48,11 @@ func TestTierForRemaining(t *testing.T) {
 func TestMonitorQuery_Tiers(t *testing.T) {
 	full := MonitorQuery(TierFull)
 	// The full query must contain every surface.
-	for _, frag := range []string{"annotations(first: 50)", "reviewThreads(last: 25)", "reviews(last: 100)", "comments(last: 25)", "checkSuites(last: 50)", "state", "mergeable"} {
+	for _, frag := range []string{"databaseId", "reviewThreads(last: 25)", "reviews(last: 100)", "comments(last: 25)", "checkSuites(last: 50)", "state", "mergeable"} {
 		assert.Contains(t, full, frag, "TierFull must contain %s", frag)
 	}
+
+	assert.NotContains(t, full, "annotations", "TierFull asks for run ids only; counts and bodies come from REST and a follow-up")
 
 	noAnns := MonitorQuery(TierNoAnnotations)
 	assert.NotContains(t, noAnns, "annotations", "TierNoAnnotations must shed annotations")
