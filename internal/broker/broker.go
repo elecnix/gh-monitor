@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -39,7 +40,8 @@ import (
 // Config configures a broker connection.
 type Config struct {
 	// Endpoint is the AWS IoT Core data-plane hostname (no scheme), e.g.
-	// "a1b2c3d4e5.iot.us-east-1.amazonaws.com".
+	// "a1b2c3d4e5.iot.us-east-1.amazonaws.com", or a ws:// or wss:// URL for
+	// a broker that does not use SigV4, e.g. "ws://127.0.0.1:9001".
 	Endpoint string
 
 	// Region is the AWS region Endpoint lives in, used for SigV4 signing.
@@ -319,12 +321,38 @@ func presignWebsocketURL(ctx context.Context, endpoint, region string) (string, 
 	return strings.Replace(signed, "https://", "wss://", 1), nil
 }
 
-// connectMQTT is the production connectFunc: it presigns a WebSocket URL,
+// connectionURL resolves cfg.Endpoint to the WebSocket URL to dial. A bare
+// host name is IoT Core and is SigV4-presigned. An endpoint with a ws:// or
+// wss:// scheme names any other broker, such as a webhook relay on this
+// machine; it is dialled as given, unsigned, with "/mqtt" as the default path.
+// That keeps AWS credentials out of the daemon's environment, which every
+// sub-daemon child inherits.
+func connectionURL(ctx context.Context, cfg Config) (string, error) {
+	if !strings.Contains(cfg.Endpoint, "://") {
+		return presignWebsocketURL(ctx, cfg.Endpoint, cfg.Region)
+	}
+	u, err := url.Parse(cfg.Endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse broker endpoint: %w", err)
+	}
+	if u.Scheme != "ws" && u.Scheme != "wss" {
+		return "", fmt.Errorf("broker endpoint scheme %q is not supported: use ws://, wss://, or a bare IoT Core host name", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("broker endpoint %q has no host", cfg.Endpoint)
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/mqtt"
+	}
+	return u.String(), nil
+}
+
+// connectMQTT is the production connectFunc: it resolves the WebSocket URL,
 // connects, subscribes to cfg.Topic, and blocks until the session ends.
 func connectMQTT(ctx context.Context, cfg Config, onConnect func(), onEvent func(Event)) error {
-	brokerURL, err := presignWebsocketURL(ctx, cfg.Endpoint, cfg.Region)
+	brokerURL, err := connectionURL(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("presign websocket URL: %w", err)
+		return fmt.Errorf("resolve websocket URL: %w", err)
 	}
 
 	done := make(chan struct{}, 1)
