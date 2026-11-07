@@ -52,6 +52,8 @@ type BudgetGuard struct {
 	observed *ghcli.RateLimitStore
 	host     string
 
+	pacer *Pacer
+
 	mu        sync.Mutex
 	lastCheck time.Time
 	cached    *rateLimitResponse
@@ -68,6 +70,7 @@ func NewBudgetGuard(svc *Service, base time.Duration) *BudgetGuard {
 		base:              base,
 		thresholdFraction: 0.10,
 		maxStretch:        maxIdleInterval,
+		pacer:             NewPacer(DefaultPaceConfig),
 	}
 	if svc != nil {
 		g.observed = ghcli.Observed
@@ -145,6 +148,46 @@ func (g *BudgetGuard) Stretch(now time.Time) BudgetState {
 	g.wasLow = st.Low
 	g.mu.Unlock()
 	return st
+}
+
+// Pace returns the poll interval the shared budget allows each of pollers
+// pollers that spend cost points per poll on average, and whether it exceeds
+// base (the cadence is stretched). Without a current header reading it
+// returns base: a blind guard must not guess. See Pacer for the formula.
+func (g *BudgetGuard) Pace(now time.Time, base time.Duration, pollers int, cost float64) (time.Duration, bool) {
+	if g == nil {
+		return base, false
+	}
+	g.mu.Lock()
+	var r ghcli.RateLimitReading
+	ok := g.observed != nil
+	if ok {
+		r, ok = g.currentReading("", now)
+	}
+	g.mu.Unlock()
+	if !ok {
+		return base, false
+	}
+	g.pacer.Observe(r)
+	d := g.pacer.Interval(now, r, base, pollers, cost)
+	return d, d > base
+}
+
+// Spend records points this daemon spent on a poll, so Pace does not count
+// them as another consumer's.
+func (g *BudgetGuard) Spend(tier QueryTier) {
+	if g == nil {
+		return
+	}
+	g.pacer.Spend(g.pacer.cfg.PollCost(tier))
+}
+
+// PollCost estimates the points one poll at tier spends.
+func (g *BudgetGuard) PollCost(tier QueryTier) float64 {
+	if g == nil {
+		return DefaultPaceConfig.CheapTierCost
+	}
+	return g.pacer.cfg.PollCost(tier)
 }
 
 // UseObserved makes the guard read response headers from store, for host,

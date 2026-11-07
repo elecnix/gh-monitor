@@ -92,3 +92,48 @@ func TestClient_RecordsHeadersOfRealCalls(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 0, r.Remaining)
 }
+
+// TestRateLimitStore_InterleavedCountersUseHighestFresh pins the two-counter
+// oddity: one token answers with remaining 0 on one response and thousands on
+// the next, in the same window. The exhausted reading must not drive alone.
+func TestRateLimitStore_InterleavedCountersUseHighestFresh(t *testing.T) {
+	store := NewRateLimitStore()
+	reset := time.Unix(1790259267, 0)
+	t0 := reset.Add(-30 * time.Minute)
+	for i, remaining := range []int{4100, 0, 4090, 0} {
+		store.Observe("", GraphQLHeaders(remaining, 5000, reset), t0.Add(time.Duration(i)*time.Second))
+	}
+	r, ok := store.Latest("github.com", "graphql")
+	require.True(t, ok)
+	assert.Equal(t, 4100, r.Remaining, "the highest fresh counter, not the exhausted one")
+	assert.Equal(t, t0.Add(3*time.Second), r.ObservedAt, "the reading is as fresh as the newest response")
+}
+
+func TestRateLimitStore_OldHighReadingDoesNotMaskExhaustion(t *testing.T) {
+	store := NewRateLimitStore()
+	reset := time.Unix(1790259267, 0)
+	t0 := reset.Add(-30 * time.Minute)
+	store.Observe("", GraphQLHeaders(4000, 5000, reset), t0)
+	store.Observe("", GraphQLHeaders(0, 5000, reset), t0.Add(ReadingFreshness+time.Second))
+	r, _ := store.Latest("github.com", "graphql")
+	assert.Equal(t, 0, r.Remaining)
+}
+
+func TestRateLimitStore_NewWindowDropsOldReadings(t *testing.T) {
+	store := NewRateLimitStore()
+	reset := time.Unix(1790259267, 0)
+	store.Observe("", GraphQLHeaders(4000, 5000, reset), reset.Add(-time.Second))
+	store.Observe("", GraphQLHeaders(0, 5000, reset.Add(time.Hour)), reset.Add(time.Second))
+	r, _ := store.Latest("github.com", "graphql")
+	assert.Equal(t, 0, r.Remaining)
+}
+
+func TestRateLimitStore_GenuineDropIsTrusted(t *testing.T) {
+	store := NewRateLimitStore()
+	reset := time.Unix(1790259267, 0)
+	t0 := reset.Add(-30 * time.Minute)
+	store.Observe("", GraphQLHeaders(5000, 5000, reset), t0)
+	store.Observe("", GraphQLHeaders(100, 5000, reset), t0.Add(time.Second))
+	r, _ := store.Latest("github.com", "graphql")
+	assert.Equal(t, 100, r.Remaining, "a falling sequence is consumption, not two counters")
+}
