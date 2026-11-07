@@ -91,8 +91,12 @@ func service(api func(host string) ghcli.API, host string) *monitor.Service {
 // distilled here instead: monitor.SnapshotRun reads no option, so the hub
 // would only rebuild the same RunStatus and drop the payload (issue #140).
 func Fetch(api func(host string) ghcli.API) hub.FetchFunc {
+	// One cache for the daemon's lifetime: a full-tier poll reads annotation
+	// bodies only for check runs whose count changed since the last poll.
+	annotations := monitor.NewAnnotationCache()
 	return func(ctx context.Context, id resolver.Identity, tier monitor.QueryTier) (any, error) {
 		svc := service(api, id.Host)
+		svc.Annotations = annotations
 		switch id.Target {
 		case "ref":
 			return svc.FetchRefWithTier(id.Owner, id.Repo, id.Ref, tier)

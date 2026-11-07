@@ -179,10 +179,13 @@ const prReviewsFragment = `      reviews(last: 100) {
         nodes { state author { login } submittedAt }
       }
 `
-const annotationsFragment = `                    annotations(first: 50) {
-                      totalCount
-                      nodes { path location { start { line } } annotationLevel title message }
-                    }
+
+// annotationsFragment adds the ids that tie a run to its annotations. GraphQL
+// bills a nested connection once per parent, so asking for annotations under
+// 50 suites of 50 runs costs 25 points however small the page is. The counts
+// come from one REST read and the bodies from a follow-up for the runs whose
+// count is new or changed (annotations.go).
+const annotationsFragment = `                    id databaseId
 `
 
 // MonitorQuery returns the PR snapshot query for the given tier.

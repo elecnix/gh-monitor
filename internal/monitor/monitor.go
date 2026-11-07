@@ -31,6 +31,12 @@ type Service struct {
 	// when nil, run-completed notifications for failed runs carry no log
 	// snippet. Production code wires this to ghcli.Client.FailedRunLogs via cmd.
 	FailedRunLogsFn func(owner, repo string, runID int) (string, error)
+
+	// Annotations remembers the annotation bodies already read, so a poll
+	// fetches bodies only for check runs whose annotation count is new or
+	// changed. It is optional: when nil, every run that has annotations is
+	// read on every full-tier poll.
+	Annotations *AnnotationCache
 }
 
 // FailedRunLogs returns the failed-run log output for a workflow run, or ""
@@ -288,6 +294,8 @@ type RunNodes struct {
 }
 
 type CheckRun struct {
+	ID          string          `json:"id"`
+	DatabaseID  int64           `json:"databaseId"`
 	Name        string          `json:"name"`
 	Conclusion  string          `json:"conclusion"`
 	Status      string          `json:"status"`
@@ -443,8 +451,23 @@ func (s *Service) FetchWithTier(identity *resolver.Identity, number int, tier Qu
 	if err != nil {
 		return nil, err
 	}
-	if result.Repository.PullRequest == nil {
+	pr := result.Repository.PullRequest
+	if pr == nil {
 		return nil, fmt.Errorf("pull request not found or not accessible")
+	}
+	if tier.HasAnnotations() {
+		key := fmt.Sprintf("pr:%s/%s#%d", identity.Owner, identity.Repo, number)
+		var suites []CheckSuite
+		if len(pr.Commits.Nodes) > 0 {
+			suites = pr.Commits.Nodes[0].Commit.CheckSuites.Nodes
+		}
+		oid := ""
+		if len(pr.Commits.Nodes) > 0 {
+			oid = pr.Commits.Nodes[0].Commit.Oid
+		}
+		if err := s.fillAnnotations(key, identity.Owner, identity.Repo, oid, suites); err != nil {
+			return nil, err
+		}
 	}
 	return &result, nil
 }
@@ -507,6 +530,12 @@ func (s *Service) FetchRefWithTier(owner, repo, ref string, tier QueryTier) (*Re
 	if result.Repository.Ref == nil {
 		return nil, fmt.Errorf("ref not found or not accessible")
 	}
+	if tier.HasAnnotations() {
+		key := fmt.Sprintf("ref:%s/%s@%s", owner, repo, ref)
+		if err := s.fillAnnotations(key, owner, repo, result.Repository.Ref.Target.Oid, result.Repository.Ref.Target.CheckSuites.Nodes); err != nil {
+			return nil, err
+		}
+	}
 	return &result, nil
 }
 
@@ -528,6 +557,12 @@ func (s *Service) FetchCommitWithTier(owner, repo, sha string, tier QueryTier) (
 	}
 	if result.Repository.Object == nil {
 		return nil, fmt.Errorf("commit not found or not accessible")
+	}
+	if tier.HasAnnotations() {
+		key := fmt.Sprintf("commit:%s/%s@%s", owner, repo, sha)
+		if err := s.fillAnnotations(key, owner, repo, result.Repository.Object.Oid, result.Repository.Object.CheckSuites.Nodes); err != nil {
+			return nil, err
+		}
 	}
 	return &result, nil
 }
