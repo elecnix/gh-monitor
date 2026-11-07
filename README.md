@@ -573,6 +573,10 @@ export GH_MONITOR_BROKER_COVERAGE_TTL=21600       # seconds; default 21600 (6h) 
 gh monitor daemon
 ```
 
+A broker that is not AWS IoT Core, such as a webhook relay on your own machine, takes a URL instead of a host name: `GH_MONITOR_BROKER_ENDPOINT=ws://127.0.0.1:9001`. A `ws://` or `wss://` endpoint is dialled as given, unsigned, with `/mqtt` as the default path, so you need no AWS credentials. The daemon passes its environment to every sub-daemon child, so a placeholder credential set for the daemon would reach a child that signs with real ones. A URL avoids that.
+
+This transport and a sub-daemon that declares the `coverage` capability work side by side. Each covers its own repositories: the sub-daemon serves the ones it vouches for, and the hub serves the rest, with a slower timer for the ones this transport delivers events for. When the transport drops, the watches it covers get a `degraded` notice and polling resumes at once. Watches a sub-daemon serves see no change.
+
 The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an assumed role, etc.) via SigV4-presigned WebSocket credentials — nothing broker-specific to configure beyond the four variables above. The event envelope this transport expects:
 
 ```json
