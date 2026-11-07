@@ -33,6 +33,7 @@ func addPollers(h *Hub, n int, cost float64) []*poller {
 	for i := 1; i <= n; i++ {
 		id := resolver.Identity{Owner: "o", Repo: "r", Number: i}
 		p := newPoller(h, id, h.interval)
+		p.started = true
 		p.lastCost.Store(math.Float64bits(cost))
 		h.pollers[p.key] = p
 		out = append(out, p)
@@ -92,4 +93,28 @@ func TestPace_IntervalGrowsStrictlyAsBudgetShrinks(t *testing.T) {
 		prev = d
 	}
 	assert.Greater(t, prev, 10*time.Minute)
+}
+
+// TestPace_RestoredPollerThatNeverStartedDoesNotStarveTheOthers pins the fix
+// for the Cite finding on #213. A poller restored from a handoff exists in
+// h.pollers before any subscriber arrives, and its lastRefresh stays zero
+// until its first fetch. Zero reads as 1970 to OldestDue, so it is the oldest
+// due candidate forever and every started poller is denied while the pace is
+// stretched.
+func TestPace_RestoredPollerThatNeverStartedDoesNotStarveTheOthers(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	store := ghcli.NewRateLimitStore()
+	store.Observe("", ghcli.GraphQLHeaders(900, 5000, now.Add(time.Hour)), now)
+	h := paceHub(t, store, &now)
+	ps := addPollers(h, 2, 26)
+	started, restored := ps[0], ps[1]
+	started.started = true
+	started.lastRefresh.Store(now.Add(-2 * time.Minute).UnixNano())
+	restored.lastRefresh.Store(0)
+
+	pace, stretched := h.paceInterval()
+	require.True(t, stretched, "pace %v", pace)
+
+	ok, wait := h.grantTurn(started)
+	assert.True(t, ok, "a poller that never started must not hold the slot; waited %v", wait)
 }
