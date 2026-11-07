@@ -90,3 +90,17 @@ func TestPacer_TinyAvailableBudgetBacksOffToReset(t *testing.T) {
 	p.otherRate = 2.7775e-4 // leaves about 1e-4 points available
 	assert.Equal(t, time.Hour, p.Interval(paceT0, r, paceBase, 20, 26))
 }
+
+// TestDefaultPaceConfig_FullTierCostMatchesTheQuery pins the full tier's
+// cost to what its query actually spends. The full tier used to read
+// annotations under 50 check suites of 50 runs, which GitHub bills once per
+// parent: 26 points. It now reads annotation counts over REST and fetches
+// bodies only for a run that changed, which measured one GraphQL point.
+// A change that adds another nested connection to the query must raise this
+// number, so the pacer does not plan for a poll that costs more than it thinks.
+func TestDefaultPaceConfig_FullTierCostMatchesTheQuery(t *testing.T) {
+	assert.Equal(t, 1.0, DefaultPaceConfig.PollCost(TierFull))
+	assert.Equal(t, 1.0, DefaultPaceConfig.PollCost(TierStatus))
+	assert.Contains(t, MonitorQuery(TierFull), "checkRuns(")
+	assert.NotContains(t, MonitorQuery(TierFull), "annotations(")
+}

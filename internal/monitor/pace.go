@@ -24,7 +24,10 @@ type PaceConfig struct {
 	Smoothing float64
 
 	// FullTierCost and CheapTierCost are the measured GraphQL points of one
-	// poll at the full tier and at every other tier.
+	// poll at the full tier and at every other tier. The full tier reads
+	// annotation counts over REST and fetches bodies only for a check run
+	// that changed, so it costs one GraphQL point like the cheaper tiers;
+	// the REST read has its own budget and does not enter this one.
 	FullTierCost  float64
 	CheapTierCost float64
 }
@@ -34,7 +37,7 @@ var DefaultPaceConfig = PaceConfig{
 	Reserve:       0.10,
 	MinObserveGap: 10 * time.Second,
 	Smoothing:     0.3,
-	FullTierCost:  26,
+	FullTierCost:  1,
 	CheapTierCost: 1,
 }
 
