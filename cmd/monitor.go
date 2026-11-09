@@ -716,7 +716,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// between polls: the batch just handled has persisted its cursor and
 		// logged its updates, so the successor resumes from written state and
 		// no delivered update is lost (issue #216).
-		if upgrader != nil && !u.More && upgrader.ReplaceRequested() {
+		if upgrader != nil && !u.More && !writeFailed && upgrader.ReplaceRequested() {
 			upgrader.Replace()
 		}
 	}
@@ -1013,7 +1013,7 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 
 		// Between cycles: the report above is written and the cycle's state
 		// is settled, so a pending self-replacement runs here (issue #216).
-		if upgrader != nil && upgrader.ReplaceRequested() {
+		if upgrader != nil && ctx.Err() == nil && upgrader.ReplaceRequested() {
 			upgrader.Replace()
 		}
 
