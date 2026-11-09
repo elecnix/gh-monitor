@@ -1333,6 +1333,15 @@ func (h *Hub) grantTurn(p *poller) (bool, time.Duration) {
 		if !q.traits.tiered || q.timerPollPaused() {
 			continue
 		}
+		// A poller restored from a handoff (issue #73) sits in the map before
+		// its first subscriber starts it, and a poller that has not fetched
+		// yet holds lastRefresh zero. Zero reads as 1970 to OldestDue, so a
+		// poller in either state would be the oldest due candidate forever
+		// and deny every started poller its slot while the pace is stretched.
+		// It has no refresh to space, so leave it out of the order.
+		if !q.started || q.lastRefresh.Load() == 0 {
+			continue
+		}
 		if q == p {
 			self = len(cands)
 		}
