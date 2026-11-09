@@ -419,11 +419,18 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	write := func(n monitor.Notification) error {
 		var err error
 		if opts.Text {
+			// A failed write is reported like the JSON path's, so a named
+			// instance never advances its cursor past text the consumer did
+			// not receive (issue #219).
 			out := cmd.OutOrStdout()
-			_, _ = fmt.Fprintln(out, monitor.LinkifyText(n))
+			if _, err = fmt.Fprintln(out, monitor.LinkifyText(n)); err != nil {
+				return err
+			}
 			if n.Detail != "" {
 				for _, line := range strings.Split(n.Detail, "\n") {
-					_, _ = fmt.Fprintf(out, "  %s\n", line)
+					if _, err = fmt.Fprintf(out, "  %s\n", line); err != nil {
+						return err
+					}
 				}
 			}
 			return nil
@@ -621,25 +628,46 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// handleUpdate runs the loop body for one delivered update: cursor
 	// persist, event log, render, the --until / write-failure paths, and the
 	// end-of-batch stop. It reports whether the watch should continue.
+	//
+	// A named instance persists cursor state from what the updates carry,
+	// whatever backend delivered them: the shared daemon, an external broker
+	// sub-daemon, or a one-shot read through the built-in backend. This is
+	// what makes a scheduled `--once --instance` tick a DELTA against the
+	// last tick instead of a full replay: the stored baseline is re-diffed
+	// on the next run, so an unchanged payload emits nothing (issue: broker
+	// replay flood: a fixed set of long-merged PRs re-arrived every poll
+	// pass because the once path never persisted its baseline).
+	//
+	// The cursor is stored at the end of a batch, after every update in it
+	// was written or deliberately suppressed by --events (issue #219). Every
+	// update in a batch carries the same post-poll state, so storing it any
+	// earlier would let a kill skip the rest of the batch. A failed write
+	// never advances the cursor, and neither does any later batch, since the
+	// failure ends the watch: the next run with the same --instance diffs
+	// against the last batch the consumer received and emits the rest again.
+	var pendingCursor *backend.Update
+	endBatch := func() {
+		if pendingCursor != nil && !writeFailed {
+			persistFromUpdate(*pendingCursor)
+		}
+		pendingCursor = nil
+	}
 	handleUpdate := func(u backend.Update) bool {
 		if !dedup.Allow(u) {
-			// A dropped redelivery can still be the update that closes the
+			// A dropped redelivery carries nothing new for the cursor, but
+			// it can close a batch whose other updates were written, and the
 			// batch a --until member fired in.
+			if !u.More {
+				endBatch()
+			}
 			if untilMet && !u.More {
 				return false
 			}
 			return true
 		}
-		// A named instance persists cursor state from what each update carries,
-		// whatever backend delivered it — the shared daemon, an external broker
-		// sub-daemon, or a one-shot read through the built-in backend. This is
-		// what makes a scheduled `--once --instance` tick a DELTA against the
-		// last tick instead of a full replay: the stored baseline is re-diffed
-		// on the next run, so an unchanged payload emits nothing (issue: broker
-		// replay flood — a fixed set of long-merged PRs re-arrived every poll
-		// pass because the once path never persisted its baseline).
-		if persistFromUpdate != nil {
-			persistFromUpdate(u)
+		if persistFromUpdate != nil && (u.Status != nil || u.Cursor != "") {
+			u := u
+			pendingCursor = &u
 		}
 		if evlog != nil && !evlogFailed {
 			if err := evlog.Log(u); err != nil {
@@ -660,8 +688,8 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// --until: the first member to fire ends the watch. It is written
 		// DIRECTLY, bypassing the --events emit() suppression, so the caller
 		// always learns which event triggered the exit even if that kind is
-		// not in the --events allowlist. Cursor persist and the event log ran
-		// above, so cursor and log stay correct on the early exit too. The
+		// not in the --events allowlist. The event log ran above, and the
+		// cursor is stored at the end of the batch, after this write. The
 		// write failure path is the same as emit()'s: a gone consumer ends
 		// the watch here as well.
 		// `any` counts only events the --events filter lets through; a named
@@ -678,6 +706,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 			emit(n)
 		}
 		ackEmit(u.Event)
+		if !u.More {
+			endBatch()
+		}
 		// The watch exits at the end of the batch the member fired in, not
 		// on the member itself: the rest of that poll's batch was already
 		// fetched, and on a first poll it is the PR's backlog (issue #116).
