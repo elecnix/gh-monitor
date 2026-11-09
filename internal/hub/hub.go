@@ -350,6 +350,7 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		resumeID:   opts.ResumeID,
 		target:     t,
 		watchOpts:  opts,
+		hub:        h,
 	}
 
 	// A watcher reconnecting after a daemon handoff claims the baseline its
@@ -743,6 +744,7 @@ func (h *Hub) Stop() {
 // no consumers left.
 func (h *Hub) detach(key pollerKey, p *poller, s *sub) {
 	close(s.done)
+	h.stashResume(s)
 	var empty bool
 	p.mu.Lock()
 	delete(p.subs, s)
@@ -755,6 +757,43 @@ func (h *Hub) detach(key pollerKey, p *poller, s *sub) {
 	h.mu.Lock()
 	if cur := h.pollers[key]; cur == p {
 		delete(h.pollers, key)
+	}
+	h.mu.Unlock()
+}
+
+// stashResume records a watcher's baseline under its ResumeID, so a watcher
+// that comes back with the same ID resumes diffing where it stopped. It runs
+// after every batch a watcher was shown and once more when it detaches.
+//
+// A resident watch replaces itself with an upgraded binary while the daemon
+// keeps running (issue #216), so the reconnect lands on THIS daemon, not a
+// successor. The resume table was populated only by a handoff adoption, and
+// the daemon can notice a dropped connection late: without a stash from the
+// batch itself, the reconnecting watcher looked like a fresh one and ran a
+// second first poll over what it had already reported.
+func (h *Hub) stashResume(s *sub) {
+	if s.resumeID == "" {
+		return
+	}
+	s.mu.Lock()
+	st := s.handle.baseline()
+	s.mu.Unlock()
+	if st == nil {
+		return
+	}
+	b, err := json.Marshal(st)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	h.mu.Lock()
+	h.resumes[s.resumeID] = resumeEntry{
+		state: ResumeState{
+			ResumeID: s.resumeID,
+			Target:   s.target,
+			Options:  s.watchOpts,
+			Baseline: b,
+		},
+		expires: time.Now().Add(resumeTTL),
 	}
 	h.mu.Unlock()
 }
@@ -1786,6 +1825,7 @@ type sub struct {
 	resumeID   string
 	target     backend.Target
 	watchOpts  backend.WatchOptions
+	hub        *Hub
 }
 
 // loop owns the consumer's diff goroutine. It reads raw payloads from the
@@ -1839,6 +1879,11 @@ func (s *sub) loop() {
 			terminal := s.handle.consume(curr, add)
 			s.mu.Unlock()
 			flush()
+			// Keep the baseline this watcher has been shown, so it can come
+			// back under the same ResumeID even while this subscription is
+			// still attached: a self-replaced watch reconnects long before the
+			// daemon notices that the old connection is gone (issue #216).
+			s.hub.stashResume(s)
 			if terminal {
 				close(s.out)
 				return

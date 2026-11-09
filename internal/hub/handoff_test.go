@@ -344,7 +344,6 @@ func TestSubscribe_TakeResumeIsSerialised(t *testing.T) {
 	wg.Wait()
 }
 
-
 // TestSubscribe_ResumePathDoesNotDeadlock guards the other direction of the
 // same contract, and it is the failure mode that does not announce itself: if
 // a caller ever locks h.mu around takeResume again — because it is "obvious"
@@ -390,4 +389,48 @@ func TestSubscribe_ResumePathDoesNotDeadlock(t *testing.T) {
 		t.Fatal("Subscribe never returned: the resume path deadlocked, which is what a " +
 			"call-site lock around takeResume looks like now that it locks itself")
 	}
+}
+
+// TestReconnectWithSameResumeIDResumesWithoutReplay covers the client-side
+// replacement on issue #216 against a daemon that keeps running: the watch
+// re-execs into the upgraded binary and reconnects with the same ResumeID.
+// The daemon must hand that watcher's baseline back, so the successor runs no
+// second first poll and replays nothing it already reported.
+func TestReconnectWithSameResumeIDResumesWithoutReplay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var failing atomic.Bool
+	failing.Store(true)
+	h := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
+		if failing.Load() {
+			return prFixture([]string{"ci-build"}), nil
+		}
+		return prFixture(nil), nil
+	}, nil, 20*time.Millisecond, nil)
+	t.Cleanup(h.Stop)
+
+	opts := testHubOpts()
+	opts.ResumeID = "self-replaced-watch"
+	ch1, cancel1 := h.SubscribePR(ctx, testHubTarget(), opts)
+	got := collect(ch1, 200*time.Millisecond)
+	require.Contains(t, got, "first-poll", "the pre-replacement watch starts with a first poll")
+	require.Contains(t, got, "new-failing-checks")
+
+	// The watch replaced itself. The exec closed its socket, but the daemon
+	// notices a dropped connection on its own schedule, so the successor can
+	// subscribe while the old subscription is still attached: the baseline
+	// stashed from the last batch is what it claims, not what a detach records.
+	failing.Store(false)
+	ch2, cancel2 := h.SubscribePR(ctx, testHubTarget(), opts)
+	cancel1()
+	t.Cleanup(cancel2)
+	resumed := collect(ch2, 300*time.Millisecond)
+
+	assert.NotContains(t, resumed, "first-poll",
+		"a reconnecting watch must not run a second first poll")
+	assert.NotContains(t, resumed, "new-failing-checks",
+		"a reconnecting watch must not replay what it already reported")
+	assert.Contains(t, resumed, "ci-all-green",
+		"a reconnecting watch must deliver what changed while it was away")
 }
