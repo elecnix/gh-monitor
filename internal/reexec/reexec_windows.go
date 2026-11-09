@@ -2,6 +2,8 @@
 
 package reexec
 
+import "fmt"
+
 // supported reports whether this platform implements the exec-into-copy
 // mechanism. Windows locks the image of a running executable differently and
 // has no exec-without-spawn, so the relaunch is not implemented: resident
@@ -10,3 +12,9 @@ func supported() bool { return false }
 
 // reexecTo is unreachable while supported() returns false.
 func reexecTo(path string) error { return nil }
+
+// execInto is unreachable while supported() returns false: no resident
+// process replaces its own image on this platform.
+func execInto(path string, argv, env []string) error {
+	return fmt.Errorf("in-place exec of %s is not supported on windows", path)
+}

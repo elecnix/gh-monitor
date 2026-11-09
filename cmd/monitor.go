@@ -511,10 +511,14 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// A continuous watch gets a ResumeID: if the shared-poller daemon hands
 	// off to an upgraded daemon (issue #73), the watcher re-establishes its
 	// stream under the same ID and resumes from the baseline it was last
-	// shown, instead of replaying what it already reported.
+	// shown, instead of replaying what it already reported. The same ID rides
+	// the environment into a successor image when the watch replaces itself on
+	// an upgrade (issue #216).
 	var resumeID string
+	var upgrader *clientUpgrader
 	if !opts.Once {
-		resumeID = newResumeID()
+		resumeID = watchResumeID()
+		upgrader = startClientUpgrade(ctx, cmd.ErrOrStderr())
 	}
 
 	watchOpts := backend.WatchOptions{
@@ -589,6 +593,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	deadline := time.Time{}
 	if opts.Timeout > 0 {
 		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+		// A self-replaced watch keeps the deadline its predecessor promised.
+		// The successor re-runs this command line, and a deadline recomputed
+		// from its own start would give the caller more time than --timeout
+		// allows (issue #216).
+		if carried := carriedWatchDeadline(); !carried.IsZero() && carried.Before(deadline) {
+			deadline = carried
+		}
 	}
 	deadlineTimer := time.NewTimer(time.Hour)
 	deadlineTimer.Stop()
@@ -707,6 +718,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		}
 		if timedOut {
 			break
+		}
+		// A self-replacement is requested by the watcher and performed here,
+		// between polls: the batch just handled has persisted its cursor and
+		// logged its updates, so the successor resumes from written state and
+		// no delivered update is lost (issue #216).
+		if upgrader != nil && !u.More && ctx.Err() == nil && upgrader.ReplaceRequested() {
+			upgrader.Replace(deadline)
 		}
 	}
 	ctxErr := ctx.Err()
@@ -910,9 +928,23 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 		interval = 10 * time.Second
 	}
 
+	// A readiness view is a resident watch too, so it replaces itself on an
+	// upgrade the same way a target watch does (issue #216). There is no
+	// baseline to carry across: a readiness view reports current state on
+	// every cycle, so the successor's first cycle is the same output.
+	var upgrader *clientUpgrader
+	if !opts.Once {
+		upgrader = startClientUpgrade(ctx, cmd.ErrOrStderr())
+	}
+
 	var deadline time.Time
 	if opts.Timeout > 0 {
 		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+		// Keep the deadline an earlier image of this watch was promised
+		// (issue #216).
+		if carried := carriedWatchDeadline(); !carried.IsZero() && carried.Before(deadline) {
+			deadline = carried
+		}
 	}
 
 	// A failed write means the consumer of the readiness output is gone; the
@@ -989,6 +1021,12 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 
 		if opts.Once {
 			return nil
+		}
+
+		// Between cycles: the report above is written and the cycle's state
+		// is settled, so a pending self-replacement runs here (issue #216).
+		if upgrader != nil && ctx.Err() == nil && upgrader.ReplaceRequested() {
+			upgrader.Replace(deadline)
 		}
 
 		// Sleep until next poll or deadline.

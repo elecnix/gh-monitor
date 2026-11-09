@@ -93,11 +93,28 @@ const copyPattern = "gh-monitor-"
 // leaving it running from the installed binary — the one state this package
 // exists to avoid, since that image cannot be replaced in place.
 func ChildEnv() []string {
-	prefix := ReexecDepthEnv + "="
-	env := os.Environ()
+	return EnvWithout(os.Environ(), ReexecDepthEnv)
+}
+
+// EnvWithout returns env with every assignment of the named keys removed.
+// Building a child's environment from this one keeps a single, later-wins
+// convention: callers append the value they want, and no stale duplicate of
+// the same key survives above it (issue #216).
+func EnvWithout(env []string, keys ...string) []string {
+	prefixes := make([]string, len(keys))
+	for i, key := range keys {
+		prefixes[i] = key + "="
+	}
 	kept := env[:0]
 	for _, kv := range env {
-		if !strings.HasPrefix(kv, prefix) {
+		drop := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(kv, prefix) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
 			kept = append(kept, kv)
 		}
 	}
@@ -165,18 +182,7 @@ func CopyPathFor(exe string) (string, error) {
 // on every launch: size, mtime (nanosecond resolution), device and inode are
 // enough for that, and the inode changes on any atomic replace.
 func identityKey(path string) (string, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("stat %s: %w", path, err)
-	}
-	inode, device := identityFields(fi)
-	h := sha256.New()
-	// A hash write cannot fail, but the check is what tells every linter —
-	// and the next reader — that nothing is being ignored here.
-	if _, err := fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device); err != nil {
-		return "", fmt.Errorf("fingerprint %s: %w", path, err)
-	}
-	return hex.EncodeToString(h.Sum(nil))[:16], nil
+	return Fingerprint(path)
 }
 
 // isRuntimeCopy reports whether path is a runtime copy: a file directly in the
@@ -411,3 +417,42 @@ func guardRuntimeDir(src, dir, base string) error {
 	return fmt.Errorf("runtime dir %s holds %d interrupted copies (%d bytes, more than %d copies and %d bytes): refusing to add another and fill the disk — remove them and restart",
 		dir, len(matches), pending, maxPendingCopies, budget)
 }
+
+// Fingerprint returns a short, stable fingerprint of one binary file. It
+// changes whenever the file's contents do, and it costs one stat: size, mtime
+// (nanosecond resolution), device and inode, never a read of 13 MB. The inode
+// changes on any atomic replace, so a rename-based upgrade always shows up.
+//
+// What it misses is an in-place rewrite that preserves both size and mtime,
+// which only a writer forging timestamps produces (issue #216).
+func Fingerprint(path string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	inode, device := identityFields(fi)
+	h := sha256.New()
+	// A hash write cannot fail, but the check is what tells every linter —
+	// and the next reader — that nothing is being ignored here.
+	if _, err := fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device); err != nil {
+		return "", fmt.Errorf("fingerprint %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16], nil
+}
+
+// ExecInto replaces the current process image with the executable at path,
+// passing argv and env. It returns only when the exec fails, or on a platform
+// without in-place exec (windows), where the caller keeps running.
+func ExecInto(path string, argv, env []string) error {
+	return execInto(path, argv, env)
+}
+
+// Supported reports whether this platform can replace a running image in
+// place. A resident client asks before it offers to replace itself on an
+// upgrade (issue #216).
+func Supported() bool { return supported() }
+
+// IsRuntimeCopy reports whether path is a runtime copy this package wrote, as
+// opposed to an installed binary. A process that lost its recorded origin can
+// use it to tell whether watching the file it runs from is meaningful.
+func IsRuntimeCopy(path string) bool { return isRuntimeCopy(path) }

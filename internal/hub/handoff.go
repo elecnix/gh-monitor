@@ -76,6 +76,11 @@ type ResumeState struct {
 type resumeEntry struct {
 	state   ResumeState
 	expires time.Time
+	// ownerSeq is the subscription sequence of the watcher that stashed this
+	// baseline. A lower sequence never overwrites a higher one: the later
+	// subscription is the newer image of the same watch (issue #216). Zero on
+	// an entry restored from a handoff, which any live subscription may claim.
+	ownerSeq uint64
 }
 
 // ExportState snapshots everything a successor daemon needs. It is safe to
@@ -134,8 +139,18 @@ func (h *Hub) ExportState() State {
 	}
 	// Baselines still held for watchers that have not reconnected yet travel
 	// too — a successor that is itself replaced mid-handoff must not drop
-	// them.
-	state.Resumes = append(state.Resumes, resumes...)
+	// them. A live watcher's own baseline above is the fresher of the two, so
+	// the stash kept for it is skipped (issue #216).
+	live := make(map[string]bool, len(state.Resumes))
+	for _, rs := range state.Resumes {
+		live[rs.ResumeID] = true
+	}
+	for _, rs := range resumes {
+		if live[rs.ResumeID] {
+			continue
+		}
+		state.Resumes = append(state.Resumes, rs)
+	}
 	return state
 }
 

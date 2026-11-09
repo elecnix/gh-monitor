@@ -154,6 +154,9 @@ type Hub struct {
 	// daemon (issue #73 handoff), keyed by the watcher's ResumeID, until the
 	// watcher reconnects and claims it.
 	resumes map[string]resumeEntry
+	// attachSeq orders subscriptions: a later attach owns a ResumeID's stash,
+	// so a late write from the image it replaced cannot overwrite it.
+	attachSeq uint64
 
 	// brokerMu guards the optional broker-transport health flag and its
 	// extended idle-poll ceiling. See SetBrokerHealth and SetBrokerIdleCap.
@@ -350,7 +353,18 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		resumeID:   opts.ResumeID,
 		target:     t,
 		watchOpts:  opts,
+		hub:        h,
 	}
+
+	// A newer subscription of a ResumeID owns that ID's stash, which is what
+	// keeps a late stash from an older, still-attached subscription of the
+	// same watch from overwriting the successor's fresher baseline (issue
+	// #216). The sequence is assigned before the claim below, so the claim
+	// records this subscription as the owner.
+	h.mu.Lock()
+	h.attachSeq++
+	sub.seq = h.attachSeq
+	h.mu.Unlock()
 
 	// A watcher reconnecting after a daemon handoff claims the baseline its
 	// predecessor's daemon held for it, so it resumes diffing where it left
@@ -365,6 +379,10 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 			if err := json.Unmarshal(raw, st); err == nil {
 				sub.handle.restore(st)
 			}
+			// The claimant owns the ID from here: re-seat the baseline it
+			// claimed under this subscription's sequence, so a late stash
+			// from the image this one replaced cannot win (issue #216).
+			h.stashResumeAs(sub, raw)
 		}
 	}
 	go sub.loop()
@@ -743,6 +761,7 @@ func (h *Hub) Stop() {
 // no consumers left.
 func (h *Hub) detach(key pollerKey, p *poller, s *sub) {
 	close(s.done)
+	h.stashResume(s)
 	var empty bool
 	p.mu.Lock()
 	delete(p.subs, s)
@@ -757,6 +776,58 @@ func (h *Hub) detach(key pollerKey, p *poller, s *sub) {
 		delete(h.pollers, key)
 	}
 	h.mu.Unlock()
+}
+
+// stashResume records a watcher's baseline under its ResumeID, so a watcher
+// that comes back with the same ID resumes diffing where it stopped. It runs
+// after every batch a watcher was shown and once more when it detaches.
+//
+// A resident watch replaces itself with an upgraded binary while the daemon
+// keeps running (issue #216), so the reconnect lands on THIS daemon, not a
+// successor. The resume table was populated only by a handoff adoption, and
+// the daemon can notice a dropped connection late: without a stash from the
+// batch itself, the reconnecting watcher looked like a fresh one and ran a
+// second first poll over what it had already reported.
+func (h *Hub) stashResume(s *sub) {
+	if s.resumeID == "" {
+		return
+	}
+	s.mu.Lock()
+	st := s.handle.baseline()
+	s.mu.Unlock()
+	if st == nil {
+		return
+	}
+	b, err := json.Marshal(st)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	h.stashResumeAs(s, b)
+}
+
+// stashResumeAs records baseline for s, unless a newer subscription of the
+// same ResumeID already owns it. Subscription sequence decides: the watch
+// image that replaced this one attached later, so its baseline is the one a
+// future reconnect must resume from (issue #216).
+func (h *Hub) stashResumeAs(s *sub, baseline json.RawMessage) {
+	if s.resumeID == "" || len(baseline) == 0 {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cur, ok := h.resumes[s.resumeID]; ok && cur.ownerSeq > s.seq {
+		return
+	}
+	h.resumes[s.resumeID] = resumeEntry{
+		state: ResumeState{
+			ResumeID: s.resumeID,
+			Target:   s.target,
+			Options:  s.watchOpts,
+			Baseline: baseline,
+		},
+		expires:  time.Now().Add(resumeTTL),
+		ownerSeq: s.seq,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,6 +1866,11 @@ type sub struct {
 	resumeID   string
 	target     backend.Target
 	watchOpts  backend.WatchOptions
+	hub        *Hub
+	// seq is this subscription's position in the attach order. A stash from a
+	// subscription with a lower seq than the ResumeID's current owner loses
+	// (issue #216).
+	seq uint64
 }
 
 // loop owns the consumer's diff goroutine. It reads raw payloads from the
@@ -1848,6 +1924,11 @@ func (s *sub) loop() {
 			terminal := s.handle.consume(curr, add)
 			s.mu.Unlock()
 			flush()
+			// Keep the baseline this watcher has been shown, so it can come
+			// back under the same ResumeID even while this subscription is
+			// still attached: a self-replaced watch reconnects long before the
+			// daemon notices that the old connection is gone (issue #216).
+			s.hub.stashResume(s)
 			if terminal {
 				close(s.out)
 				return

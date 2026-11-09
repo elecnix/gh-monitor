@@ -52,16 +52,37 @@ var maybeReexecFn = reexec.MaybeReexec
 var maybeStartGuardFn = orphan.MaybeStart
 
 // startUpgradeWatcher launches the background check that hands the daemon off
-// to an upgraded binary. It only runs when the daemon was launched through
-// the runtime-copy launcher: without it, the running image maps the installed
-// file, an upgrade could not have landed anyway, and replacing a mapped
-// executable is exactly what cannot be done.
+// to an upgraded binary.
 func startUpgradeWatcher(ctx context.Context, cmd *cobra.Command, socket string, interval time.Duration) {
-	installed := os.Getenv(reexec.InstalledBinEnv)
+	installed := upgradeTarget()
 	if installed == "" {
 		return
 	}
 	go watchInstalledBinary(ctx, installed, socket, interval, cmd.ErrOrStderr())
+}
+
+// upgradeTarget returns the file a resident process watches for a replacement:
+// the installed binary the runtime-copy launcher recorded, or, when nothing
+// recorded it, the executable this process runs from.
+//
+// The fallback covers the daemon that predates the launcher: with no recorded
+// origin it started no upgrade watcher at all, so it could never adopt the
+// release that added one. A runtime copy with no recorded origin is the one
+// case where watching is pointless, because nothing rewrites that file. An
+// empty answer means there is nothing to watch or nothing to exec, and the
+// caller keeps serving the image it started with (issue #216).
+func upgradeTarget() string {
+	if installed := os.Getenv(reexec.InstalledBinEnv); installed != "" {
+		return installed
+	}
+	if !reexec.Supported() {
+		return ""
+	}
+	exe, err := os.Executable()
+	if err != nil || reexec.IsRuntimeCopy(exe) {
+		return ""
+	}
+	return exe
 }
 
 // watchInstalledBinary stats the installed binary on every tick and, when it
