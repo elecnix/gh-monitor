@@ -434,3 +434,24 @@ func TestReconnectWithSameResumeIDResumesWithoutReplay(t *testing.T) {
 	assert.Contains(t, resumed, "ci-all-green",
 		"a reconnecting watch must deliver what changed while it was away")
 }
+
+// TestLateStashCannotOverwriteTheSuccessor covers the ordering hazard of a
+// self-replaced watch (issue #216): the image that was replaced can stay
+// attached until the daemon notices its connection is gone, and its stash runs
+// after the successor has already recorded a fresher baseline. Subscription
+// sequence decides, so the older image never wins.
+func TestLateStashCannotOverwriteTheSuccessor(t *testing.T) {
+	h := New(nil, nil, time.Hour, nil)
+	t.Cleanup(h.Stop)
+
+	older := &sub{resumeID: "w", seq: 3}
+	newer := &sub{resumeID: "w", seq: 4}
+	h.stashResumeAs(newer, json.RawMessage(`{"state":"MERGED"}`))
+	h.stashResumeAs(older, json.RawMessage(`{"state":"OPEN"}`))
+
+	h.mu.Lock()
+	got := h.resumes["w"].state.Baseline
+	h.mu.Unlock()
+	assert.JSONEq(t, `{"state":"MERGED"}`, string(got),
+		"a late stash from the replaced image must not overwrite the successor's baseline")
+}

@@ -34,6 +34,12 @@ const (
 	// binary every few seconds would otherwise relaunch the watch forever.
 	clientReplaceCountEnv = "GH_MONITOR_CLIENT_REPLACE_COUNT"
 
+	// watchDeadlineEnv carries a watch's --timeout deadline across an in-place
+	// replacement, as UnixNano. The successor re-runs the same command line,
+	// and recomputing the deadline from its own start would hand the caller
+	// more watch time than --timeout promised (issue #216).
+	watchDeadlineEnv = "GH_MONITOR_WATCH_DEADLINE"
+
 	// maxClientReplacements caps one chain's self-replacements. The number is a
 	// fuse, not a budget: a working watch replaces itself once per upgrade, so
 	// a chain anywhere near this count is churning.
@@ -98,6 +104,8 @@ func startClientUpgrade(ctx context.Context, stderr io.Writer) *clientUpgrader {
 	}
 	installed := upgradeTarget()
 	if installed == "" {
+		_, _ = fmt.Fprintf(stderr,
+			"gh-monitor: cannot tell which file to watch for upgrades; this watch keeps serving the image it started with\n")
 		return nil
 	}
 	if count := clientReplaceCount(); count >= maxClientReplacements {
@@ -170,6 +178,21 @@ func (u *clientUpgrader) ReplaceRequested() bool {
 	return u.requested
 }
 
+// carriedWatchDeadline returns the --timeout deadline an earlier image of this
+// watch set, or the zero time when there is none. A value that cannot be
+// parsed is ignored: an unreadable timestamp must not end or extend a watch.
+func carriedWatchDeadline() time.Time {
+	raw := strings.TrimSpace(os.Getenv(watchDeadlineEnv))
+	if raw == "" {
+		return time.Time{}
+	}
+	ns, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || ns <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns).UTC()
+}
+
 // clientReplaceEnv is the environment for the successor image: this process's
 // own, minus the re-exec depth, with the replacement count advanced by one.
 //
@@ -178,20 +201,24 @@ func (u *clientUpgrader) ReplaceRequested() bool {
 // depth count would trip the re-exec fuse on a healthy chain. The count is
 // advanced only in the slice handed to the exec, never in this process, so an
 // exec that fails does not spend the chain's budget.
-func clientReplaceEnv() []string {
-	env := reexec.EnvWithout(reexec.ChildEnv(), clientReplaceCountEnv)
-	return append(env, clientReplaceCountEnv+"="+strconv.Itoa(clientReplaceCount()+1))
+func clientReplaceEnv(deadline time.Time) []string {
+	env := reexec.EnvWithout(reexec.ChildEnv(), clientReplaceCountEnv, watchDeadlineEnv)
+	env = append(env, clientReplaceCountEnv+"="+strconv.Itoa(clientReplaceCount()+1))
+	if !deadline.IsZero() {
+		env = append(env, watchDeadlineEnv+"="+strconv.FormatInt(deadline.UnixNano(), 10))
+	}
+	return env
 }
 
 // Replace replaces this process with the installed binary, passing this watch's
-// command line and environment. It does not return on success. On failure the
-// watch keeps serving and the recorded baseline stays advanced, so the same
-// change is not retried.
-func (u *clientUpgrader) Replace() {
+// command line and environment, and the deadline the caller was promised. It
+// does not return on success. On failure the watch keeps serving and the
+// recorded baseline stays advanced, so the same change is not retried.
+func (u *clientUpgrader) Replace(deadline time.Time) {
 	u.mu.Lock()
 	u.requested = false
 	u.mu.Unlock()
-	if err := execIntoFn(u.installed, os.Args, clientReplaceEnv()); err != nil {
+	if err := execIntoFn(u.installed, os.Args, clientReplaceEnv(deadline)); err != nil {
 		_, _ = fmt.Fprintf(u.stderr,
 			"gh-monitor: replacing this watch with %s failed (%v); still serving, and it will not retry until the binary changes again\n",
 			u.installed, err)

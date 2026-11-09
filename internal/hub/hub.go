@@ -154,6 +154,9 @@ type Hub struct {
 	// daemon (issue #73 handoff), keyed by the watcher's ResumeID, until the
 	// watcher reconnects and claims it.
 	resumes map[string]resumeEntry
+	// attachSeq orders subscriptions: a later attach owns a ResumeID's stash,
+	// so a late write from the image it replaced cannot overwrite it.
+	attachSeq uint64
 
 	// brokerMu guards the optional broker-transport health flag and its
 	// extended idle-poll ceiling. See SetBrokerHealth and SetBrokerIdleCap.
@@ -353,6 +356,16 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 		hub:        h,
 	}
 
+	// A newer subscription of a ResumeID owns that ID's stash, which is what
+	// keeps a late stash from an older, still-attached subscription of the
+	// same watch from overwriting the successor's fresher baseline (issue
+	// #216). The sequence is assigned before the claim below, so the claim
+	// records this subscription as the owner.
+	h.mu.Lock()
+	h.attachSeq++
+	sub.seq = h.attachSeq
+	h.mu.Unlock()
+
 	// A watcher reconnecting after a daemon handoff claims the baseline its
 	// predecessor's daemon held for it, so it resumes diffing where it left
 	// off instead of replaying what it already reported (issue #73).
@@ -366,6 +379,10 @@ func (h *Hub) Subscribe(ctx context.Context, t backend.Target, opts backend.Watc
 			if err := json.Unmarshal(raw, st); err == nil {
 				sub.handle.restore(st)
 			}
+			// The claimant owns the ID from here: re-seat the baseline it
+			// claimed under this subscription's sequence, so a late stash
+			// from the image this one replaced cannot win (issue #216).
+			h.stashResumeAs(sub, raw)
 		}
 	}
 	go sub.loop()
@@ -785,17 +802,32 @@ func (h *Hub) stashResume(s *sub) {
 	if err != nil || len(b) == 0 {
 		return
 	}
+	h.stashResumeAs(s, b)
+}
+
+// stashResumeAs records baseline for s, unless a newer subscription of the
+// same ResumeID already owns it. Subscription sequence decides: the watch
+// image that replaced this one attached later, so its baseline is the one a
+// future reconnect must resume from (issue #216).
+func (h *Hub) stashResumeAs(s *sub, baseline json.RawMessage) {
+	if s.resumeID == "" || len(baseline) == 0 {
+		return
+	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if cur, ok := h.resumes[s.resumeID]; ok && cur.ownerSeq > s.seq {
+		return
+	}
 	h.resumes[s.resumeID] = resumeEntry{
 		state: ResumeState{
 			ResumeID: s.resumeID,
 			Target:   s.target,
 			Options:  s.watchOpts,
-			Baseline: b,
+			Baseline: baseline,
 		},
-		expires: time.Now().Add(resumeTTL),
+		expires:  time.Now().Add(resumeTTL),
+		ownerSeq: s.seq,
 	}
-	h.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -1826,6 +1858,10 @@ type sub struct {
 	target     backend.Target
 	watchOpts  backend.WatchOptions
 	hub        *Hub
+	// seq is this subscription's position in the attach order. A stash from a
+	// subscription with a lower seq than the ResumeID's current owner loses
+	// (issue #216).
+	seq uint64
 }
 
 // loop owns the consumer's diff goroutine. It reads raw payloads from the

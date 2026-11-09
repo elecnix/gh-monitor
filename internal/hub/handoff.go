@@ -76,6 +76,11 @@ type ResumeState struct {
 type resumeEntry struct {
 	state   ResumeState
 	expires time.Time
+	// ownerSeq is the subscription sequence of the watcher that stashed this
+	// baseline. A lower sequence never overwrites a higher one: the later
+	// subscription is the newer image of the same watch (issue #216). Zero on
+	// an entry restored from a handoff, which any live subscription may claim.
+	ownerSeq uint64
 }
 
 // ExportState snapshots everything a successor daemon needs. It is safe to

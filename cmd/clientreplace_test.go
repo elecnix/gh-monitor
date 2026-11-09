@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -119,7 +120,7 @@ func TestWatchClientReplacesItselfOnBinaryChange(t *testing.T) {
 	require.NoError(t, os.WriteFile(installed, []byte("v2-with-a-longer-body"), 0o755))
 
 	waitFor(t, "the replacement request", up.ReplaceRequested)
-	up.Replace()
+	up.Replace(time.Time{})
 
 	got := calls()
 	require.Len(t, got, 1, "one change must produce exactly one re-exec")
@@ -215,7 +216,7 @@ func TestWatchClientReplaceLoopImpossible(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(installed, []byte("v2-bigger"), 0o755))
 		waitFor(t, "the replacement request", up.ReplaceRequested)
-		up.Replace()
+		up.Replace(time.Time{})
 		time.Sleep(150 * time.Millisecond) // many further ticks over the same change
 		mu.Lock()
 		n := attempts
@@ -254,4 +255,42 @@ func TestUpgradeTargetFallsBackToTheRunningExecutable(t *testing.T) {
 	exe, err := os.Executable()
 	require.NoError(t, err)
 	assert.Equal(t, exe, upgradeTarget(), "without a recorded origin, watch the file this process runs from")
+}
+
+// TestClientReplaceCarriesTheWatchDeadline pins the --timeout contract across a
+// replacement: the successor re-runs the same command line, and a deadline
+// recomputed from its own start would give the caller more time than the flag
+// allows.
+func TestClientReplaceCarriesTheWatchDeadline(t *testing.T) {
+	t.Setenv(watchDeadlineEnv, "")
+	t.Setenv(clientReplaceCountEnv, "")
+	calls := captureExec(t)
+
+	deadline := time.Unix(1_800_000_000, 123).UTC()
+	u := &clientUpgrader{installed: "/installed", stderr: io.Discard}
+	u.Replace(deadline)
+
+	got := calls()
+	require.Len(t, got, 1)
+	raw, ok := envValue(got[0].env, watchDeadlineEnv)
+	require.True(t, ok, "the successor must inherit the deadline its caller was promised")
+	assert.Equal(t, strconv.FormatInt(deadline.UnixNano(), 10), raw)
+
+	t.Setenv(watchDeadlineEnv, raw)
+	assert.Equal(t, deadline.UnixNano(), carriedWatchDeadline().UnixNano(),
+		"the successor must read back the same instant")
+}
+
+// TestClientReplaceWithoutDeadlineAddsNone keeps an untimed watch untimed.
+func TestClientReplaceWithoutDeadlineAddsNone(t *testing.T) {
+	t.Setenv(watchDeadlineEnv, "")
+	t.Setenv(clientReplaceCountEnv, "")
+	calls := captureExec(t)
+
+	u := &clientUpgrader{installed: "/installed", stderr: io.Discard}
+	u.Replace(time.Time{})
+	got := calls()
+	require.Len(t, got, 1)
+	_, ok := envValue(got[0].env, watchDeadlineEnv)
+	assert.False(t, ok, "a watch with no --timeout must not carry a deadline")
 }

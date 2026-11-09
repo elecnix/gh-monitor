@@ -593,6 +593,13 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	deadline := time.Time{}
 	if opts.Timeout > 0 {
 		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+		// A self-replaced watch keeps the deadline its predecessor promised.
+		// The successor re-runs this command line, and a deadline recomputed
+		// from its own start would give the caller more time than --timeout
+		// allows (issue #216).
+		if carried := carriedWatchDeadline(); !carried.IsZero() && carried.Before(deadline) {
+			deadline = carried
+		}
 	}
 	deadlineTimer := time.NewTimer(time.Hour)
 	deadlineTimer.Stop()
@@ -716,8 +723,8 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// between polls: the batch just handled has persisted its cursor and
 		// logged its updates, so the successor resumes from written state and
 		// no delivered update is lost (issue #216).
-		if upgrader != nil && !u.More && !writeFailed && upgrader.ReplaceRequested() {
-			upgrader.Replace()
+		if upgrader != nil && !u.More && ctx.Err() == nil && upgrader.ReplaceRequested() {
+			upgrader.Replace(deadline)
 		}
 	}
 	ctxErr := ctx.Err()
@@ -933,6 +940,11 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 	var deadline time.Time
 	if opts.Timeout > 0 {
 		deadline = time.Now().Add(time.Duration(opts.Timeout) * time.Second)
+		// Keep the deadline an earlier image of this watch was promised
+		// (issue #216).
+		if carried := carriedWatchDeadline(); !carried.IsZero() && carried.Before(deadline) {
+			deadline = carried
+		}
 	}
 
 	// A failed write means the consumer of the readiness output is gone; the
@@ -1014,7 +1026,7 @@ func runReadiness(cmd *cobra.Command, opts *monitorOptions) error {
 		// Between cycles: the report above is written and the cycle's state
 		// is settled, so a pending self-replacement runs here (issue #216).
 		if upgrader != nil && ctx.Err() == nil && upgrader.ReplaceRequested() {
-			upgrader.Replace()
+			upgrader.Replace(deadline)
 		}
 
 		// Sleep until next poll or deadline.
