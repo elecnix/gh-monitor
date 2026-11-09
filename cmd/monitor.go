@@ -525,7 +525,7 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	var upgrader *clientUpgrader
 	if !opts.Once {
 		resumeID = watchResumeID()
-		upgrader = startClientUpgrade(ctx, cmd.ErrOrStderr())
+		upgrader = startWatchUpgrade(ctx, cmd.ErrOrStderr(), target.Kind, opts.Instance)
 	}
 
 	watchOpts := backend.WatchOptions{

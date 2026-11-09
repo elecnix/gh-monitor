@@ -231,7 +231,11 @@ func TestWatchClientReplaceLoopImpossible(t *testing.T) {
 // two consecutive ticks before a replacement is requested, and a fingerprint
 // that changes again in between restarts that count.
 func TestReplaceRequiresStableFingerprint(t *testing.T) {
-	u := &clientUpgrader{installed: "/installed", baseline: "v1"}
+	// Every candidate is another build, so only the two-tick rule decides.
+	orig := binarySumFn
+	t.Cleanup(func() { binarySumFn = orig })
+	binarySumFn = func(string) (string, error) { return "candidate-sum", nil }
+	u := &clientUpgrader{installed: "/installed", baseline: "v1", runningSum: "running-sum"}
 
 	assert.False(t, u.observe("v2"), "first sighting of a new fingerprint must only be recorded")
 	assert.True(t, u.observe("v2"), "a fingerprint stable across two ticks requests the replacement")

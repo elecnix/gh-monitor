@@ -7,6 +7,12 @@
 // resident watch stats the installed binary on the same slow tick the daemon
 // uses, and when an upgrade has settled on disk it re-execs into it between
 // polls, carrying its ResumeID so the daemon hands its baseline back.
+//
+// Content decides whether the binary changed, and metadata only pre-tests it.
+// Every tick costs one stat. A stat change that stays stable for two ticks is
+// a candidate, and only then does the watch hash the candidate and compare it
+// with the image it runs. A touch, a chmod or a reinstall of the same build
+// moves the stat and keeps the watch where it is.
 package cmd
 
 import (
@@ -19,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elecnix/gh-monitor/backend"
 	"github.com/elecnix/gh-monitor/internal/reexec"
 )
 
@@ -51,8 +58,32 @@ const (
 var execIntoFn = reexec.ExecInto
 
 // binaryFingerprintFn reads the installed binary's cheap stat fingerprint.
-// Package variable so tests can drive ticks without touching the filesystem.
-var binaryFingerprintFn = reexec.Fingerprint
+// It includes the inode change time, so an in-place rewrite that keeps size
+// and mtime still makes a candidate. Package variable so tests can drive ticks
+// without touching the filesystem.
+var binaryFingerprintFn = reexec.ChangeFingerprint
+
+// binarySumFn hashes a binary's content. It runs only for a candidate that
+// settled over two ticks, never on a tick where the stat did not move.
+// Package variable so tests can make a read fail.
+var binarySumFn = reexec.ContentSum
+
+// runningImageFn returns the path of the image this process runs. Package
+// variable so tests can stand in a file whose content they choose.
+var runningImageFn = os.Executable
+
+// contentVerdict is what the content check concludes about a candidate.
+type contentVerdict int
+
+const (
+	// contentUnconfirmed: a read or hash failed. The watch keeps serving and
+	// checks the candidate again on the next tick.
+	contentUnconfirmed contentVerdict = iota
+	// contentSame: the candidate holds the bytes this process already runs.
+	contentSame
+	// contentDiffers: the candidate is another build.
+	contentDiffers
+)
 
 // clientUpgrader watches the installed binary for a resident watch and records
 // when the watch should replace itself. It requests a replacement and never
@@ -62,10 +93,19 @@ type clientUpgrader struct {
 	installed string
 	stderr    io.Writer
 
-	mu        sync.Mutex
-	baseline  string // the fingerprint this chain has already acted on
-	pending   string // a changed fingerprint seen once, not yet stable
-	requested bool
+	// running is the path of the image this process runs. In the normal case
+	// it is the content-addressed runtime copy (internal/reexec), written once
+	// and never rewritten, so its bytes are the running image's bytes. With
+	// the relaunch opted out it is the installed file itself, which an upgrade
+	// rewrites; runningSum is therefore taken when the watch starts.
+	running string
+
+	mu         sync.Mutex
+	runningSum string // SHA-256 of the running image, "" until read
+	baseline   string // the fingerprint this chain has already acted on
+	pending    string // a changed fingerprint seen once, not yet stable
+	unreadable string // the candidate whose read failure was reported
+	requested  bool
 }
 
 // watchResumeID returns this watch's ResumeID. A successor reuses the one its
@@ -120,14 +160,39 @@ func startClientUpgrade(ctx context.Context, stderr io.Writer) *clientUpgrader {
 		return nil
 	}
 	u := &clientUpgrader{installed: installed, stderr: stderr, baseline: baseline}
+	if running, err := runningImageFn(); err == nil {
+		u.running = running
+	}
 	go u.run(ctx)
 	return u
+}
+
+// watchContinuitySafe reports whether a watch of this kind can replace itself
+// without losing its place. A repo watch reads events from a cursor, and
+// without --instance that cursor exists only in this process's memory: the
+// successor would replay events the consumer already saw, or skip the ones
+// that arrived during the exec. Other kinds resume through their ResumeID.
+func watchContinuitySafe(kind backend.Kind, instance string) bool {
+	return kind != backend.KindRepo || instance != ""
+}
+
+// startWatchUpgrade starts the upgrade watcher for a continuous target watch,
+// or returns nil with one line on stderr when the watch cannot replace itself
+// without losing its place.
+func startWatchUpgrade(ctx context.Context, stderr io.Writer, kind backend.Kind, instance string) *clientUpgrader {
+	if !watchContinuitySafe(kind, instance) {
+		_, _ = fmt.Fprintf(stderr,
+			"gh-monitor: a repo watch without --instance keeps its cursor in memory only, so it keeps serving the image it started with after an upgrade; restart it, or start it with --instance NAME to let it replace itself\n")
+		return nil
+	}
+	return startClientUpgrade(ctx, stderr)
 }
 
 // run stats the installed binary on every tick. A new fingerprint must be seen
 // on two consecutive ticks before it requests a replacement, so a file that is
 // still being written is never executed.
 func (u *clientUpgrader) run(ctx context.Context) {
+	u.hashRunningImage()
 	ticker := time.NewTicker(upgradeCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -147,10 +212,27 @@ func (u *clientUpgrader) run(ctx context.Context) {
 	}
 }
 
+// hashRunningImage records the running image's SHA-256 when the watch
+// starts. A failure leaves it empty, and compareContent retries it only where
+// the path cannot have been rewritten since.
+func (u *clientUpgrader) hashRunningImage() {
+	if u.running == "" {
+		return
+	}
+	sum, err := binarySumFn(u.running)
+	if err != nil {
+		return
+	}
+	u.mu.Lock()
+	u.runningSum = sum
+	u.mu.Unlock()
+}
+
 // observe folds one tick's fingerprint into the state machine and reports
-// whether it requested a replacement. The recorded baseline advances on the
-// request, so a replacement that fails to exec retries only when the binary
-// changes again.
+// whether it requested a replacement. The recorded baseline advances once the
+// content check reaches a verdict, so a replacement that fails to exec
+// retries only when the binary changes again. A candidate that cannot be read
+// stays pending, and the next tick checks it again.
 func (u *clientUpgrader) observe(cur string) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -164,10 +246,58 @@ func (u *clientUpgrader) observe(cur string) bool {
 		u.pending = cur
 		return false
 	}
-	u.pending = ""
-	u.baseline = cur
-	u.requested = true
-	return true
+	verdict, err := u.compareContent()
+	switch verdict {
+	case contentDiffers:
+		u.pending = ""
+		u.baseline = cur
+		u.requested = true
+		return true
+	case contentSame:
+		u.pending = ""
+		u.baseline = cur
+		u.logf("gh-monitor: %s changed on disk but has the same content as this watch's image; this watch keeps serving\n", u.installed)
+		return false
+	default:
+		if u.unreadable != cur {
+			u.unreadable = cur
+			u.logf("gh-monitor: %s changed on disk, but its content could not be compared (%v); this watch keeps serving and checks again on the next tick\n", u.installed, err)
+		}
+		return false
+	}
+}
+
+// compareContent hashes the candidate and compares it with the running image.
+// Callers hold u.mu. The running image is hashed first, so a watch that
+// cannot read its own image does not read the candidate on every tick.
+func (u *clientUpgrader) compareContent() (contentVerdict, error) {
+	if u.runningSum == "" {
+		// Only a runtime copy can be read again safely: it is never rewritten.
+		// Any other path may now hold the candidate's bytes.
+		if u.running == "" || !reexec.IsRuntimeCopy(u.running) {
+			return contentUnconfirmed, fmt.Errorf("the running image was not hashed at start")
+		}
+		sum, err := binarySumFn(u.running)
+		if err != nil {
+			return contentUnconfirmed, err
+		}
+		u.runningSum = sum
+	}
+	candidate, err := binarySumFn(u.installed)
+	if err != nil {
+		return contentUnconfirmed, err
+	}
+	if candidate == u.runningSum {
+		return contentSame, nil
+	}
+	return contentDiffers, nil
+}
+
+// logf writes one line to stderr when the upgrader has one.
+func (u *clientUpgrader) logf(format string, args ...any) {
+	if u.stderr != nil {
+		_, _ = fmt.Fprintf(u.stderr, format, args...)
+	}
 }
 
 // ReplaceRequested reports whether a replacement is waiting to be performed at
