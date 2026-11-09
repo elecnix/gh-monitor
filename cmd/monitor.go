@@ -512,9 +512,16 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// off to an upgraded daemon (issue #73), the watcher re-establishes its
 	// stream under the same ID and resumes from the baseline it was last
 	// shown, instead of replaying what it already reported.
+	//
+	// The ID survives the watch replacing itself on an upgraded binary (#216),
+	// which is what makes that replacement invisible: the new image reconnects
+	// with the same ID and the daemon hands back this watcher's baseline.
 	var resumeID string
 	if !opts.Once {
-		resumeID = newResumeID()
+		resumeID = resumeIDFromEnv()
+		if resumeID == "" {
+			resumeID = newResumeID()
+		}
 	}
 
 	watchOpts := backend.WatchOptions{
@@ -543,6 +550,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	if err != nil {
 		return fmt.Errorf("backend %q: %w", sourceName, err)
 	}
+	// A watch that outlives an upgrade must become the new binary: until this
+	// existed, an upgraded file on disk never reached the processes that
+	// actually emit events (issue #216).
+	startWatchUpgradeWatch(ctx, resumeID, watchContinuitySafe(target.Kind, opts.Instance), cmd.ErrOrStderr())
 	// A backend with at-least-once delivery repeats itself; a repeat that
 	// reaches the operator is a second notification about one thing.
 	dedup := backend.NewDeduper(0)

@@ -743,6 +743,12 @@ func (h *Hub) Stop() {
 // no consumers left.
 func (h *Hub) detach(key pollerKey, p *poller, s *sub) {
 	close(s.done)
+	// Keep this watcher's baseline addressable by its resume ID before the sub
+	// disappears, so a client that reconnects — after replacing itself with an
+	// upgraded binary (issue #216), or after a dropped stream — resumes from
+	// where it stopped instead of replaying a first poll. Same store, same TTL
+	// and same reclaim path as a daemon handoff; no second mechanism.
+	h.stashResume(s)
 	var empty bool
 	p.mu.Lock()
 	delete(p.subs, s)

@@ -201,3 +201,41 @@ func (h *Hub) takeResume(resumeID string) (json.RawMessage, bool) {
 	}
 	return entry.state.Baseline, true
 }
+
+// stashResume records one departing watcher's baseline under its resume ID,
+// with the same TTL the handoff uses, so the watcher can reconnect and resume.
+//
+// It exists because a resume ID was previously only reusable across a *daemon*
+// handoff: `resumes` was filled exclusively by ExportState. A watch client that
+// replaced itself with an upgraded binary (issue #216) reconnects to the same
+// daemon, which found nothing under its ID and answered with a first poll — the
+// replay this mechanism exists to prevent. Stashing on detach makes the
+// guarantee hold for any reconnect, which is what the resume ID always looked
+// like it promised.
+//
+// Locking: s.mu is taken and released before h.mu, never nested, so this cannot
+// deadlock against ExportState (which takes h.mu, then p.mu, then s.mu).
+func (h *Hub) stashResume(s *sub) {
+	if s == nil || s.resumeID == "" {
+		return
+	}
+	s.mu.Lock()
+	st := s.handle.baseline()
+	rs := ResumeState{
+		ResumeID: s.resumeID,
+		Target:   s.target,
+		Options:  s.watchOpts,
+	}
+	s.mu.Unlock()
+	if st == nil {
+		return
+	}
+	b, err := json.Marshal(st)
+	if err != nil {
+		return
+	}
+	rs.Baseline = b
+	h.mu.Lock()
+	h.resumes[rs.ResumeID] = resumeEntry{state: rs, expires: time.Now().Add(resumeTTL)}
+	h.mu.Unlock()
+}
