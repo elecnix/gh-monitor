@@ -93,11 +93,28 @@ const copyPattern = "gh-monitor-"
 // leaving it running from the installed binary — the one state this package
 // exists to avoid, since that image cannot be replaced in place.
 func ChildEnv() []string {
-	prefix := ReexecDepthEnv + "="
-	env := os.Environ()
+	return EnvWithout(os.Environ(), ReexecDepthEnv)
+}
+
+// EnvWithout returns env with every assignment of the named keys removed.
+// Building a child's environment from this one keeps a single, later-wins
+// convention: callers append the value they want, and no stale duplicate of
+// the same key survives above it (issue #216).
+func EnvWithout(env []string, keys ...string) []string {
+	prefixes := make([]string, len(keys))
+	for i, key := range keys {
+		prefixes[i] = key + "="
+	}
 	kept := env[:0]
 	for _, kv := range env {
-		if !strings.HasPrefix(kv, prefix) {
+		drop := false
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(kv, prefix) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
 			kept = append(kept, kv)
 		}
 	}

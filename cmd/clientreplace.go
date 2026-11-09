@@ -179,15 +179,8 @@ func (u *clientUpgrader) ReplaceRequested() bool {
 // advanced only in the slice handed to the exec, never in this process, so an
 // exec that fails does not spend the chain's budget.
 func clientReplaceEnv() []string {
-	prefix := clientReplaceCountEnv + "="
-	env := reexec.ChildEnv()
-	kept := env[:0]
-	for _, kv := range env {
-		if !strings.HasPrefix(kv, prefix) {
-			kept = append(kept, kv)
-		}
-	}
-	return append(kept, prefix+strconv.Itoa(clientReplaceCount()+1))
+	env := reexec.EnvWithout(reexec.ChildEnv(), clientReplaceCountEnv)
+	return append(env, clientReplaceCountEnv+"="+strconv.Itoa(clientReplaceCount()+1))
 }
 
 // Replace replaces this process with the installed binary, passing this watch's
