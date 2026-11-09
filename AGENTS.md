@@ -107,6 +107,14 @@ cgroup. The rules that follow from that:
 - **`gh monitor reload` asks the daemon to spawn its successor** (`OpReload`).
   A client-spawned successor lands in the client's cgroup. The client falls back
   to spawning only for a daemon too old to answer.
+- **A resident watch replaces itself on an upgrade** (`cmd/clientreplace.go`).
+  It stats the installed binary on the same 15 s tick the daemon uses, requires
+  the change to be stable across two ticks, and re-execs between polls after the
+  batch in flight is handled. It passes its ResumeID in
+  `GH_MONITOR_WATCH_RESUME_ID`. The hub stashes a watcher's baseline after every
+  batch, so the reconnecting watch resumes without a second first poll. A watch
+  that has nothing to report adopts the upgrade at its next batch end, and a
+  chain caps its self-replacements through `GH_MONITOR_CLIENT_REPLACE_COUNT`.
 - **Socket activation outranks binding** (`internal/activation`). An activated
   socket's path belongs to the service manager: the daemon must not unlink it.
   A connect on an activated path succeeds even with no daemon running, so
