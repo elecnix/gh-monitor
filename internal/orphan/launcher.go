@@ -12,17 +12,23 @@
 // shell, editor, or agent that actually asked for the watch.
 //
 // When that ancestor has already exited, the OS has adopted the wrapper: the
-// walk ends at init (pid 1, launchd on macOS). Init never exits, so a guard
-// that waited for it to change would wait forever. Seven watches of that
-// shape, up to four days old, were found polling on one machine. The walk
-// therefore reports init as the launcher, and the guard reads that as the
-// launcher being gone.
+// walk ends at init (pid 1: systemd, launchd, or a container init such as
+// tini). Init never exits, so a guard that waited for it to change would wait
+// forever. Seven watches of that shape, up to four days old, were found
+// polling on one machine. The walk therefore reports LauncherGone when the
+// chain ends at an init, and the guard fires on it. A pid 1 that is not an
+// init is a container entrypoint that started the watch itself, such as a
+// shell or an agent: it is a live launcher, and its exit ends the whole pid
+// namespace, so nothing is leaked by waiting on it.
 
 package orphan
 
-// InitPID is the pid of init (launchd on macOS), the process the OS reparents
-// an orphan to. A launcher resolved to it has already exited.
-const InitPID = 1
+// LauncherGone is what ResolveLauncher reports when the chain ends at init:
+// the process that asked for the watch has already exited.
+const LauncherGone = -1
+
+// initPID is the pid the OS reparents an orphan to.
+const initPID = 1
 
 // maxLauncherHops bounds the walk up the process tree. A wrapper chain longer
 // than this is not a launcher worth following, and an unbounded walk on a
@@ -39,8 +45,10 @@ type ParentFunc func(pid int) (ppid int, comm string, ok bool)
 // A wrapper is a process that exists only to run the watch — today, the gh
 // CLI. Anything else is treated as the launcher, so a direct invocation from a
 // shell resolves to the shell on the first hop, exactly as before. A chain
-// that ends at init resolves to InitPID whether or not init itself can be
-// inspected: the process that asked for the watch is already gone.
+// that ends at pid 1 resolves to LauncherGone when pid 1 is an init, or
+// cannot be inspected at all: the process that asked for the watch is
+// already gone. A pid 1 with any other name is a container entrypoint and
+// resolves as a live launcher.
 func ResolveLauncher(pid int, parentOf ParentFunc) int {
 	if parentOf == nil {
 		return 0
@@ -51,12 +59,12 @@ func ResolveLauncher(pid int, parentOf ParentFunc) int {
 		if !ok || ppid <= 0 {
 			return 0
 		}
-		if ppid == InitPID {
-			return InitPID
-		}
 		// The wrapper test asks about the parent's own command name: the
 		// watch's own name says nothing about what started it.
 		_, parentComm, pok := parentOf(ppid)
+		if ppid == initPID && (!pok || isInit(parentComm)) {
+			return LauncherGone
+		}
 		if !pok || !isWrapper(parentComm) {
 			return ppid
 		}
@@ -70,6 +78,17 @@ func ResolveLauncher(pid int, parentOf ParentFunc) int {
 func isWrapper(comm string) bool {
 	switch comm {
 	case "gh":
+		return true
+	}
+	return false
+}
+
+// isInit reports whether comm names a process that adopts orphans and never
+// exits on its own: the system init, or a container init that only
+// supervises its children.
+func isInit(comm string) bool {
+	switch comm {
+	case "init", "systemd", "launchd", "tini", "docker-init", "dumb-init", "s6-svscan":
 		return true
 	}
 	return false
