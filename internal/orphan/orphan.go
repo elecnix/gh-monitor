@@ -10,15 +10,16 @@
 // The visible signature of a launcher that exited is a changed parent pid:
 // the OS reassigns the child to a new parent (init, launchd, or the user
 // service manager) when the old parent exits. A goroutine polls the launcher
-// pid and closes Done when it differs from the pid captured at start. The
-// launcher is resolved past wrapper processes — `gh` forks the extension and
-// waits, so the watch's own parent never changes and watching os.Getppid()
-// alone missed every watch started through the CLI (see launcher.go). Polling
-// rather than prctl(PR_SET_PDEATHSIG, SIGTERM) is deliberate: PDEATHSIG
-// observes the parent's main thread, which a multi-threaded launcher (Node,
-// .NET) exits long before its process ends, so it would stop healthy watches.
-// One integer read per poll is also the whole cost: no /proc parsing, and
-// nothing platform-specific at all.
+// pid and closes Done when it differs from the pid captured at start, or when
+// it is init: a launcher that resolves to pid 1 has already exited, and pid 1
+// never changes. The launcher is resolved past wrapper processes — `gh` forks
+// the extension and waits, so the watch's own parent never changes and
+// watching os.Getppid() alone missed every watch started through the CLI (see
+// launcher.go). Polling rather than prctl(PR_SET_PDEATHSIG, SIGTERM) is
+// deliberate: PDEATHSIG observes the parent's main thread, which a
+// multi-threaded launcher (Node, .NET) exits long before its process ends, so
+// it would stop healthy watches. A few process-table reads per tick are the
+// whole cost.
 package orphan
 
 import (
@@ -110,9 +111,11 @@ func LauncherPID() int {
 }
 
 // Start captures the parent pid and launches the poll loop. The first read
-// is the baseline every later poll compares against. A guard is single-use:
-// a second Start on the same guard is a no-op, not a second poll loop
-// racing the first for the done channel.
+// is the baseline every later poll compares against. A baseline or a later
+// reading of InitPID means the launcher has already exited, so the guard
+// fires on that tick without waiting for pid 1 to change. A guard is
+// single-use: a second Start on the same guard is a no-op, not a second poll
+// loop racing the first for the done channel.
 func (g *Guard) Start() *Guard {
 	g.startOnce.Do(func() {
 		if g.ppidFn == nil {
@@ -140,6 +143,12 @@ func (g *Guard) Start() *Guard {
 					return
 				case <-ticker.C:
 					cur := g.ppidFn()
+					// Init adopted this process or its wrapper: the launcher is
+					// gone whichever source reported it, and init never exits.
+					if cur == InitPID {
+						close(g.done)
+						return
+					}
 					// A read that fails, or a walk that suddenly cannot resolve,
 					// yields a pid from a different source than the baseline. That
 					// is not evidence the launcher left, so it is skipped rather

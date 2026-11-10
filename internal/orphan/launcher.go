@@ -10,8 +10,19 @@
 //
 // So the baseline is not the parent but the first *non-wrapper* ancestor: the
 // shell, editor, or agent that actually asked for the watch.
+//
+// When that ancestor has already exited, the OS has adopted the wrapper: the
+// walk ends at init (pid 1, launchd on macOS). Init never exits, so a guard
+// that waited for it to change would wait forever. Seven watches of that
+// shape, up to four days old, were found polling on one machine. The walk
+// therefore reports init as the launcher, and the guard reads that as the
+// launcher being gone.
 
 package orphan
+
+// InitPID is the pid of init (launchd on macOS), the process the OS reparents
+// an orphan to. A launcher resolved to it has already exited.
+const InitPID = 1
 
 // maxLauncherHops bounds the walk up the process tree. A wrapper chain longer
 // than this is not a launcher worth following, and an unbounded walk on a
@@ -27,7 +38,9 @@ type ParentFunc func(pid int) (ppid int, comm string, ok bool)
 //
 // A wrapper is a process that exists only to run the watch — today, the gh
 // CLI. Anything else is treated as the launcher, so a direct invocation from a
-// shell resolves to the shell on the first hop, exactly as before.
+// shell resolves to the shell on the first hop, exactly as before. A chain
+// that ends at init resolves to InitPID whether or not init itself can be
+// inspected: the process that asked for the watch is already gone.
 func ResolveLauncher(pid int, parentOf ParentFunc) int {
 	if parentOf == nil {
 		return 0
@@ -37,6 +50,9 @@ func ResolveLauncher(pid int, parentOf ParentFunc) int {
 		ppid, _, ok := parentOf(cur)
 		if !ok || ppid <= 0 {
 			return 0
+		}
+		if ppid == InitPID {
+			return InitPID
 		}
 		// The wrapper test asks about the parent's own command name: the
 		// watch's own name says nothing about what started it.

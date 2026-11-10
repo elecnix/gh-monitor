@@ -207,3 +207,64 @@ func TestLauncherPIDIsReadable(t *testing.T) {
 		t.Fatalf("LauncherPID = %d, want a positive pid", got)
 	}
 }
+
+// TestResolveLauncherChainEndingAtInit is the shape of a leaked watch after
+// its session exited: the wrapper was reparented to init, so the walk ends
+// there. Init is not a launcher that can exit, so the walk must report it as
+// the launcher being gone rather than as a pid to wait on forever.
+func TestResolveLauncherChainEndingAtInit(t *testing.T) {
+	tree := map[int]struct {
+		ppid int
+		comm string
+	}{
+		100: {200, "gh-monitor"},
+		200: {1, "gh"},
+		1:   {0, "launchd"},
+	}
+	parentOf := func(pid int) (int, string, bool) {
+		e, ok := tree[pid]
+		return e.ppid, e.comm, ok
+	}
+	if got := ResolveLauncher(100, parentOf); got != InitPID {
+		t.Fatalf("ResolveLauncher = %d, want init (%d) when the chain ends there", got, InitPID)
+	}
+
+	// Init that cannot be inspected (a hardened /proc) is still init.
+	delete(tree, 1)
+	if got := ResolveLauncher(100, parentOf); got != InitPID {
+		t.Fatalf("ResolveLauncher = %d, want init (%d) when init cannot be inspected", got, InitPID)
+	}
+}
+
+// TestGuardFiresWhenTheLauncherIsInit pins the orphan-at-start contract: a
+// guard whose baseline resolves to init has already lost its launcher, so it
+// fires on its first tick instead of waiting for pid 1 to change.
+func TestGuardFiresWhenTheLauncherIsInit(t *testing.T) {
+	g := New(20*time.Millisecond, func() int { return InitPID }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not fire for a launcher that is init")
+	}
+}
+
+// TestGuardFiresWhenReparentedToInit covers the walk's view after the session
+// exits: the resolved launcher goes from the session's pid to init.
+func TestGuardFiresWhenReparentedToInit(t *testing.T) {
+	var current atomic.Int64
+	current.Store(300)
+	g := New(20*time.Millisecond, func() int { return int(current.Load()) }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+		t.Fatal("guard fired while the launcher was alive")
+	case <-time.After(100 * time.Millisecond):
+	}
+	current.Store(InitPID)
+	select {
+	case <-g.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not fire after the launcher was replaced by init")
+	}
+}
