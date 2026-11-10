@@ -172,7 +172,7 @@ func TestDoctor_ReportsFailingTransport(t *testing.T) {
 	assert.Contains(t, out, "attempt 8")
 	assert.Contains(t, out, "retrying in 1m0s")
 	assert.Contains(t, out, "last healthy 1h0m0s ago")
-	assert.Contains(t, out, "last error 30s ago: connect: connect: network Error : dial tcp: i/o timeout")
+	assert.Contains(t, out, "last error 30s ago (connect): connect: network Error : dial tcp: i/o timeout")
 	assert.Contains(t, out, "down for 9m0s; the watches were told")
 }
 

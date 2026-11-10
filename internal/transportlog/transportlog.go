@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -192,8 +191,10 @@ type Summary struct {
 	Attempt int
 	// LastHealthy is when the transport last connected, zero if never.
 	LastHealthy time.Time
-	// LastError is the last recorded error, as "class: message".
+	// LastError is the last recorded error's redacted message.
 	LastError string
+	// LastErrorClass is broker.Classify's name for it.
+	LastErrorClass string
 	// LastErrorAt is when it was recorded.
 	LastErrorAt time.Time
 	// Retrying reports that the daemon is between attempts or in one.
@@ -271,7 +272,8 @@ func (s *Summary) apply(r Record) {
 		s.Attempt = r.Attempt
 		s.Retrying = true
 		s.RetryIn, _ = time.ParseDuration(r.RetryIn)
-		s.LastError = strings.TrimPrefix(r.ErrorClass+": "+r.Error, ": ")
+		s.LastError = r.Error
+		s.LastErrorClass = r.ErrorClass
 		s.LastErrorAt = r.At
 		s.DownSince = since
 	case broker.TransitionOutage:
@@ -307,7 +309,11 @@ func (s Summary) Describe(now time.Time) []string {
 		lines = append(lines, fmt.Sprintf("last healthy %s ago (%s)", age(s.LastHealthy), s.LastHealthy.Format(time.RFC3339)))
 	}
 	if s.LastError != "" {
-		lines = append(lines, fmt.Sprintf("last error %s ago: %s", age(s.LastErrorAt), s.LastError))
+		class := ""
+		if s.LastErrorClass != "" {
+			class = " (" + s.LastErrorClass + ")"
+		}
+		lines = append(lines, fmt.Sprintf("last error %s ago%s: %s", age(s.LastErrorAt), class, s.LastError))
 	}
 	if !s.DownSince.IsZero() {
 		line := fmt.Sprintf("down for %s", age(s.DownSince))

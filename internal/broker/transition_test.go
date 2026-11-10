@@ -330,6 +330,12 @@ func TestRedact(t *testing.T) {
 			drop: []string{"X-Amz-Signature", "deadbeef0123", "AKIAEXAMPLE", "X-Amz-Security-Token", "FwoGZXIvYXdz", "/mqtt?"},
 		},
 		{
+			name: "URL userinfo is a credential",
+			in:   "connect: dial wss://ghmon:p4ssw0rd-secret@relay.example.com:9001/mqtt: connection refused",
+			keep: []string{"wss://relay.example.com:9001/", "connection refused"},
+			drop: []string{"ghmon", "p4ssw0rd-secret", "@", "/mqtt"},
+		},
+		{
 			name: "authorization header value",
 			in:   "connect: 401 with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.secret.sig",
 			keep: []string{"connect: 401"},

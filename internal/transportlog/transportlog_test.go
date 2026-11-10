@@ -183,7 +183,8 @@ func TestSummarize(t *testing.T) {
 		assert.Equal(t, t0.Add(3*time.Minute+time.Second), s.Since)
 		assert.Equal(t, 7, s.Attempt)
 		assert.Equal(t, t0.Add(time.Second), s.LastHealthy)
-		assert.Equal(t, "connect: connect: dial tcp: i/o timeout", s.LastError)
+		assert.Equal(t, "connect: dial tcp: i/o timeout", s.LastError, "the message, once, as the record carries it")
+		assert.Equal(t, "connect", s.LastErrorClass)
 		assert.Equal(t, t0.Add(time.Minute+3*time.Second), s.LastErrorAt)
 		assert.True(t, s.Retrying)
 		assert.True(t, s.OutageOpen)
@@ -275,13 +276,13 @@ func TestDescribe(t *testing.T) {
 	})
 	t.Run("failing", func(t *testing.T) {
 		s := Summary{Host: "relay.example.com", State: "degraded", Since: t0.Add(9 * time.Minute), Attempt: 8,
-			LastHealthy: t0, LastError: "websocket-close-1006: connection lost", LastErrorAt: t0.Add(9 * time.Minute),
+			LastHealthy: t0, LastError: "connection lost: websocket: close 1006 (abnormal closure): unexpected EOF", LastErrorClass: "websocket-close-1006", LastErrorAt: t0.Add(9 * time.Minute),
 			Retrying: true, RetryIn: 60 * time.Second, DownSince: t0.Add(time.Minute), OutageOpen: true, LastRecord: t0.Add(9 * time.Minute)}
 		text := strings.Join(s.Describe(now), "\n")
 		assert.Contains(t, text, "degraded")
 		assert.Contains(t, text, "attempt 8")
 		assert.Contains(t, text, "retrying in 1m0s")
-		assert.Contains(t, text, "websocket-close-1006")
+		assert.Contains(t, text, "last error 1m0s ago (websocket-close-1006): connection lost: websocket: close 1006")
 		assert.Contains(t, text, "last healthy")
 		assert.Contains(t, text, "down for 9m")
 		assert.Contains(t, text, "watches were told")

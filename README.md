@@ -602,14 +602,14 @@ The daemon records its own broker connection in `transport.jsonl` in the user ca
 {"at":"2026-11-10T17:04:59Z","event":"connecting","host":"abc123.iot.us-east-1.amazonaws.com","attempt":2}
 ```
 
-A record carries the endpoint's host, the error's class and its message. The message is redacted before it is written: any URL in it keeps its scheme and host only, and an authorization header, a bearer token or a `token=`, `signature=` or `X-Amz-*=` pair loses its value. A SigV4-presigned URL is a credential, and a connect error can quote one. Event payloads are never recorded. The same redaction applies to the degraded notice the clients receive.
+A record carries the endpoint's host, the error's class and its message. The message is redacted before it is written: any URL in it keeps its scheme and host only, with no userinfo, path or query, and an authorization header, a bearer token or a `token=`, `signature=` or `X-Amz-*=` pair loses its value. A SigV4-presigned URL is a credential, and a connect error can quote one. Event payloads are never recorded. The same redaction applies to the degraded notice the clients receive.
 
 `gh monitor doctor` reads the log and adds the connection's state to its report: the state and how long it has held, the attempt and the delay while reconnecting, when the transport was last healthy, the last error, and whether an outage notice is open. The lines describe the daemon's own connection. A sub-daemon's connection is its own.
 
 ```
 broker transport: degraded for 30s (host abc123.iot.us-east-1.amazonaws.com, attempt 8), retrying in 1m0s
 broker transport: last healthy 1h0m0s ago (2026-11-10T16:04:57Z)
-broker transport: last error 30s ago: connect: connect: network Error : dial tcp: i/o timeout
+broker transport: last error 30s ago (connect): connect: network Error : dial tcp: i/o timeout
 broker transport: down for 9m0s; the watches were told and are served by polling
 ```
 

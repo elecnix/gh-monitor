@@ -77,10 +77,11 @@ func (c Config) Host() string {
 const redactMaxLen = 512
 
 var (
-	// redactURL matches any URL and keeps the scheme and host. The path and
-	// query go: a SigV4-presigned URL carries its credential, signature and
-	// session token in the query.
-	redactURL = regexp.MustCompile(`(?i)\b(wss?|https?)://([^\s/?#]+)[^\s]*`)
+	// redactURL matches any URL and keeps the scheme and host. The userinfo
+	// goes, because user:password@ is a credential. The path and query go:
+	// a SigV4-presigned URL carries its credential, signature and session
+	// token in the query.
+	redactURL = regexp.MustCompile(`(?i)\b(wss?|https?)://(?:[^\s/?#@]*@)?([^\s/?#@]+)[^\s]*`)
 	// redactHeader matches an Authorization header with its value.
 	redactHeader = regexp.MustCompile(`(?i)\bauthorization:\s*\S+(\s+\S+)?`)
 	// redactScheme matches a bearer, basic or token scheme with its value.
@@ -91,8 +92,9 @@ var (
 
 // Redact strips credentials from an error message before it is written
 // anywhere a reader can see it: the transport log and the degraded notice
-// sent to watching clients. Any URL keeps its scheme and host only, an
-// Authorization header or bearer token loses its value, and a key=value pair
+// sent to watching clients. Any URL keeps its scheme and host only, with
+// no userinfo, path or query, an Authorization header or bearer token
+// loses its value, and a key=value pair
 // whose key is a token, signature, secret or AWS signing parameter loses
 // its value. The result is cut at redactMaxLen bytes.
 func Redact(msg string) string {
