@@ -111,6 +111,8 @@ type clientUpgrader struct {
 	pending    string // a changed fingerprint seen once, not yet stable
 	unreadable string // the candidate whose read failure was reported
 	requested  bool
+
+	done chan struct{} // closed when the tick goroutine returns
 }
 
 // watchResumeID returns this watch's ResumeID. A successor reuses the one its
@@ -167,7 +169,11 @@ func startClientUpgrade(ctx context.Context, stderr io.Writer) *clientUpgrader {
 		_, _ = fmt.Fprintf(stderr, "gh-monitor: cannot watch %s for upgrades (%v); this watch keeps serving the image it started with\n", installed, err)
 		return nil
 	}
-	go u.run(ctx)
+	u.done = make(chan struct{})
+	go func() {
+		defer close(u.done)
+		u.run(ctx)
+	}()
 	return u
 }
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -137,6 +138,22 @@ func TestWatchClientHashFailureKeepsServing(t *testing.T) {
 	waitFor(t, "the replacement once the candidate reads", up.ReplaceRequested)
 }
 
+// startWatchUpgradeForTest starts the upgrade watcher for one target watch
+// and stops it at the end of the test, waiting for its tick goroutine to
+// return before the next test changes the package variables it reads.
+func startWatchUpgradeForTest(t *testing.T, stderr func(string), kind backend.Kind, instance string) *clientUpgrader {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	up := startWatchUpgrade(ctx, writerFunc(stderr), kind, instance)
+	t.Cleanup(func() {
+		cancel()
+		if up != nil {
+			<-up.done
+		}
+	})
+	return up
+}
+
 // TestRepoWatchWithoutInstanceKeepsItsBinary pins idea 2 of issue #216: a repo
 // watch without --instance keeps its cursor in memory only, so a replacement
 // would replay events or skip them. It keeps its binary and says so once. The
@@ -145,7 +162,7 @@ func TestRepoWatchWithoutInstanceKeepsItsBinary(t *testing.T) {
 	t.Run("no instance", func(t *testing.T) {
 		installedForTest(t, "v1")
 		var logs strings.Builder
-		up := startWatchUpgrade(t.Context(), writerFunc(func(s string) { logs.WriteString(s) }), backend.KindRepo, "")
+		up := startWatchUpgradeForTest(t, func(s string) { logs.WriteString(s) }, backend.KindRepo, "")
 		assert.Nil(t, up, "a repo watch without --instance must not watch for upgrades")
 		assert.Equal(t, 1, strings.Count(logs.String(), "\n"), "the skip is reported on one line")
 		assert.Contains(t, logs.String(), "--instance")
@@ -158,7 +175,7 @@ func TestRepoWatchWithoutInstanceKeepsItsBinary(t *testing.T) {
 		upgradeCheckInterval = 10 * time.Millisecond
 		t.Cleanup(func() { upgradeCheckInterval = origInterval })
 
-		up := startWatchUpgrade(t.Context(), writerFunc(func(string) {}), backend.KindRepo, "ci")
+		up := startWatchUpgradeForTest(t, func(string) {}, backend.KindRepo, "ci")
 		require.NotNil(t, up, "a repo watch with --instance stores its cursor, so it can replace itself")
 		require.NoError(t, os.WriteFile(installed, []byte("v2-with-a-longer-body"), 0o755))
 		waitFor(t, "the replacement request", up.ReplaceRequested)
@@ -168,7 +185,7 @@ func TestRepoWatchWithoutInstanceKeepsItsBinary(t *testing.T) {
 
 	t.Run("pr watch without instance", func(t *testing.T) {
 		installedForTest(t, "v1")
-		up := startWatchUpgrade(t.Context(), writerFunc(func(string) {}), backend.KindPR, "")
+		up := startWatchUpgradeForTest(t, func(string) {}, backend.KindPR, "")
 		assert.NotNil(t, up, "a pr watch resumes through its ResumeID, so it needs no instance")
 	})
 }
@@ -185,19 +202,24 @@ func TestWatchClientUpgradeDuringStartHashStillReplaces(t *testing.T) {
 	t.Cleanup(func() { runningImageFn = orig })
 	calls := captureExec(t)
 
+	// The hash runs on the goroutine that starts the upgrader, so the write
+	// error is kept and checked here: t.FailNow there would leave
+	// clientWatchForTest waiting forever.
 	var once sync.Once
+	var writeErr error
 	origSum := binarySumFn
 	t.Cleanup(func() { binarySumFn = origSum })
 	binarySumFn = func(path string) (string, error) {
 		once.Do(func() {
 			// The upgrade lands just before the start hash reads the file.
-			require.NoError(t, os.WriteFile(installed, []byte("v2-with-a-longer-body"), 0o755))
+			writeErr = os.WriteFile(installed, []byte("v2-with-a-longer-body"), 0o755)
 		})
 		return origSum(path)
 	}
 
 	up, stop := clientWatchForTest(t, installed, func(string) {})
 	t.Cleanup(stop)
+	require.NoError(t, writeErr, "the simulated upgrade must be written")
 	require.NotNil(t, up)
 
 	waitFor(t, "the replacement request", up.ReplaceRequested)

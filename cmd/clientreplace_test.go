@@ -34,9 +34,13 @@ func clientWatchForTest(t *testing.T, installed string, stderr func(string)) (*c
 		up = startClientUpgrade(ctx, writerFunc(stderr))
 		started <- up
 	}()
-	return <-started, func() {
+	up = <-started
+	return up, func() {
 		cancel()
 		<-done
+		if up != nil {
+			<-up.done
+		}
 	}
 }
 
