@@ -732,6 +732,18 @@ func (h *Hub) BrokerHealthy() (healthy bool, idleCap time.Duration) {
 	return h.brokerHealthy, h.brokerIdleCap
 }
 
+// BroadcastNotice sends one notice to every subscriber of every active
+// poller. The daemon uses it for the broker transport's outage and recovered
+// notices (issue #223), which say that a watch is served by polling for the
+// time being, and when that ended. The notice is a degraded-type update that
+// carries only its text, like the broker health notice.
+func (h *Hub) BroadcastNotice(notice string) {
+	h.broadcastAll(monitor.Event{
+		Type:   monitor.EventDegraded,
+		Notice: notice,
+	})
+}
+
 // broadcastAll fans an event out to every subscriber of every active
 // poller — used for hub-wide notices (broker health) rather than a single
 // poller's own degraded/tier-shed broadcasts.

@@ -593,6 +593,28 @@ The connection is authenticated the same way the AWS CLI is (`AWS_PROFILE`, an a
 
 An event that names a repository but no `pr_number` (check-run/check-suite events, which key off a commit SHA rather than a PR) wakes every PR this daemon is currently watching for that repository, rather than guessing which one changed.
 
+##### Transport log and outage notices
+
+The daemon records its own broker connection in `transport.jsonl` in the user cache directory, next to `coverage.json` ([#223](https://github.com/elecnix/gh-monitor/issues/223)). A daemon started detached has `/dev/null` for its standard streams, so the reconnect loop's attempts, delays and errors had nowhere else to go. Each line is one record: a connect attempt, a connected session, a session that ended with its error and the delay before the next attempt, or one of the two episode notices below. The file is capped at 1 MiB and rotated once to `transport.jsonl.1`, so a transport that fails every second cannot fill the disk. `GH_MONITOR_TRANSPORT_LOG` moves it.
+
+```jsonc
+{"at":"2026-11-10T17:04:57Z","event":"degraded","host":"abc123.iot.us-east-1.amazonaws.com","attempt":1,"error_class":"websocket-close-1006","error":"connection lost: websocket: close 1006 (abnormal closure): unexpected EOF","retry_in":"2s","since":"2026-11-10T17:04:57Z"}
+{"at":"2026-11-10T17:04:59Z","event":"connecting","host":"abc123.iot.us-east-1.amazonaws.com","attempt":2}
+```
+
+A record carries the endpoint's host, the error's class and its message. The message is redacted before it is written: any URL in it keeps its scheme and host only, and an authorization header, a bearer token or a `token=`, `signature=` or `X-Amz-*=` pair loses its value. A SigV4-presigned URL is a credential, and a connect error can quote one. Event payloads are never recorded. The same redaction applies to the degraded notice the clients receive.
+
+`gh monitor doctor` reads the log and adds the connection's state to its report: the state and how long it has held, the attempt and the delay while reconnecting, when the transport was last healthy, the last error, and whether an outage notice is open. The lines describe the daemon's own connection. A sub-daemon's connection is its own.
+
+```
+broker transport: degraded for 30s (host abc123.iot.us-east-1.amazonaws.com, attempt 8), retrying in 1m0s
+broker transport: last healthy 1h0m0s ago (2026-11-10T16:04:57Z)
+broker transport: last error 30s ago: connect: connect: network Error : dial tcp: i/o timeout
+broker transport: down for 9m0s; the watches were told and are served by polling
+```
+
+A single lost connection is normal and produces the `degraded` notice described above. A transport that stays down for two minutes is a different case, and every watch receives a second, distinct notice once per episode: how long the transport has been down, how many reconnect attempts failed, and that a comment or review posted while it is down arrives at the next poll rather than as it happens. The connection returning produces one `recovered` notice that names the episode it closes. A session reading the stream can tell "this watch is current" from "this watch is served by polling until the transport recovers" by those two notices alone.
+
 ##### Broker coverage is per-repository
 
 **A connected broker does not mean every repository is covered.** One connection carries whichever repositories your webhooks publish to it, so if your webhook is installed on one organisation, watches on repositories outside it have no wake path at all — however healthy the socket looks. Reducing or suspending their polling on the strength of the connection alone would leave them with neither a wake nor a poll, which is the failure this transport exists to prevent, not to relocate.

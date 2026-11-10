@@ -112,6 +112,10 @@ The process scan needs Linux /proc; the daemon half works anywhere.`,
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 					"warning: this shell has NOTIFY_SOCKET set but the resident daemon reports no service manager\n")
 			}
+			// The daemon's own broker connection, from the log it writes
+			// (issue #223). A sub-daemon's connection is its own and is not
+			// described here.
+			printTransport(out, transportLogPath(), info, infoErr, doctorNow())
 
 			procs, scanErr := scanWatchers()
 			if scanErr != nil {

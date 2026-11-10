@@ -656,17 +656,24 @@ func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 	h.SetBrokerCoverage(coverage)
 
 	w := broker.NewWatcher(cfg)
+	// The transport log (issue #223) is the daemon's own record of this
+	// connection: every attempt, every state change, and the outage and
+	// recovered notices. A detached daemon has nowhere else to write them.
+	tlog := openTransportLog(cmd)
+	w.OnTransition = transportObserver(h, tlog, cmd.ErrOrStderr())
 	w.OnState = func(state broker.State, err error) {
 		detail := ""
 		if err != nil {
-			detail = err.Error()
+			// The detail reaches every watching client. A connect error can
+			// quote the presigned URL, which is a credential.
+			detail = broker.Redact(err.Error())
 		}
 		h.SetBrokerHealth(state == broker.StateHealthy, detail)
 		switch state {
 		case broker.StateHealthy:
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport connected (topic %s)\n", cfg.Topic)
 		case broker.StateDegraded:
-			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport degraded (%v) — falling back to interval polling\n", err)
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport degraded (%s) — falling back to interval polling\n", detail)
 		}
 	}
 	w.OnWake = func(owner, repo string, prNumber int) {
@@ -694,9 +701,15 @@ func startBrokerTransport(ctx context.Context, cmd *cobra.Command, h *hub.Hub) {
 		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker watcher stopped: %v\n", err)
 		}
+		if tlog != nil {
+			_ = tlog.Close()
+		}
 	}()
 
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport enabled (endpoint %s, topic %s)\n", cfg.Endpoint, cfg.Topic)
+	if tlog != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "gh-monitor daemon: broker transport log at %s\n", tlog.Path())
+	}
 }
 
 func (s hubSource) Watch(ctx context.Context, t backend.Target, opts backend.WatchOptions) (<-chan backend.Update, error) {
