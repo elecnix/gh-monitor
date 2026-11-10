@@ -6,7 +6,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/elecnix/gh-monitor/internal/ghcli"
 	"github.com/elecnix/gh-monitor/internal/resolver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,7 +18,10 @@ import (
 // snapshot query, whose runs carry an id and an annotation count but no
 // bodies, and the follow-up that reads bodies for the runs it is given.
 type annotationServer struct {
-	counts    map[string]int // run id -> annotation count the snapshot reports
+	counts    map[string]int    // run id -> annotation count the REST list reports
+	status    map[string]string // run id -> status; COMPLETED when unset
+	completed map[string]string // run id -> completedAt; empty when unset
+	restErr   error             // returned by every REST read when set
 	snapshots int
 	restReads int
 	followUps [][]string // ids of each follow-up call
@@ -32,6 +37,9 @@ func dbID(id string) int64 {
 func (s *annotationServer) api() *fakeAPI {
 	return &fakeAPI{restFunc: func(method, path string, _ map[string]string, _ interface{}, result interface{}) error {
 		s.restReads++
+		if s.restErr != nil {
+			return s.restErr
+		}
 		if !strings.Contains(path, "/commits/abc/check-runs") {
 			return errors.New("unexpected REST path: " + path)
 		}
@@ -63,8 +71,13 @@ func (s *annotationServer) api() *fakeAPI {
 		s.snapshots++
 		runs := []map[string]any{}
 		for id := range s.counts {
+			status := s.status[id]
+			if status == "" {
+				status = "COMPLETED"
+			}
 			runs = append(runs, map[string]any{
-				"id": id, "databaseId": dbID(id), "name": "build-" + id, "status": "COMPLETED", "conclusion": "SUCCESS",
+				"id": id, "databaseId": dbID(id), "name": "build-" + id, "status": status, "conclusion": "SUCCESS",
+				"completedAt": s.completed[id],
 			})
 		}
 		return assign(result, map[string]any{
@@ -120,7 +133,7 @@ func TestAnnotationFollowUp_UnchangedCountsBuildNoBodyQuery(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, srv.snapshots)
 	assert.Len(t, srv.followUps, 1, "an unchanged count must not fetch bodies again")
-	assert.Equal(t, 2, srv.restReads, "one REST count read per poll")
+	assert.Equal(t, 1, srv.restReads, "an idle poll inside the TTL reads no counts over REST")
 	assert.Equal(t, []string{"t-R1"}, annotationTitles(t, second), "cached bodies still reach the snapshot")
 }
 
@@ -179,4 +192,147 @@ func TestAnnotationFollowUp_FailureFailsThePoll(t *testing.T) {
 	svc := &Service{API: api, Annotations: NewAnnotationCache()}
 	_, err := svc.FetchWithTier(&resolver.Identity{Owner: "o", Repo: "r"}, 7, TierFull)
 	assert.Error(t, err, "a failed body fetch must not read as annotations cleared")
+}
+
+// tickingCache returns a cache whose clock the test moves by hand.
+func tickingCache() (*AnnotationCache, *time.Time) {
+	clock := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	cache := NewAnnotationCache()
+	cache.now = func() time.Time { return clock }
+	return cache, &clock
+}
+
+func TestAnnotationCounts_IdlePollInsideTTLReadsNothingOverREST(t *testing.T) {
+	srv := &annotationServer{counts: map[string]int{"R1": 2}}
+	cache, clock := tickingCache()
+	svc := &Service{API: srv.api(), Annotations: cache}
+	id := &resolver.Identity{Owner: "o", Repo: "r"}
+
+	_, err := svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	require.Equal(t, 1, srv.restReads, "a run seen for the first time is read at once")
+
+	for i := 0; i < 4; i++ {
+		*clock = clock.Add(time.Minute)
+		resp, err := svc.FetchWithTier(id, 7, TierFull)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"t-R1"}, annotationTitles(t, resp), "cached counts and bodies still reach the snapshot")
+	}
+	assert.Equal(t, 1, srv.restReads, "four idle polls inside the TTL cost no REST call")
+	assert.Len(t, srv.followUps, 1)
+}
+
+func TestAnnotationCounts_RunChangeReadsCountsOnce(t *testing.T) {
+	srv := &annotationServer{counts: map[string]int{"R1": 2}, status: map[string]string{"R1": "IN_PROGRESS"}}
+	cache, clock := tickingCache()
+	svc := &Service{API: srv.api(), Annotations: cache}
+	id := &resolver.Identity{Owner: "o", Repo: "r"}
+
+	_, err := svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	require.Equal(t, 1, srv.restReads)
+
+	*clock = clock.Add(time.Second)
+	srv.status["R1"] = "COMPLETED"
+	_, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 2, srv.restReads, "a status change reads the counts once")
+
+	*clock = clock.Add(time.Second)
+	srv.completed = map[string]string{"R1": "2026-11-10T12:00:02Z"}
+	_, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 3, srv.restReads, "a completedAt change reads the counts once")
+
+	*clock = clock.Add(time.Second)
+	srv.counts["R2"] = 0
+	_, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 4, srv.restReads, "a run that appears for the first time is read at once")
+
+	*clock = clock.Add(time.Second)
+	_, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 4, srv.restReads, "the next idle poll reads nothing")
+}
+
+func TestAnnotationCounts_LateAnnotationIsReadAfterTTL(t *testing.T) {
+	srv := &annotationServer{counts: map[string]int{"R1": 0}}
+	cache, clock := tickingCache()
+	svc := &Service{API: srv.api(), Annotations: cache}
+	id := &resolver.Identity{Owner: "o", Repo: "r"}
+
+	resp, err := svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Empty(t, annotationTitles(t, resp))
+	require.Equal(t, 1, srv.restReads)
+
+	// An annotation added to a passing run after it completed: no run field
+	// changes, so only the TTL can expose it.
+	srv.counts["R1"] = 2
+	*clock = clock.Add(AnnotationCountTTL - time.Second)
+	resp, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 1, srv.restReads, "inside the TTL the cached count stands")
+	assert.Empty(t, annotationTitles(t, resp))
+
+	*clock = clock.Add(time.Second)
+	resp, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 2, srv.restReads, "the TTL expiring reads the counts once")
+	assert.Equal(t, []string{"t-R1"}, annotationTitles(t, resp))
+	assert.Len(t, srv.followUps, 1)
+}
+
+func TestAnnotationCounts_RESTFailureServesCachedCounts(t *testing.T) {
+	for name, restErr := range map[string]error{
+		"transport":     errors.New("dial tcp: connection refused"),
+		"403 exhausted": &ghcli.APIError{StatusCode: 403, Message: "API rate limit exceeded"},
+		"429":           &ghcli.APIError{StatusCode: 429, Message: "too many requests"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := &annotationServer{counts: map[string]int{"R1": 2}}
+			cache, clock := tickingCache()
+			svc := &Service{API: srv.api(), Annotations: cache}
+			id := &resolver.Identity{Owner: "o", Repo: "r"}
+
+			_, err := svc.FetchWithTier(id, 7, TierFull)
+			require.NoError(t, err)
+
+			srv.restErr = restErr
+			*clock = clock.Add(AnnotationCountTTL)
+			resp, err := svc.FetchWithTier(id, 7, TierFull)
+			require.NoError(t, err, "a failed count read must not fail the poll")
+			assert.Equal(t, 2, srv.restReads, "the read was attempted")
+			assert.Equal(t, []string{"t-R1"}, annotationTitles(t, resp), "the cached counts and bodies stand")
+			assert.Len(t, srv.followUps, 1, "cached counts need no body fetch")
+
+			// A failed read leaves nothing to cache, so the next poll reads again.
+			srv.restErr = nil
+			*clock = clock.Add(time.Second)
+			resp, err = svc.FetchWithTier(id, 7, TierFull)
+			require.NoError(t, err)
+			assert.Equal(t, 3, srv.restReads, "the read is retried once REST answers")
+			assert.Equal(t, []string{"t-R1"}, annotationTitles(t, resp))
+		})
+	}
+}
+
+func TestAnnotationCounts_RESTFailureOnFirstPollKeepsThePollAlive(t *testing.T) {
+	srv := &annotationServer{counts: map[string]int{"R1": 2}, restErr: &ghcli.APIError{StatusCode: 403}}
+	cache, clock := tickingCache()
+	svc := &Service{API: srv.api(), Annotations: cache}
+	id := &resolver.Identity{Owner: "o", Repo: "r"}
+
+	resp, err := svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err, "a spent REST budget is not a monitoring outage")
+	assert.Empty(t, annotationTitles(t, resp), "nothing is known yet")
+	assert.Empty(t, srv.followUps)
+
+	srv.restErr = nil
+	*clock = clock.Add(time.Second)
+	resp, err = svc.FetchWithTier(id, 7, TierFull)
+	require.NoError(t, err)
+	assert.Equal(t, 2, srv.restReads)
+	assert.Equal(t, []string{"t-R1"}, annotationTitles(t, resp))
 }

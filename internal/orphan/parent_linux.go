@@ -9,8 +9,9 @@ import (
 )
 
 // procParentOf reads a process's parent pid and command name from /proc. It
-// is the real ParentFunc on Linux; other platforms get the unresolvable
-// variant, which keeps the guard's previous parent-pid behaviour.
+// is the real ParentFunc on Linux; macOS reads the same through sysctl, and
+// other platforms get the unresolvable variant, which keeps the guard's
+// previous parent-pid behaviour.
 func procParentOf(pid int) (int, string, bool) {
 	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err == nil {

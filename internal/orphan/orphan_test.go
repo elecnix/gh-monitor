@@ -207,3 +207,116 @@ func TestLauncherPIDIsReadable(t *testing.T) {
 		t.Fatalf("LauncherPID = %d, want a positive pid", got)
 	}
 }
+
+// TestResolveLauncherChainEndingAtInit is the shape of a leaked watch after
+// its session exited: the wrapper was reparented to init, so the walk ends
+// there. Init is not a launcher that can exit, so the walk must report the
+// launcher as gone rather than as a pid to wait on forever.
+func TestResolveLauncherChainEndingAtInit(t *testing.T) {
+	for _, initComm := range []string{"launchd", "systemd", "init"} {
+		tree := map[int]struct {
+			ppid int
+			comm string
+		}{
+			100: {200, "gh-monitor"},
+			200: {1, "gh"},
+			1:   {0, initComm},
+		}
+		parentOf := func(pid int) (int, string, bool) {
+			e, ok := tree[pid]
+			return e.ppid, e.comm, ok
+		}
+		if got := ResolveLauncher(100, parentOf); got != LauncherGone {
+			t.Fatalf("ResolveLauncher = %d under %s, want LauncherGone", got, initComm)
+		}
+	}
+}
+
+// TestResolveLauncherUninspectableInitIsGone covers a hardened /proc where
+// pid 1 cannot be read: it is still init, so the launcher is still gone.
+func TestResolveLauncherUninspectableInitIsGone(t *testing.T) {
+	parentOf := func(pid int) (int, string, bool) {
+		switch pid {
+		case 100:
+			return 200, "gh-monitor", true
+		case 200:
+			return 1, "gh", true
+		}
+		return 0, "", false
+	}
+	if got := ResolveLauncher(100, parentOf); got != LauncherGone {
+		t.Fatalf("ResolveLauncher = %d, want LauncherGone when init cannot be inspected", got)
+	}
+}
+
+// TestResolveLauncherContainerEntrypointIsAlive pins the container case: the
+// pid 1 of a namespace that started the watch itself is a live launcher,
+// whether it is the entrypoint shell or agent, or tini under `docker run
+// --init`, which spawns the command rather than adopting it. Its exit ends
+// the namespace, so the guard waits on it like any other launcher instead of
+// stopping the watch at once.
+func TestResolveLauncherContainerEntrypointIsAlive(t *testing.T) {
+	for _, entry := range []string{"sh", "bash", "node", "tini", "docker-init", "dumb-init"} {
+		tree := map[int]struct {
+			ppid int
+			comm string
+		}{
+			100: {200, "gh-monitor"},
+			200: {1, "gh"},
+			1:   {0, entry},
+		}
+		parentOf := func(pid int) (int, string, bool) {
+			e, ok := tree[pid]
+			return e.ppid, e.comm, ok
+		}
+		if got := ResolveLauncher(100, parentOf); got != 1 {
+			t.Fatalf("ResolveLauncher = %d under entrypoint %s, want the live pid 1", got, entry)
+		}
+	}
+}
+
+// TestGuardFiresWhenTheLauncherIsGoneAtStart pins the orphan-at-start
+// contract: a guard whose baseline is LauncherGone has already lost its
+// launcher, so it fires on its first tick.
+func TestGuardFiresWhenTheLauncherIsGoneAtStart(t *testing.T) {
+	g := New(20*time.Millisecond, func() int { return LauncherGone }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not fire for a launcher that is already gone")
+	}
+	assertEqual(t, "launcher gone", g.String())
+}
+
+// TestGuardDoesNotFireOnALivePidOne pins the container case end to end: a
+// launcher that is pid 1 and alive is an ordinary stable baseline.
+func TestGuardDoesNotFireOnALivePidOne(t *testing.T) {
+	g := New(20*time.Millisecond, func() int { return 1 }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+		t.Fatal("guard fired on a live launcher that happens to be pid 1")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestGuardFiresWhenReparentedToInit covers the walk's view after the session
+// exits: the resolved launcher goes from the session's pid to gone.
+func TestGuardFiresWhenReparentedToInit(t *testing.T) {
+	var current atomic.Int64
+	current.Store(300)
+	g := New(20*time.Millisecond, func() int { return int(current.Load()) }).Start()
+	defer g.Stop()
+	select {
+	case <-g.Done():
+		t.Fatal("guard fired while the launcher was alive")
+	case <-time.After(100 * time.Millisecond):
+	}
+	current.Store(LauncherGone)
+	select {
+	case <-g.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("guard did not fire after init adopted the wrapper")
+	}
+}
