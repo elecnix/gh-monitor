@@ -232,7 +232,7 @@ The `owner/repo#number` shorthand is the same cross-reference form GitHub's own 
 
 A monitor that outlives the process that started it polls a finished pull request forever, and a pile of such monitors shares one API budget with the sessions that are still alive ([#129](https://github.com/elecnix/gh-monitor/issues/129)). Two safeguards close that gap, both on by default:
 
-- **The orphan guard.** A continuous watch polls `os.Getppid()` every 5 seconds against the parent pid it captured at start. When the launcher exits, the OS reparents the watch (to `init`, `launchd`, or the user service manager), the pid changes, and the watch ends the way a Ctrl-C ends it: exit 0, no error, no notification. This reads one integer per tick and never touches the network. Set `GH_MONITOR_ORPHAN_GUARD=0` to opt out, the same convention as `GH_MONITOR_REEXEC`.
+- **The orphan guard.** A continuous watch resolves its launcher every 5 seconds and compares it with the one it captured at start. The launcher is the first ancestor that is not a wrapper: `gh` forks the extension and waits for it, so the watch's own parent never changes, and the walk looks past it to the shell, editor or agent that asked for the watch. The walk reads `/proc` on Linux and the `kern.proc.pid` sysctl on macOS. When the launcher exits, the OS reparents the wrapper (to `init`, `launchd`, or the user service manager), the resolved pid changes, and the watch ends the way a Ctrl-C ends it: exit 0, no error, no notification. A launcher that resolves to pid 1 has already exited, so a watch that starts or is found in that state ends on its next tick. The guard never touches the network. Set `GH_MONITOR_ORPHAN_GUARD=0` to opt out, the same convention as `GH_MONITOR_REEXEC`.
 - **A dead output consumer ends the watch.** A watch whose stdout is a pipe with no reader gets `EPIPE` on its next notification; the watch treats that failed write as its exit and returns an error (exit 1) instead of streaming into the void. A caller that keeps reading is unaffected.
 
 `--timeout <seconds>` remains the way to bound a watch's lifetime explicitly; the orphan guard covers the case where no bound was passed and the launcher disappeared.
@@ -292,6 +292,8 @@ the checks here are lint, dupdelta. Fix --annotation-checks or the annotationChe
 It is said once per watch, not every poll, and `none` is not reported — a deliberate mute is not a typo.
 
 Both filters are applied when the snapshot is built, not when the event is emitted, so a filtered-out annotation never reaches the diff and never re-fires as "new" on a later poll.
+
+The snapshot query carries no annotation counts, so the daemon reads them over REST from the commit's check runs. It reads when a run appears, changes status or conclusion, or completes, and otherwise once every five minutes, so an idle target costs at most 12 REST calls an hour instead of one per poll. A late annotation on a run that already completed is reported within five minutes. A count read that fails, including a 403 or 429 for a spent REST budget, keeps the previous counts and the watch alive, and the next poll reads again.
 
 #### Exiting when a condition fires with `--until`
 

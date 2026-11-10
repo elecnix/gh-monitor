@@ -32,10 +32,12 @@ type Service struct {
 	// snippet. Production code wires this to ghcli.Client.FailedRunLogs via cmd.
 	FailedRunLogsFn func(owner, repo string, runID int) (string, error)
 
-	// Annotations remembers the annotation bodies already read, so a poll
-	// fetches bodies only for check runs whose annotation count is new or
-	// changed. It is optional: when nil, every run that has annotations is
-	// read on every full-tier poll.
+	// Annotations remembers the annotation counts and bodies already read, so
+	// a poll reads counts over REST only when a check run changed or the last
+	// read is older than AnnotationCountTTL, and fetches bodies only for runs
+	// whose annotation count is new or changed. It is optional: when nil,
+	// every full-tier poll reads the counts and every run that has
+	// annotations.
 	Annotations *AnnotationCache
 }
 
