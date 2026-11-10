@@ -213,7 +213,7 @@ func TestLauncherPIDIsReadable(t *testing.T) {
 // there. Init is not a launcher that can exit, so the walk must report the
 // launcher as gone rather than as a pid to wait on forever.
 func TestResolveLauncherChainEndingAtInit(t *testing.T) {
-	for _, initComm := range []string{"launchd", "systemd", "init", "tini"} {
+	for _, initComm := range []string{"launchd", "systemd", "init"} {
 		tree := map[int]struct {
 			ppid int
 			comm string
@@ -249,12 +249,14 @@ func TestResolveLauncherUninspectableInitIsGone(t *testing.T) {
 	}
 }
 
-// TestResolveLauncherContainerEntrypointIsAlive pins the container case: a
-// shell or agent that is pid 1 of its namespace and started the watch itself
-// is a live launcher, and its exit ends the namespace, so the guard must wait
-// on it like any other launcher instead of stopping the watch at once.
+// TestResolveLauncherContainerEntrypointIsAlive pins the container case: the
+// pid 1 of a namespace that started the watch itself is a live launcher,
+// whether it is the entrypoint shell or agent, or tini under `docker run
+// --init`, which spawns the command rather than adopting it. Its exit ends
+// the namespace, so the guard waits on it like any other launcher instead of
+// stopping the watch at once.
 func TestResolveLauncherContainerEntrypointIsAlive(t *testing.T) {
-	for _, entry := range []string{"sh", "bash", "node"} {
+	for _, entry := range []string{"sh", "bash", "node", "tini", "docker-init", "dumb-init"} {
 		tree := map[int]struct {
 			ppid int
 			comm string
