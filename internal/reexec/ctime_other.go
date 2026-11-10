@@ -1,9 +1,9 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package reexec
 
-import "os"
+import "syscall"
 
-// changeTime returns 0: this platform's stat result is not read for an inode
-// change time, so ChangeFingerprint falls back to the Fingerprint fields.
-func changeTime(os.FileInfo) int64 { return 0 }
+// statChangeTime returns 0: this platform's stat result is not read for an
+// inode change time, so ChangeFingerprint falls back to the Fingerprint fields.
+func statChangeTime(*syscall.Stat_t) int64 { return 0 }

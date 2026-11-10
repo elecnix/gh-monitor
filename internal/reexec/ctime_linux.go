@@ -2,17 +2,7 @@
 
 package reexec
 
-import (
-	"os"
-	"syscall"
-)
+import "syscall"
 
-// changeTime returns the inode change time in nanoseconds, or 0 when the
-// platform's stat result carries none.
-func changeTime(fi os.FileInfo) int64 {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok || st == nil {
-		return 0
-	}
-	return st.Ctim.Nano()
-}
+// statChangeTime reads the inode change time, in nanoseconds.
+func statChangeTime(st *syscall.Stat_t) int64 { return st.Ctim.Nano() }
