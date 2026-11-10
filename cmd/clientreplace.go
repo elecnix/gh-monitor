@@ -102,6 +102,11 @@ type clientUpgrader struct {
 
 	mu         sync.Mutex
 	runningSum string // SHA-256 of the running image, "" until read
+	// startRaced records that the installed file changed while the start
+	// hash read it, and that the hash is not trusted as this image's content.
+	// The file changed after this process started, so the next settled
+	// candidate counts as another build.
+	startRaced bool
 	baseline   string // the fingerprint this chain has already acted on
 	pending    string // a changed fingerprint seen once, not yet stable
 	unreadable string // the candidate whose read failure was reported
@@ -154,17 +159,49 @@ func startClientUpgrade(ctx context.Context, stderr io.Writer) *clientUpgrader {
 			count)
 		return nil
 	}
-	baseline, err := binaryFingerprintFn(installed)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "gh-monitor: cannot watch %s for upgrades (%v); this watch keeps serving the image it started with\n", installed, err)
-		return nil
-	}
-	u := &clientUpgrader{installed: installed, stderr: stderr, baseline: baseline}
+	u := &clientUpgrader{installed: installed, stderr: stderr}
 	if running, err := runningImageFn(); err == nil {
 		u.running = running
 	}
+	if err := u.snapshot(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "gh-monitor: cannot watch %s for upgrades (%v); this watch keeps serving the image it started with\n", installed, err)
+		return nil
+	}
 	go u.run(ctx)
 	return u
+}
+
+// snapshot records the baseline fingerprint and the running image's hash,
+// with the hash read between two stats of the installed file. When the
+// running image is the installed file itself, an upgrade that lands during the
+// hash would otherwise be recorded as this image's content, and the upgrade
+// would later compare as "same content".
+func (u *clientUpgrader) snapshot() error {
+	before, err := binaryFingerprintFn(u.installed)
+	if err != nil {
+		return err
+	}
+	u.baseline = before
+	if u.running == "" {
+		return nil
+	}
+	sum, sumErr := binarySumFn(u.running)
+	after, err := binaryFingerprintFn(u.installed)
+	if err != nil {
+		return err
+	}
+	switch {
+	case sumErr != nil:
+		// Unknown content: compareContent retries a runtime copy later and
+		// reports any other path as unconfirmed.
+	case after == before || reexec.IsRuntimeCopy(u.running):
+		// A runtime copy is never rewritten, so its hash is good even when
+		// the installed file moved during the read.
+		u.runningSum = sum
+	default:
+		u.startRaced = true
+	}
+	return nil
 }
 
 // watchContinuitySafe reports whether a watch of this kind can replace itself
@@ -192,7 +229,6 @@ func startWatchUpgrade(ctx context.Context, stderr io.Writer, kind backend.Kind,
 // on two consecutive ticks before it requests a replacement, so a file that is
 // still being written is never executed.
 func (u *clientUpgrader) run(ctx context.Context) {
-	u.hashRunningImage()
 	ticker := time.NewTicker(upgradeCheckInterval)
 	defer ticker.Stop()
 	for {
@@ -210,22 +246,6 @@ func (u *clientUpgrader) run(ctx context.Context) {
 				"gh-monitor: the installed binary changed (%s); replacing this watch between polls\n", u.installed)
 		}
 	}
-}
-
-// hashRunningImage records the running image's SHA-256 when the watch
-// starts. A failure leaves it empty, and compareContent retries it only where
-// the path cannot have been rewritten since.
-func (u *clientUpgrader) hashRunningImage() {
-	if u.running == "" {
-		return
-	}
-	sum, err := binarySumFn(u.running)
-	if err != nil {
-		return
-	}
-	u.mu.Lock()
-	u.runningSum = sum
-	u.mu.Unlock()
 }
 
 // observe folds one tick's fingerprint into the state machine and reports
@@ -271,6 +291,11 @@ func (u *clientUpgrader) observe(cur string) bool {
 // Callers hold u.mu. The running image is hashed first, so a watch that
 // cannot read its own image does not read the candidate on every tick.
 func (u *clientUpgrader) compareContent() (contentVerdict, error) {
+	if u.runningSum == "" && u.startRaced {
+		// The installed file changed after this process started, so the
+		// candidate is not the image this process runs.
+		return contentDiffers, nil
+	}
 	if u.runningSum == "" {
 		// Only a runtime copy can be read again safely: it is never rewritten.
 		// Any other path may now hold the candidate's bytes.

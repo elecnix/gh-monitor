@@ -172,3 +172,35 @@ func TestRepoWatchWithoutInstanceKeepsItsBinary(t *testing.T) {
 		assert.NotNil(t, up, "a pr watch resumes through its ResumeID, so it needs no instance")
 	})
 }
+
+// TestWatchClientUpgradeDuringStartHashStillReplaces covers a watch whose
+// running image is the installed file itself (GH_MONITOR_REEXEC=0). An
+// upgrade that lands between the baseline stat and the start hash must not be
+// recorded as this watch's own content, or the watch would call the upgrade
+// "same content" and keep serving the old build.
+func TestWatchClientUpgradeDuringStartHashStillReplaces(t *testing.T) {
+	installed := installedForTest(t, "v1")
+	orig := runningImageFn
+	runningImageFn = func() (string, error) { return installed, nil }
+	t.Cleanup(func() { runningImageFn = orig })
+	calls := captureExec(t)
+
+	var once sync.Once
+	origSum := binarySumFn
+	t.Cleanup(func() { binarySumFn = origSum })
+	binarySumFn = func(path string) (string, error) {
+		once.Do(func() {
+			// The upgrade lands just before the start hash reads the file.
+			require.NoError(t, os.WriteFile(installed, []byte("v2-with-a-longer-body"), 0o755))
+		})
+		return origSum(path)
+	}
+
+	up, stop := clientWatchForTest(t, installed, func(string) {})
+	t.Cleanup(stop)
+	require.NotNil(t, up)
+
+	waitFor(t, "the replacement request", up.ReplaceRequested)
+	up.Replace(time.Time{})
+	assert.Len(t, calls(), 1, "an upgrade that raced the start hash must still replace the watch")
+}
