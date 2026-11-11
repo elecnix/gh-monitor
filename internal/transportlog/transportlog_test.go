@@ -288,3 +288,18 @@ func TestDescribe(t *testing.T) {
 		assert.Contains(t, text, "watches were told")
 	})
 }
+
+// TestDescribeWithNoRecords pins the fix for a summary that never happened.
+// Open creates the file before the first record is written, so a fresh log
+// summarizes to a zero Summary; Doctor then rendered " for 2562047h47m16.854775807s"
+// from the zero time instead of saying there is nothing to report.
+func TestDescribeWithNoRecords(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	var s Summary
+	lines := s.Describe(now)
+	require.NotEmpty(t, lines)
+	text := strings.Join(lines, "\n")
+	assert.NotContains(t, text, "2562047h", "a zero time must not be rendered as an age")
+	assert.NotContains(t, text, " for ", "there is no state to have lasted")
+	assert.Contains(t, text, "no records", "the reader is told the log has nothing yet")
+}

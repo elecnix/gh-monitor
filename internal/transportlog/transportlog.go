@@ -289,6 +289,12 @@ func (s *Summary) apply(r Record) {
 // its "broker transport:" prefix. now is the reader's clock, for the ages.
 func (s Summary) Describe(now time.Time) []string {
 	age := func(t time.Time) string { return now.Sub(t).Round(time.Second).String() }
+	// Open creates the file before the first record is written, so an empty
+	// log summarizes to a zero Summary. Rendering it would print an empty
+	// state whose age is the zero time, which reads as 2562047h.
+	if s.State == "" {
+		return []string{"no records yet"}
+	}
 	var lines []string
 	first := fmt.Sprintf("%s for %s", s.State, age(s.Since))
 	if s.Host != "" {
