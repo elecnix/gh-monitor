@@ -56,7 +56,7 @@ func TestWaitForFreeSocketGivesUpWhileThePredecessorStays(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hold the socket: %v", err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	if _, err := waitForFreeSocket(context.Background(), path, 120*time.Millisecond, 10*time.Millisecond); err == nil {
 		t.Fatal("a socket held past the grace must return the live-daemon error, not a listener")
 	} else if !errors.Is(err, ipc.ErrLiveDaemon) {
