@@ -103,8 +103,11 @@ func Redact(msg string) string {
 	msg = redactScheme.ReplaceAllString(msg, "$1 [redacted]")
 	msg = redactPair.ReplaceAllString(msg, "$1=[redacted]")
 	if len(msg) > redactMaxLen {
+		// Step back only far enough not to split the rune at the boundary.
+		// An invalid byte earlier in the message is kept as it is: the cap
+		// is a length, not a validity check.
 		cut := redactMaxLen
-		for cut > 0 && !utf8.ValidString(msg[:cut]) {
+		for cut > redactMaxLen-utf8.UTFMax && !utf8.RuneStart(msg[cut]) {
 			cut--
 		}
 		msg = msg[:cut] + "…"

@@ -287,7 +287,12 @@ func (s *Summary) apply(r Record) {
 
 // Describe renders the summary as the lines doctor prints, each without
 // its "broker transport:" prefix. now is the reader's clock, for the ages.
+// A summary with no state, from a log with no readable record, renders as
+// one line saying so: an age computed from the zero time is not a state.
 func (s Summary) Describe(now time.Time) []string {
+	if s.State == "" {
+		return []string{"the log has no records"}
+	}
 	age := func(t time.Time) string { return now.Sub(t).Round(time.Second).String() }
 	var lines []string
 	first := fmt.Sprintf("%s for %s", s.State, age(s.Since))

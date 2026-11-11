@@ -266,6 +266,18 @@ func TestSummarize(t *testing.T) {
 
 func TestDescribe(t *testing.T) {
 	now := t0.Add(10 * time.Minute)
+	t.Run("empty log", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "transport.jsonl")
+		w, err := Open(path, DefaultMaxBytes)
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+		s, err := Summarize(path)
+		require.NoError(t, err)
+		lines := s.Describe(now)
+		require.Len(t, lines, 1)
+		assert.Equal(t, "the log has no records", lines[0])
+		assert.NotContains(t, strings.Join(lines, "\n"), "2562047h", "an age from the zero time is not a state")
+	})
 	t.Run("healthy", func(t *testing.T) {
 		s := Summary{Host: "relay.example.com", State: "healthy", Since: t0, LastHealthy: t0, LastRecord: t0}
 		lines := s.Describe(now)

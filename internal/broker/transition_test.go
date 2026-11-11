@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -371,6 +372,30 @@ func TestRedact(t *testing.T) {
 			long[i] = 'x'
 		}
 		assert.LessOrEqual(t, len(Redact(string(long))), redactMaxLen+len("…"))
+	})
+
+	t.Run("an invalid byte before the cap does not move the cut", func(t *testing.T) {
+		long := make([]byte, 600)
+		for i := range long {
+			long[i] = 'x'
+		}
+		long[10] = 0xFF
+		got := Redact(string(long))
+		assert.Equal(t, redactMaxLen+len("…"), len(got), "the cap is a length, so the cut stays at the cap")
+		assert.Equal(t, string(long[:redactMaxLen]), got[:redactMaxLen], "everything up to the cap is kept, invalid byte included")
+	})
+
+	t.Run("the cut does not split a rune", func(t *testing.T) {
+		long := []byte{}
+		for len(long) < 600 {
+			long = append(long, "é"...) // two bytes each
+		}
+		// redactMaxLen is even, so the boundary falls between runes; shift
+		// it by one so the cap lands inside a rune.
+		long = append([]byte{'a'}, long...)
+		got := Redact(string(long))
+		assert.True(t, utf8.ValidString(got), "the cut must not leave half a rune")
+		assert.GreaterOrEqual(t, len(got), redactMaxLen-utf8.UTFMax+len("…"))
 	})
 }
 
