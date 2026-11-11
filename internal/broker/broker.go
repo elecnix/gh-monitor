@@ -189,6 +189,13 @@ type Watcher struct {
 	// the event carries none); the caller decides what to refresh.
 	OnWake func(owner, repo string, prNumber int)
 
+	// OnTransition is called for every connect attempt, every state change,
+	// and the two episode notices (outage and recovered), in the form the
+	// daemon's transport log records (issue #223). Calls are serialized:
+	// the outage timer and the reconnect loop never deliver one at the same
+	// time. OnState, when set, is called first for the state changes.
+	OnTransition func(Transition)
+
 	// initialBackoff, maxBackoff, and stableAfter tune the reconnect loop.
 	// Zero values fall back to the production defaults (see Run); tests
 	// override them directly (same package) to keep the reconnect state
@@ -196,6 +203,29 @@ type Watcher struct {
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 	stableAfter    time.Duration
+
+	// outageAfter is how long the transport may stay down before the
+	// watcher raises one outage transition for the episode. Zero means
+	// defaultOutageAfter.
+	outageAfter time.Duration
+
+	// now and startTimer are the clock. Tests replace them so a record's
+	// timestamp and the outage threshold are decisions the test makes.
+	now        func() time.Time
+	startTimer func(time.Duration, func()) (stop func())
+
+	// mu guards the episode: the fields below are read by the reconnect
+	// loop and by the outage timer's goroutine.
+	mu sync.Mutex
+	// downSince is when the current episode began, zero while healthy or
+	// before the first failure.
+	downSince time.Time
+	// failures counts the attempts that failed in the current episode.
+	failures int
+	// outageOpen is set once the episode's outage transition was raised.
+	outageOpen bool
+	// stopOutage disarms the episode's outage timer.
+	stopOutage func()
 }
 
 // NewWatcher creates a Watcher wired to the real MQTT/SigV4 connection.
@@ -207,7 +237,29 @@ const (
 	defaultInitialBackoff = time.Second
 	defaultMaxBackoff     = 60 * time.Second
 	defaultStableAfter    = 5 * time.Minute
+	// defaultOutageAfter is the outage threshold: a transport down this long
+	// has retried several times under the default backoff (the delays sum
+	// past a minute after six failures), so the episode is a sustained one
+	// and the watches get told (issue #223).
+	defaultOutageAfter = 2 * time.Minute
 )
+
+// clock returns the watcher's time source.
+func (w *Watcher) clock() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
+}
+
+// timer arms a one-shot timer through the watcher's clock.
+func (w *Watcher) timer(d time.Duration, fn func()) func() {
+	if w.startTimer != nil {
+		return w.startTimer(d, fn)
+	}
+	t := time.AfterFunc(d, fn)
+	return func() { t.Stop() }
+}
 
 // Run connects, reconnects with exponential backoff on loss, and blocks
 // until ctx is cancelled, returning ctx.Err(). Every state transition is
@@ -235,17 +287,28 @@ func (w *Watcher) Run(ctx context.Context) error {
 		stableAfter = defaultStableAfter
 	}
 
+	outageAfter := w.outageAfter
+	if outageAfter <= 0 {
+		outageAfter = defaultOutageAfter
+	}
+	host := w.cfg.Host()
+	defer w.disarm()
+
 	backoff := initial
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		w.setState(StateConnecting, nil)
+		w.mu.Lock()
+		w.emitLocked(Transition{Kind: TransitionConnecting, At: w.clock(), Host: host, Attempt: w.failures + 1})
+		w.mu.Unlock()
 
 		var connectedAt time.Time
 		onConnect := func() {
-			connectedAt = time.Now()
+			connectedAt = w.clock()
 			w.setState(StateHealthy, nil)
+			w.connected(connectedAt, host)
 		}
 
 		err := w.connect(ctx, w.cfg, onConnect, func(evt Event) {
@@ -264,7 +327,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 
 		w.setState(StateDegraded, err)
 
-		if !connectedAt.IsZero() && time.Since(connectedAt) >= stableAfter {
+		if !connectedAt.IsZero() && w.clock().Sub(connectedAt) >= stableAfter {
 			backoff = initial
 		} else {
 			backoff *= 2
@@ -272,6 +335,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 				backoff = maxB
 			}
 		}
+		w.failed(err, backoff, outageAfter, host)
 
 		select {
 		case <-ctx.Done():
@@ -285,6 +349,94 @@ func (w *Watcher) setState(s State, err error) {
 	if w.OnState != nil {
 		w.OnState(s, err)
 	}
+}
+
+// emitLocked delivers one transition. The caller holds w.mu, which is what
+// serializes the reconnect loop's transitions with the outage timer's.
+func (w *Watcher) emitLocked(t Transition) {
+	if w.OnTransition != nil {
+		w.OnTransition(t)
+	}
+}
+
+// failed records a session that ended or an attempt that failed. The first
+// failure after a healthy session opens an episode and arms the outage
+// timer; later failures of the same episode count attempts and leave the
+// timer alone, so the threshold is measured from the first failure.
+func (w *Watcher) failed(err error, retryIn, outageAfter time.Duration, host string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	now := w.clock()
+	w.failures++
+	if w.downSince.IsZero() {
+		w.downSince = now
+		w.stopOutage = w.timer(outageAfter, w.outage)
+	}
+	w.emitLocked(Transition{
+		Kind:    TransitionDegraded,
+		At:      now,
+		Host:    host,
+		Attempt: w.failures,
+		Err:     err,
+		RetryIn: retryIn,
+		Since:   w.downSince,
+	})
+}
+
+// outage is the outage timer's callback. It raises the episode's one outage
+// transition, unless the episode closed before the timer fired.
+func (w *Watcher) outage() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.downSince.IsZero() || w.outageOpen {
+		return
+	}
+	w.outageOpen = true
+	w.emitLocked(Transition{
+		Kind:    TransitionOutage,
+		At:      w.clock(),
+		Host:    w.cfg.Host(),
+		Attempt: w.failures,
+		Since:   w.downSince,
+	})
+}
+
+// connected records a session that subscribed. It closes the episode, if
+// one was open, and raises the recovered transition when that episode had
+// raised an outage.
+func (w *Watcher) connected(at time.Time, host string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	since, failures, wasOutage := w.downSince, w.failures, w.outageOpen
+	w.disarmLocked()
+	w.emitLocked(Transition{Kind: TransitionHealthy, At: at, Host: host})
+	if wasOutage {
+		w.emitLocked(Transition{
+			Kind:    TransitionRecovered,
+			At:      at,
+			Host:    host,
+			Attempt: failures,
+			Since:   since,
+		})
+	}
+}
+
+// disarm closes the episode and stops its timer. Run calls it on exit so a
+// timer never fires into a watcher that stopped.
+func (w *Watcher) disarm() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.disarmLocked()
+}
+
+func (w *Watcher) disarmLocked() {
+	if w.stopOutage != nil {
+		w.stopOutage()
+		w.stopOutage = nil
+	}
+	w.downSince = time.Time{}
+	w.failures = 0
+	w.outageOpen = false
 }
 
 // ---------------------------------------------------------------------------

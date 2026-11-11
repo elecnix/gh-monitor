@@ -86,6 +86,14 @@ Practical consequences when debugging or extending the daemon:
   anything) and one `hub-failover` record per watch that fell back from a
   sub-daemon to the hub. A log of delivered updates alone cannot show how
   often the hub polls, or which watches gave up a sub-daemon's free serving.
+- The daemon's own broker connection is recorded in `transport.jsonl` in the
+  user cache directory ([#223](https://github.com/elecnix/gh-monitor/issues/223)):
+  one record per connect attempt, state change, outage notice and recovery,
+  written through `internal/transportlog`. `gh monitor doctor` reads it. A
+  detached daemon writes its stderr to `/dev/null`, so this file is the only
+  place a reconnect loop's attempts, delays and errors can be read after the
+  fact. Error messages go through `broker.Redact` before they are written or
+  sent to a client, because a connect error can quote the presigned URL.
 
 ## Supervision and the daemon handoff
 
