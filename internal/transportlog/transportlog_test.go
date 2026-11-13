@@ -288,3 +288,31 @@ func TestDescribe(t *testing.T) {
 		assert.Contains(t, text, "watches were told")
 	})
 }
+
+// TestDescribeWithNoRecords pins the fix for a summary that never happened.
+// Open creates the file before the first record is written, so a fresh log
+// summarizes to a zero Summary; Doctor then rendered " for 2562047h47m16.854775807s"
+// from the zero time instead of saying there is nothing to report.
+func TestDescribeWithNoRecords(t *testing.T) {
+	now := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	var s Summary
+	lines := s.Describe(now)
+	require.NotEmpty(t, lines)
+	text := strings.Join(lines, "\n")
+	assert.NotContains(t, text, "2562047h", "a zero time must not be rendered as an age")
+	assert.NotContains(t, text, " for ", "there is no state to have lasted")
+	assert.Contains(t, text, "no records", "the reader is told the log has nothing yet")
+}
+
+// TestDescribeWithRecordsButNoState pins the fix for a guard that asked the
+// wrong question: State stays empty for an outage or a recovered record on
+// its own, so a log holding only those reported "no records yet" while it
+// had records to show.
+func TestDescribeWithRecordsButNoState(t *testing.T) {
+	now := t0.Add(10 * time.Minute)
+	s := Summary{Host: "relay.example.com", DownSince: t0.Add(time.Minute), OutageOpen: true, LastRecord: t0.Add(9 * time.Minute)}
+	text := strings.Join(s.Describe(now), "\n")
+	assert.NotContains(t, text, "no records yet")
+	assert.Contains(t, text, "down for 9m")
+	assert.Contains(t, text, "watches were told")
+}

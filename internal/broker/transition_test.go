@@ -3,9 +3,11 @@ package broker
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -394,4 +396,29 @@ func TestClassify(t *testing.T) {
 			assert.Equal(t, tc.want, Classify(tc.err))
 		})
 	}
+}
+
+// TestRedactTruncatesAtTheLengthBoundaryNotAtAnEarlyBadByte pins the fix for a
+// truncation that followed the first invalid UTF-8 byte. The old loop asked
+// whether the whole prefix was valid, so one stray byte early in a long
+// message made every longer prefix invalid too, and the message was cut down
+// to that byte instead of to redactMaxLen.
+func TestRedactTruncatesAtTheLengthBoundaryNotAtAnEarlyBadByte(t *testing.T) {
+	msg := "connect: " + string([]byte{0xff}) + strings.Repeat("a", redactMaxLen*2)
+	got := Redact(msg)
+	assert.Greater(t, len(got), redactMaxLen-utf8.UTFMax,
+		"a long message keeps its length up to the boundary, whatever byte sits early in it")
+	assert.LessOrEqual(t, len(got), redactMaxLen+len("…"))
+	assert.True(t, strings.HasSuffix(got, "…"), "a truncated message is marked as truncated")
+	assert.True(t, strings.HasPrefix(got, "connect: "), "the part before the boundary survives")
+}
+
+// TestRedactDoesNotCutInTheMiddleOfARune covers the other half of the same
+// loop: a multi-byte rune that straddles redactMaxLen must not be split.
+func TestRedactDoesNotCutInTheMiddleOfARune(t *testing.T) {
+	// Pad so that a three-byte rune straddles the boundary.
+	msg := strings.Repeat("a", redactMaxLen-1) + "€" + strings.Repeat("b", 10)
+	got := Redact(msg)
+	assert.True(t, utf8.ValidString(strings.TrimSuffix(got, "…")), "the kept prefix is valid UTF-8")
+	assert.LessOrEqual(t, len(got), redactMaxLen+len("…"))
 }

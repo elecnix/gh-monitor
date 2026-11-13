@@ -289,19 +289,29 @@ func (s *Summary) apply(r Record) {
 // its "broker transport:" prefix. now is the reader's clock, for the ages.
 func (s Summary) Describe(now time.Time) []string {
 	age := func(t time.Time) string { return now.Sub(t).Round(time.Second).String() }
+	// Open creates the file before the first record is written, so an empty
+	// log summarizes to a zero Summary. Rendering it would print an empty
+	// state whose age is the zero time, which reads as 2562047h. LastRecord
+	// answers "are there any records": every parsed record sets it, while
+	// State stays empty for an outage or recovered record on its own.
+	if s.LastRecord.IsZero() {
+		return []string{"no records yet"}
+	}
 	var lines []string
-	first := fmt.Sprintf("%s for %s", s.State, age(s.Since))
-	if s.Host != "" {
-		first += " (host " + s.Host
-		if s.Attempt > 0 {
-			first += fmt.Sprintf(", attempt %d", s.Attempt)
+	if s.State != "" {
+		first := fmt.Sprintf("%s for %s", s.State, age(s.Since))
+		if s.Host != "" {
+			first += " (host " + s.Host
+			if s.Attempt > 0 {
+				first += fmt.Sprintf(", attempt %d", s.Attempt)
+			}
+			first += ")"
 		}
-		first += ")"
+		if s.Retrying && s.RetryIn > 0 && s.State == string(broker.TransitionDegraded) {
+			first += ", retrying in " + s.RetryIn.String()
+		}
+		lines = append(lines, first)
 	}
-	if s.Retrying && s.RetryIn > 0 && s.State == string(broker.TransitionDegraded) {
-		first += ", retrying in " + s.RetryIn.String()
-	}
-	lines = append(lines, first)
 	switch {
 	case s.LastHealthy.IsZero():
 		lines = append(lines, "last healthy: never")
@@ -324,6 +334,10 @@ func (s Summary) Describe(now time.Time) []string {
 	}
 	if s.LastRecord.Before(now.Add(-24 * time.Hour)) {
 		lines = append(lines, fmt.Sprintf("last record %s ago", age(s.LastRecord)))
+	}
+	if len(lines) == 0 {
+		// Records exist, but none of them reported a connection state.
+		lines = append(lines, "no connection state recorded")
 	}
 	return lines
 }

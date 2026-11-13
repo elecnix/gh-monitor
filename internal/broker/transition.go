@@ -104,7 +104,11 @@ func Redact(msg string) string {
 	msg = redactPair.ReplaceAllString(msg, "$1=[redacted]")
 	if len(msg) > redactMaxLen {
 		cut := redactMaxLen
-		for cut > 0 && !utf8.ValidString(msg[:cut]) {
+		// Step back only as far as the rune the boundary falls inside, at
+		// most utf8.UTFMax bytes. Asking whether the whole prefix is valid
+		// made one stray byte early in a long message cut it down to that
+		// byte, because no longer prefix could ever be valid.
+		for back := 0; back < utf8.UTFMax && cut > 0 && !utf8.RuneStart(msg[cut]); back++ {
 			cut--
 		}
 		msg = msg[:cut] + "…"
