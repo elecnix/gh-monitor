@@ -123,6 +123,10 @@ cgroup. The rules that follow from that:
   batch, so the reconnecting watch resumes without a second first poll. A watch
   that has nothing to report adopts the upgrade at its next batch end, and a
   chain caps its self-replacements through `GH_MONITOR_CLIENT_REPLACE_COUNT`.
+  The stat, which includes the inode change time, only finds a candidate. The
+  watch then compares SHA-256 sums of the candidate and of its own image, and
+  replaces itself only when they differ. A repo watch without `--instance`
+  never replaces itself, because its cursor exists only in memory.
 - **Socket activation outranks binding** (`internal/activation`). An activated
   socket's path belongs to the service manager: the daemon must not unlink it.
   A connect on an activated path succeeds even with no daemon running, so

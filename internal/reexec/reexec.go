@@ -426,18 +426,48 @@ func guardRuntimeDir(src, dir, base string) error {
 // What it misses is an in-place rewrite that preserves both size and mtime,
 // which only a writer forging timestamps produces (issue #216).
 func Fingerprint(path string) (string, error) {
+	return fingerprint(path, false)
+}
+
+// ChangeFingerprint is Fingerprint plus the inode change time (ctime). Any
+// write to the file moves ctime, and so does setting its mtime back, so an
+// in-place rewrite that keeps size and mtime still shows up here. Chmod,
+// chown and touch move it too, so a change it reports is only a candidate:
+// the caller confirms it with ContentSum (issue #216). It is not a copy key,
+// because a chmod must not produce a new runtime copy.
+func ChangeFingerprint(path string) (string, error) {
+	return fingerprint(path, true)
+}
+
+// fingerprint hashes the stat fields of path: size, mtime, inode and device,
+// plus the inode change time when withChangeTime is set.
+func fingerprint(path string, withChangeTime bool) (string, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("stat %s: %w", path, err)
 	}
-	inode, device := identityFields(fi)
-	h := sha256.New()
-	// A hash write cannot fail, but the check is what tells every linter —
-	// and the next reader — that nothing is being ignored here.
-	if _, err := fmt.Fprintf(h, "%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device); err != nil {
-		return "", fmt.Errorf("fingerprint %s: %w", path, err)
+	inode, device, ctime := identityFields(fi)
+	fields := fmt.Sprintf("%d:%d:%d:%d", fi.Size(), fi.ModTime().UnixNano(), inode, device)
+	if withChangeTime {
+		fields += fmt.Sprintf(":%d", ctime)
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16], nil
+	sum := sha256.Sum256([]byte(fields))
+	return hex.EncodeToString(sum[:])[:16], nil
+}
+
+// ContentSum returns the hex SHA-256 of the file at path. It reads the whole
+// file, so callers run it only once a cheaper check reported a change.
+func ContentSum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // ExecInto replaces the current process image with the executable at path,
