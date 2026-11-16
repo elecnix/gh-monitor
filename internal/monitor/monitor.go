@@ -283,6 +283,18 @@ type CheckSuite struct {
 	Status     string   `json:"status"`
 	App        AppInfo  `json:"app"`
 	CheckRuns  RunNodes `json:"checkRuns"`
+	// WorkflowRun is the Actions run that created the suite, when it has one.
+	// A run that ends in startup_failure leaves a suite with no check runs, so
+	// this is the only place the workflow's name and the run's URL survive.
+	WorkflowRun *WorkflowRunRef `json:"workflowRun,omitempty"`
+}
+
+// WorkflowRunRef names the workflow run behind a check suite.
+type WorkflowRunRef struct {
+	URL      string `json:"url"`
+	Workflow struct {
+		Name string `json:"name"`
+	} `json:"workflow"`
 }
 
 type AppInfo struct {
