@@ -52,6 +52,7 @@ const MONITOR_READINESS_QUERY = `query MonitorReadiness($owner: String!, $repo: 
                   conclusion
                   status
                   app { name slug }
+                  workflowRun { url workflow { name } }
                   checkRuns(last: 10) {
                     totalCount
                     nodes { name conclusion status startedAt completedAt }

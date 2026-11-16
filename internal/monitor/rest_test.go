@@ -246,3 +246,65 @@ func TestFetchPRViaREST_TruncatedRunsMarkTheSnapshot(t *testing.T) {
 	assert.True(t, st.TruncatedSuites, "500 of 600 runs read is an incomplete payload")
 	assert.False(t, ciAllGreen(st))
 }
+
+// TestFetchPRViaREST_StartupFailureNamesTheWorkflow: the elecnix/your-attention
+// shape (2026-11-16). Suite 118867855981 is completed, startup_failure, with no
+// check runs, beside a green suite. The suite does not name its workflow, so the
+// read asks the head commit's workflow runs, and only when such a suite exists.
+func TestFetchPRViaREST_StartupFailureNamesTheWorkflow(t *testing.T) {
+	api := checksAPI(t, []map[string]any{
+		suite(118867855981, "GitHub Actions", "github-actions", "completed", "startup_failure"),
+		suite(3, "GitHub Actions", "github-actions", "completed", "success"),
+	}, []map[string]any{actionsRun("test", 3)}, 1)
+	checks := api.restFunc
+	asked := 0
+	api.restFunc = func(method, path string, h map[string]string, b interface{}, result interface{}) error {
+		if base, _, _ := strings.Cut(path, "?"); base == "repos/o/r/actions/runs" {
+			asked++
+			assert.Contains(t, path, "head_sha=ccccccc")
+			return assign(result, map[string]any{"total_count": 2, "workflow_runs": []map[string]any{
+				{"name": "Cite review", "html_url": startupRunURL, "check_suite_id": 118867855981, "conclusion": "startup_failure"},
+				{"name": "CI", "html_url": "https://github.com/o/r/actions/runs/1", "check_suite_id": 3, "conclusion": "success"},
+			}})
+		}
+		return checks(method, path, h, b, result)
+	}
+
+	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err)
+	failing := Snapshot(pr, SnapshotOptions{}).FailingChecks
+	require.Len(t, failing, 1)
+	assert.Contains(t, failing[0], "Cite review")
+	assert.Contains(t, failing[0], startupRunURL)
+	assert.Equal(t, 1, asked)
+}
+
+// TestFetchPRViaREST_NoEmptyFailedSuiteSkipsTheRunsRead: a PR without a suite
+// that never started costs no extra request.
+func TestFetchPRViaREST_NoEmptyFailedSuiteSkipsTheRunsRead(t *testing.T) {
+	api := checksAPI(t, []map[string]any{
+		suite(3, "GitHub Actions", "github-actions", "completed", "success"),
+	}, []map[string]any{actionsRun("test", 3)}, 1)
+	_, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err) // the fake errors on any actions/runs path
+}
+
+// TestFetchPRViaREST_StartupFailureSurvivesAFailedNaming: the workflow-runs read
+// errors, and the suite is still reported, unnamed.
+func TestFetchPRViaREST_StartupFailureSurvivesAFailedNaming(t *testing.T) {
+	api := checksAPI(t, []map[string]any{
+		suite(118867855981, "GitHub Actions", "github-actions", "completed", "startup_failure"),
+	}, nil, 0)
+	checks := api.restFunc
+	api.restFunc = func(method, path string, h map[string]string, b interface{}, result interface{}) error {
+		if strings.Contains(path, "/actions/runs") {
+			return fmt.Errorf("rate limited")
+		}
+		return checks(method, path, h, b, result)
+	}
+	pr, err := (&Service{API: api}).FetchPRViaREST("o", "r", 7, knownHead())
+	require.NoError(t, err)
+	failing := Snapshot(pr, SnapshotOptions{}).FailingChecks
+	require.Len(t, failing, 1)
+	assert.Contains(t, failing[0], "never started")
+}

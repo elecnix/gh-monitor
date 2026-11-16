@@ -130,6 +130,7 @@ const monitorPRTemplate = `query MonitorPR($owner: String!, $repo: String!, $num
                 conclusion
                 status
                 app { name slug }
+                workflowRun { url workflow { name } }
                 checkRuns(last: 50) {
                   nodes { name conclusion status startedAt completedAt detailsUrl permalink
 %s
@@ -228,6 +229,7 @@ const refCommitTargetFragment = `    ref(qualifiedName: $ref) {
               conclusion
               status
               app { name slug }
+              workflowRun { url workflow { name } }
               checkRuns(last: 50) {
                 nodes { name conclusion status startedAt completedAt detailsUrl permalink
 %s
@@ -251,6 +253,7 @@ const commitObjectFragment = `    object(oid: $oid) {
             conclusion
             status
             app { name slug }
+            workflowRun { url workflow { name } }
             checkRuns(last: 50) {
               nodes { name conclusion status startedAt completedAt detailsUrl permalink
 %s

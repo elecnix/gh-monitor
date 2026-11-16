@@ -266,6 +266,50 @@ func isContainerApp(s *CheckSuite) bool {
 	return containerApps[strings.ToLower(s.App.Slug)] || containerApps[strings.ToLower(s.App.Name)]
 }
 
+// suiteNeverStarted reports whether a suite is the husk of a workflow run that
+// never started. When a run ends in startup_failure (a broken workflow file, an
+// unavailable action, a quota), GitHub creates its check suite, completes it
+// and attaches no check runs. Nothing the workflow would have posted, checks or
+// review comments, will ever arrive, and the PR rollup shows only the other
+// workflows, green (2026-11-16, elecnix/your-attention run 43908747360).
+//
+// Any app's completed suite with no runs and a STARTUP_FAILURE conclusion is
+// one. The Actions container suite is held to the same standard when it is
+// empty and failed: it is the container GitHub creates per workflow run, and a
+// failed one with nothing under it cannot have run anything. CANCELLED stays
+// out on purpose, because an empty cancelled container is a superseded attempt
+// (#96, #113). Non-container apps keep their existing rule, which already
+// reports an empty failed suite.
+func suiteNeverStarted(s *CheckSuite) bool {
+	if s.Status != "COMPLETED" || suiteHasRuns(s) {
+		return false
+	}
+	if s.Conclusion == "STARTUP_FAILURE" {
+		return true
+	}
+	return isContainerApp(s) && isFailureVerdict(s.Conclusion)
+}
+
+// neverStartedLabel is the check name reported for a suite that never started.
+// It names the workflow and the run and says what it means for the watcher. The
+// run URL is part of the name, so each run is reported once and a rerun that
+// fails again is a new report.
+func neverStartedLabel(s *CheckSuite) string {
+	name := suiteName(s)
+	url := ""
+	if wr := s.WorkflowRun; wr != nil {
+		if wr.Workflow.Name != "" {
+			name = wr.Workflow.Name
+		}
+		url = wr.URL
+	}
+	label := name + " (workflow never started: startup_failure, so its checks and comments will not arrive"
+	if url != "" {
+		label += "; run " + url
+	}
+	return label + ")"
+}
+
 // ---------------------------------------------------------------------------
 // The five classifiers
 // ---------------------------------------------------------------------------
@@ -288,6 +332,9 @@ type verdictPredicates struct {
 	// fallback classifies a run's conclusion when the name has no verdict at
 	// all. Deliberately distinct from verdict.
 	fallback func(string) bool
+	// neverStarted claims a workflow run that ended before it created any check
+	// run. It is a failure, and only a failure: no side reads it as success.
+	neverStarted bool
 }
 
 // failingPredicates classify the red side of the mirror.
@@ -305,6 +352,7 @@ var verdictPredicateTable = []struct {
 		commitState:     func(s string) bool { return failureCommitStates[s] },
 		verdict:         isFailureVerdict,
 		fallback:        isFailureConclusion,
+		neverStarted:    true,
 	}},
 	{"success", verdictPredicates{
 		suiteConclusion: isSuccessConclusion,
@@ -353,6 +401,9 @@ func classifiedChecks(v HeadCommitView, p verdictPredicates) []string {
 			// suite is not a check at all (see suiteCarriesRuns).
 			if p.suiteConclusion(suite.Conclusion) && !suiteCarriesRuns(suite) && !isContainerApp(suite) {
 				add(suiteName(suite))
+			}
+			if p.neverStarted && suiteNeverStarted(suite) {
+				add(neverStartedLabel(suite))
 			}
 			for _, run := range suite.CheckRuns.Nodes {
 				name := run.Name

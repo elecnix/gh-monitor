@@ -74,6 +74,17 @@ type restCheckSuite struct {
 	} `json:"app"`
 }
 
+// restWorkflowRuns is the workflow-runs listing of one commit. It is read only
+// to name a suite that never started, which carries no check runs to name it.
+type restWorkflowRuns struct {
+	TotalCount   int `json:"total_count"`
+	WorkflowRuns []struct {
+		Name         string `json:"name"`
+		HTMLURL      string `json:"html_url"`
+		CheckSuiteID int64  `json:"check_suite_id"`
+	} `json:"workflow_runs"`
+}
+
 type restCombinedStatus struct {
 	Statuses []struct {
 		State       string `json:"state"`
@@ -268,6 +279,9 @@ func (s *Service) restCheckSuites(owner, repo, sha string) (SuiteNodes, error) {
 	for i := range out.Nodes {
 		out.Nodes[i].CheckRuns.TotalCount = len(out.Nodes[i].CheckRuns.Nodes)
 	}
+	// Naming is best effort: the suite is reported either way, and this read is
+	// the rate-limit fallback, so a failure here must not sink the whole read.
+	_ = s.nameStartupFailures(owner, repo, sha, &out, index)
 	out.TotalCount = len(out.Nodes)
 	if suitesTotal > out.TotalCount {
 		out.TotalCount = suitesTotal
@@ -277,6 +291,44 @@ func (s *Service) restCheckSuites(owner, repo, sha string) (SuiteNodes, error) {
 		out.TotalCount = len(out.Nodes) + 1
 	}
 	return out, nil
+}
+
+// nameStartupFailures attaches the workflow run to each suite that never
+// started. A suite does not name its workflow, and without runs it has nothing
+// else to name it by, so the commit's workflow runs are read, once, and only
+// when such a suite exists. A suite the listing does not cover is still
+// reported, unnamed. The read stops at maxCheckPages like the others.
+func (s *Service) nameStartupFailures(owner, repo, sha string, out *SuiteNodes, index map[int64]int) error {
+	wanted := map[int64]int{}
+	for id, i := range index {
+		if suiteNeverStarted(&out.Nodes[i]) {
+			wanted[id] = i
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	read := 0
+	for page := 1; page <= maxCheckPages && len(wanted) > 0; page++ {
+		var resp restWorkflowRuns
+		path := fmt.Sprintf("repos/%s/%s/actions/runs?head_sha=%s&per_page=100&page=%d", owner, repo, sha, page)
+		if err := s.API.REST("GET", path, nil, nil, &resp); err != nil {
+			return fmt.Errorf("read workflow runs over REST: %w", err)
+		}
+		for _, r := range resp.WorkflowRuns {
+			if i, ok := wanted[r.CheckSuiteID]; ok {
+				ref := &WorkflowRunRef{URL: r.HTMLURL}
+				ref.Workflow.Name = r.Name
+				out.Nodes[i].WorkflowRun = ref
+				delete(wanted, r.CheckSuiteID)
+			}
+		}
+		read += len(resp.WorkflowRuns)
+		if len(resp.WorkflowRuns) == 0 || read >= resp.TotalCount {
+			break
+		}
+	}
+	return nil
 }
 
 // headCommit returns the head commit of a PR payload, if it has one.
