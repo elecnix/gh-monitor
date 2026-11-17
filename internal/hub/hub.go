@@ -871,6 +871,11 @@ type kindTraits struct {
 	// tiered reports whether the kind's fetch honours query tiers.
 	tiered bool
 
+	// inFlight, when non-nil, reports whether what the last fetch produced
+	// shows work that has not finished: a check on the head commit, or the
+	// workflow run itself. A kind without checks leaves it nil.
+	inFlight func(fetched any) bool
+
 	// cursorOf, when non-nil, extracts the opaque resume token an update
 	// should carry so the client can persist its cursor (repo targets:
 	// the latest createdAt in the response).
@@ -966,6 +971,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 			consumer:    refCommitConsumer,
 			fingerprint: fingerprintRefResp,
 			tiered:      true,
+			inFlight:    refChecksInFlight,
 		}
 	case backend.KindCommit:
 		return kindTraits{
@@ -973,6 +979,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 			consumer:    refCommitConsumer,
 			fingerprint: fingerprintCommitResp,
 			tiered:      true,
+			inFlight:    commitChecksInFlight,
 		}
 	case backend.KindIssue:
 		return kindTraits{
@@ -997,6 +1004,7 @@ func traitsFor(kind backend.Kind) kindTraits {
 				return newHandle(c, "")
 			},
 			fingerprint: fingerprintRunStatus,
+			inFlight:    runInFlight,
 		}
 	case backend.KindRepo:
 		return kindTraits{
@@ -1014,7 +1022,8 @@ func traitsFor(kind backend.Kind) kindTraits {
 			fingerprint: func(raw any) string {
 				return monitor.Fingerprint(raw.(*monitor.PullRequest))
 			},
-			tiered: true,
+			tiered:   true,
+			inFlight: prChecksInFlight,
 		}
 	}
 }
@@ -1126,6 +1135,36 @@ func fingerprintRunStatus(fetched any) string {
 
 func fingerprintRepoResp(raw any) string {
 	return monitor.FingerprintRepo(monitor.SnapshotRepo(raw.(*monitor.RepoQueryResponse)))
+}
+
+// The inFlight traits adapt each kind's payload to the one definition of a
+// check in flight, monitor.ChecksInFlight, through the adapters the verdict
+// already uses. A response that found no ref or no commit has no checks.
+
+func prChecksInFlight(raw any) bool {
+	return monitor.ChecksInFlight(monitor.HeadCommitViewOf(raw.(*monitor.PullRequest)))
+}
+
+func refChecksInFlight(raw any) bool {
+	ref := raw.(*monitor.RefQueryResponse).Repository.Ref
+	if ref == nil {
+		return false
+	}
+	return monitor.ChecksInFlight(monitor.HeadCommitViewOfSuites(ref.Target.CheckSuites, ref.Target.Status))
+}
+
+func commitChecksInFlight(raw any) bool {
+	c := raw.(*monitor.CommitQueryResponse).Repository.Object
+	if c == nil {
+		return false
+	}
+	return monitor.ChecksInFlight(monitor.HeadCommitViewOfSuites(c.CheckSuites, c.Status))
+}
+
+// runInFlight reports a workflow run that has not completed. The run fetch
+// ships the distilled status (issue #140), so that is what is read.
+func runInFlight(fetched any) bool {
+	return !fetched.(*monitor.RunStatus).IsTerminal()
 }
 
 // repoCursor extracts the opaque resume token a repo update carries: the
@@ -1353,10 +1392,15 @@ func (p *poller) nextDelay() time.Duration {
 	// the in-process loops did: the error backoff dominates the idle backoff
 	// until a fetch succeeds again, so a hard-down GitHub is polled at
 	// doubling delays up to the same 300s ceiling rather than at full rate.
+	// A target with work in flight is exempt: see retryAtBaseIntervalLocked.
 	p.mu.Lock()
 	errBackoff := p.errBackoff
+	retryAtBase := p.retryAtBaseIntervalLocked()
 	p.mu.Unlock()
-	if errBackoff > d {
+	switch {
+	case retryAtBase:
+		d = monitor.Jittered(interval)
+	case errBackoff > d:
 		d = monitor.Jittered(errBackoff)
 	}
 	if p.budget != nil {
@@ -1375,6 +1419,28 @@ func (p *poller) nextDelay() time.Duration {
 		}
 	}
 	return d
+}
+
+// retryAtBaseIntervalLocked reports whether a failed fetch must be retried at
+// the poller's base interval, with the error backoff set aside. It is true
+// while fetches are failing and the last successful snapshot shows checks, or
+// a workflow run, still in flight (issue #231).
+//
+// A target with checks in flight is the one thing a watcher is guaranteed to
+// be waiting on, so a failing GitHub must not hide it. A failed fetch leaves
+// the snapshot as it was, so the poller cannot see that the checks have since
+// finished, and each further failure would double the wait before it looks
+// again, up to 300s. A target with nothing in flight keeps that ceiling.
+//
+// The rule replaces the error backoff and the idle backoff only. The budget
+// pace is applied after it in nextDelay and may still stretch the wait, and
+// grantTurn still spaces the fetches: a spent budget is a wait GitHub imposes,
+// which a retry cannot shorten. The caller holds p.mu.
+func (p *poller) retryAtBaseIntervalLocked() bool {
+	if p.errBackoff <= 0 || p.latest == nil || p.traits.inFlight == nil {
+		return false
+	}
+	return p.traits.inFlight(p.latest)
 }
 
 // paceInterval returns the per-poller interval the shared GraphQL budget

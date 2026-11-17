@@ -493,6 +493,31 @@ func pendingChecks(v HeadCommitView) []string {
 	return out
 }
 
+// ChecksInFlight reports whether the view carries a check that has not
+// finished: a check run in any CheckStatusState except COMPLETED, a pending
+// suite that has runs, or an old-style status context in PENDING or EXPECTED.
+//
+// It reads "pending" from the same tables and the same suite rule as
+// pendingChecks, so a caller that only needs the yes-or-no answer cannot hold
+// a different definition from the verdict. The run loop exists because the
+// verdict reports pending work per suite, and a rerun can start a run under a
+// suite whose own status still reads COMPLETED.
+func ChecksInFlight(v HeadCommitView) bool {
+	if len(pendingChecks(v)) > 0 {
+		return true
+	}
+	for _, c := range v.Commits {
+		for j := range c.Suites.Nodes {
+			for _, run := range c.Suites.Nodes[j].CheckRuns.Nodes {
+				if isPendingStatus(run.Status) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // truncatedSuites reports whether the check-suites payload was truncated —
 // the API reported more suites than were returned in nodes. When true, the
 // verdict is degraded: awaiting checks may report checks as absent that
