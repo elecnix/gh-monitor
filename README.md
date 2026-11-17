@@ -299,6 +299,8 @@ The snapshot query carries no annotation counts, so the daemon reads them over R
 
 `--events` shapes what is streamed; `--until` turns the watch itself into an await: it takes the same comma-separated set of event kinds (validated identically, so a typo fails loudly) and ends the watch the FIRST time any member fires — any member, not all of them. The triggering event is always written to stdout before exiting, even when `--events` would have suppressed it, so the caller can tell what woke the watch.
 
+An await waits for a change. A watch with no stored position announces the target's current state on its first poll, and that announcement never satisfies `--until`: a fresh `--until ci-all-green` on an already-green pull request keeps watching rather than exiting on the state it started in. A watch restored from a named `--instance` cursor has a real baseline, so a change in its first batch does satisfy `--until`. When the question is "is it green right now", read once instead of waiting.
+
 ```sh
 # Wake as soon as CI turns all green or starts failing, for at most 30 minutes:
 gh monitor -R owner/repo 42 --until ci-all-green,new-failing-checks --timeout 1800
