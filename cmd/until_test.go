@@ -143,9 +143,10 @@ func TestMonitorUntilNotMetWhenStreamCoversNoMember(t *testing.T) {
 	require.ErrorIs(t, err, errUntilNotMet)
 }
 
-// TestMonitorUntilAlreadyGreenPRExitsZero pins the already-green interaction:
-// a green PR emits ci-all-green on the first poll, so --until ci-all-green
-// exits 0 almost immediately instead of waiting for a timeout.
+// TestMonitorUntilAlreadyGreenPRExitsZero pins the --once interaction: a
+// --once read asks for the current state, so the ci-all-green its one poll
+// reports for a green PR satisfies --until ci-all-green. A continuous watch
+// ignores that replay (issue #232).
 func TestMonitorUntilAlreadyGreenPRExitsZero(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("GH_HOST", "")
@@ -472,4 +473,118 @@ func TestMonitorUntilAnyIgnoresEventsTheEventsFilterDrops(t *testing.T) {
 func TestMonitorUntilAnyNotMetWhenTheWatchEndsFirst(t *testing.T) {
 	_, err := runUntilAny(t, untilAnyUpdates(), "--until", "any", "--events", "conflict")
 	require.ErrorIs(t, err, errUntilNotMet)
+}
+
+// firstPollReplay is the batch a watch with no baseline receives first: the
+// first-poll marker, then the state that was already true reported as an
+// event. The source marks every update but the last with More.
+func firstPollReplay(replayed backend.Event) []backend.Update {
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	return []backend.Update{
+		{Event: backend.Event{Type: backend.EventFirstPoll}, At: at, More: true},
+		{Event: replayed, At: at},
+	}
+}
+
+// replayedMembers lists the kinds issue #232 names: each is a state the first
+// poll replays, and each can also change later in the watch.
+func replayedMembers() []backend.Event {
+	return []backend.Event{
+		{Type: backend.EventCIAllGreen},
+		{Type: backend.EventNewFailingChecks, Checks: []string{"build"}},
+		{Type: backend.EventNewGeneralComments},
+	}
+}
+
+// TestMonitorUntilIgnoresTheFirstPollReplay is issue #232: a watch with no
+// baseline replays the state that was already true, and that replay must not
+// satisfy --until. The same kind reported by a later poll is a change, so it
+// ends the watch, and the batch after it never prints.
+func TestMonitorUntilIgnoresTheFirstPollReplay(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	for _, member := range replayedMembers() {
+		t.Run(string(member.Type), func(t *testing.T) {
+			updates := append(firstPollReplay(member),
+				backend.Update{Event: member, At: at},
+				// The batch after the trigger: must never be reported.
+				backend.Update{Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, At: at},
+			)
+			out, err := runUntilAny(t, updates, "--until", string(member.Type))
+			require.NoError(t, err)
+			require.Equal(t, []string{"first-poll", string(member.Type), string(member.Type)}, notificationTypes(t, out))
+		})
+	}
+}
+
+// TestMonitorUntilNotMetWhenOnlyTheReplayCarriesTheMember: a watch that ends
+// after its first-poll batch never saw a change, so it reports "the watch
+// ended first" (exit 2) even though the replay carried a member.
+func TestMonitorUntilNotMetWhenOnlyTheReplayCarriesTheMember(t *testing.T) {
+	for _, member := range replayedMembers() {
+		t.Run(string(member.Type), func(t *testing.T) {
+			out, err := runUntilAny(t, firstPollReplay(member), "--until", string(member.Type))
+			require.ErrorIs(t, err, errUntilNotMet)
+			require.Equal(t, []string{"first-poll", string(member.Type)}, notificationTypes(t, out),
+				"the replay still prints; it only stops counting toward --until")
+		})
+	}
+}
+
+// TestMonitorUntilRestoredWatchExitsOnItsFirstBatch: a watch restored from a
+// cursor has a baseline, so its source sends no first-poll and its first batch
+// is a change since the cursor. That batch satisfies --until, and it prints
+// whole before the watch ends.
+func TestMonitorUntilRestoredWatchExitsOnItsFirstBatch(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	updates := []backend.Update{
+		{Event: backend.Event{Type: backend.EventCIAllGreen}, At: at, More: true},
+		{Event: backend.Event{Type: backend.EventNewGeneralComments}, At: at},
+		// The next batch: must never be reported.
+		{Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, At: at},
+	}
+	out, err := runUntilAny(t, updates, "--until", "ci-all-green")
+	require.NoError(t, err)
+	require.Equal(t, []string{"ci-all-green", "new-general-comments"}, notificationTypes(t, out))
+}
+
+// TestMonitorUntilFirstPollNeverSatisfiesIt: first-poll reports that the watch
+// started, which is not a change, so neither naming it nor `any` ends the
+// watch on it.
+func TestMonitorUntilFirstPollNeverSatisfiesIt(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	quietFirstPoll := []backend.Update{{Event: backend.Event{Type: backend.EventFirstPoll}, At: at}}
+	for _, until := range []string{"first-poll", "any", "first-poll,ci-all-green"} {
+		t.Run(until, func(t *testing.T) {
+			out, err := runUntilAny(t, quietFirstPoll, "--until", until)
+			require.ErrorIs(t, err, errUntilNotMet)
+			require.Equal(t, []string{"first-poll"}, notificationTypes(t, out))
+		})
+	}
+}
+
+// TestMonitorUntilAnySkipsTheReplayAndExitsOnTheNextEvent: `any` waits past
+// the first-poll batch like a named member does.
+func TestMonitorUntilAnySkipsTheReplayAndExitsOnTheNextEvent(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	updates := append(firstPollReplay(backend.Event{Type: backend.EventCIAllGreen}),
+		backend.Update{Event: backend.Event{Type: backend.EventNewGeneralComments}, At: at},
+		backend.Update{Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, At: at},
+	)
+	out, err := runUntilAny(t, updates, "--until", "any")
+	require.NoError(t, err)
+	require.Equal(t, []string{"first-poll", "ci-all-green", "new-general-comments"}, notificationTypes(t, out))
+}
+
+// TestMonitorWithoutUntilPrintsEveryBatch: a watch run without --until reads
+// the stream to its end, first-poll batch included.
+func TestMonitorWithoutUntilPrintsEveryBatch(t *testing.T) {
+	at := time.Date(2026, 8, 16, 12, 5, 0, 0, time.UTC)
+	updates := append(firstPollReplay(backend.Event{Type: backend.EventCIAllGreen}),
+		backend.Update{Event: backend.Event{Type: backend.EventNewGeneralComments}, At: at},
+		backend.Update{Event: backend.Event{Type: backend.EventNewUnresolvedThreads}, At: at},
+	)
+	out, err := runUntilAny(t, updates)
+	require.NoError(t, err)
+	require.Equal(t, []string{"first-poll", "ci-all-green", "new-general-comments", "new-unresolved-threads"},
+		notificationTypes(t, out))
 }

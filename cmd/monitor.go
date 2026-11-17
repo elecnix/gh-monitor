@@ -41,7 +41,7 @@ func addMonitorFlags(cmd *cobra.Command, opts *monitorOptions) {
 	cmd.Flags().StringVar(&opts.IgnoredBots, "ignored-bots", "", "Comma-separated author logins whose general comments are ignored")
 	cmd.Flags().StringVar(&opts.Events, "events", "", "Comma-separated list of event kinds to emit (suppresses all others); omit to emit everything")
 	cmd.Flags().StringVar(&opts.Events, "only-events", "", "Alias for --events")
-	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds, or 'any' for the first event of any kind; exit 0 the first time one fires (exit 2 if the watch ends first)")
+	cmd.Flags().StringVar(&opts.Until, "until", "", "Comma-separated event kinds, or 'any' for the first event of any kind; exit 0 the first time one fires after the first poll (exit 2 if the watch ends first)")
 	cmd.Flags().StringVar(&opts.Annotations, "annotation-levels", "", "Comma-separated annotation levels to surface: notice, warning, failure, or none (default: warning,failure)")
 	cmd.Flags().StringVar(&opts.AnnotationChecks, "annotation-checks", "", "Comma-separated check names whose annotations to surface (default: every check)")
 	cmd.Flags().StringVar(&opts.AnnotationExcludeChecks, "annotation-exclude-checks", "", "Comma-separated check names whose annotations to suppress, whoever allows them")
@@ -343,7 +343,10 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// watch ends the FIRST time any member fires; the flag is applied here at
 	// the consumer loop, not in per-backend code, so it works whatever
 	// transport serves the watch — the shared-poller daemon, an external
-	// backend, or the in-process --once path.
+	// backend, or the in-process --once path. A continuous watch counts only
+	// changes: the batch its first poll opened is a replay of state that was
+	// already true, so it never satisfies the flag (issue #232, see
+	// replaying below).
 	var untilFilter *monitor.EventFilter
 	untilAny := false
 	if strings.TrimSpace(opts.Until) != "" {
@@ -589,6 +592,17 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 	// errUntilNotMet sentinel (exit code 2).
 	untilMet := false
 
+	// replaying is true inside the batch a first poll opened (issue #232). A
+	// watch with no baseline gets first-poll and then its target's current
+	// state diffed against an empty baseline, so every condition already true
+	// arrives as an event. None of that is a change, so the batch does not
+	// count toward --until, and neither does first-poll itself. The batch
+	// ends at the first update whose More is false. A watch restored from a
+	// cursor has a baseline: its source sends no first-poll, and its first
+	// batch counts. A --once read asks for the current state, so its one
+	// batch counts too.
+	replaying := false
+
 	// The client keeps its own copy of the --timeout deadline (issue #127):
 	// the daemon-side relays honour it too, but a backend whose watch
 	// machinery stopped answering the deadline — the observed case is a
@@ -664,12 +678,16 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		pendingCursor = nil
 	}
 	handleUpdate := func(u backend.Update) bool {
+		if u.Event.Type == backend.EventFirstPoll && !opts.Once {
+			replaying = true
+		}
 		if !dedup.Allow(u) {
 			// A dropped redelivery carries nothing new for the cursor, but
-			// it can close a batch whose other updates were written, and the
-			// batch a --until member fired in.
+			// it can close a batch whose other updates were written, the
+			// batch a --until member fired in, and the first-poll batch.
 			if !u.More {
 				endBatch()
+				replaying = false
 			}
 			if untilMet && !u.More {
 				return false
@@ -704,8 +722,9 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		// write failure path is the same as emit()'s: a gone consumer ends
 		// the watch here as well.
 		// `any` counts only events the --events filter lets through; a named
-		// member counts even when --events suppressed it.
-		if untilFilter != nil && (untilFilter.Allows(n.Type) || untilAny && (eventFilter == nil || eventFilter.Allows(n.Type))) {
+		// member counts even when --events suppressed it. Nothing in the
+		// first-poll batch counts.
+		if untilFilter != nil && !replaying && (untilFilter.Allows(n.Type) || untilAny && (eventFilter == nil || eventFilter.Allows(n.Type))) {
 			if !writeFailed {
 				if write(n) != nil {
 					writeFailed = true
@@ -719,10 +738,11 @@ func runMonitor(cmd *cobra.Command, opts *monitorOptions) error {
 		ackEmit(u.Event)
 		if !u.More {
 			endBatch()
+			replaying = false
 		}
 		// The watch exits at the end of the batch the member fired in, not
 		// on the member itself: the rest of that poll's batch was already
-		// fetched, and on a first poll it is the PR's backlog (issue #116).
+		// fetched, and on a --once read it is the PR's backlog (issue #116).
 		return !untilMet || u.More
 	}
 
