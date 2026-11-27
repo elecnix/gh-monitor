@@ -80,6 +80,10 @@ type Event struct {
 	// Checks holds the newly-failing check names (EventNewFailingChecks).
 	Checks []string `json:"checks,omitempty"`
 
+	// PassedChecks names the checks the read saw pass (EventCIAllGreen). A
+	// green verdict names its evidence: a check that is absent is not passed.
+	PassedChecks []string `json:"passed_checks,omitempty"`
+
 	// Threads holds the new/updated unresolved threads (EventNewUnresolvedThreads).
 	Threads []ThreadSummary `json:"threads,omitempty"`
 
@@ -91,7 +95,8 @@ type Event struct {
 	ReviewState  string `json:"review_state,omitempty"`
 	ReviewAuthor string `json:"review_author,omitempty"`
 
-	// Commit is the new head commit (EventNewCommit).
+	// Commit is the new head commit (EventNewCommit), or the head commit a
+	// green verdict belongs to (EventCIAllGreen).
 	Commit *CommitSummary `json:"commit,omitempty"`
 
 	// IssueComments holds the new issue comments (EventIssueNewComment, EventIssueMention).

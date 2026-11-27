@@ -96,7 +96,8 @@ issue-closed, issue-reopened, issue-new-comment, issue-mention, run-queued,
 run-in-progress, run-completed.
 
 Template tokens: {owner} {repo} {number} {host} {prLabel} {prUrl}
-{unresolvedThreads} {generalComments} {failingChecks} {conflict} {intervalSec}
+{unresolvedThreads} {generalComments} {failingChecks} {passedChecks}
+{passedCount} {checksReadAt} {conflict} {intervalSec}
 {reviewAuthor} {commitOid} {commitShortOid} {commitUrl} {commitAuthor}
 {commitCoauthors} {commitMessageHeadline} {issueState} {issueTitle}
 {issueComments} {runId} {runName} {runNumber} {runEvent} {runStatus}

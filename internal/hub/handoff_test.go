@@ -46,7 +46,7 @@ func TestExportRestoreResumesWithoutReplay(t *testing.T) {
 	// A short interval: if the subscriber has not yet drained the seeded
 	// snapshot when the first fetch lands, the next tick redelivers.
 	h2 := New(func(context.Context, resolver.Identity, monitor.QueryTier) (any, error) {
-		return prFixture(nil), nil
+		return prPassingFixture("ci-build"), nil
 	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h2.Stop)
 	require.NoError(t, h2.RestoreState(state))
@@ -406,7 +406,7 @@ func TestReconnectWithSameResumeIDResumesWithoutReplay(t *testing.T) {
 		if failing.Load() {
 			return prFixture([]string{"ci-build"}), nil
 		}
-		return prFixture(nil), nil
+		return prPassingFixture("ci-build"), nil
 	}, nil, 20*time.Millisecond, nil)
 	t.Cleanup(h.Stop)
 

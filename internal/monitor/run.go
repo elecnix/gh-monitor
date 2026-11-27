@@ -149,9 +149,19 @@ type Notification struct {
 	UnresolvedThreads int      `json:"unresolved_threads,omitempty"`
 	GeneralComments   int      `json:"general_comments,omitempty"`
 	FailingChecks     []string `json:"failing_checks,omitempty"`
-	CommitShortOid    string   `json:"commit_short_oid,omitempty"`
-	CommitAuthor      string   `json:"commit_author,omitempty"`
-	ReviewAuthor      string   `json:"review_author,omitempty"`
+	// PassedChecks and HeadSHA are the evidence of a ci-all-green: the checks
+	// the read saw pass, by name, and the head commit they passed on.
+	// Timestamp is when that read was made.
+	PassedChecks []string `json:"passed_checks,omitempty"`
+	HeadSHA      string   `json:"head_sha,omitempty"`
+	// GreenUnverified marks a ci-all-green that names no passed check, so
+	// nothing shows the checks were there to pass. The event is still
+	// delivered; the field and the message's "⚠ unverified" suffix say what
+	// it is worth.
+	GreenUnverified bool   `json:"green_unverified,omitempty"`
+	CommitShortOid  string `json:"commit_short_oid,omitempty"`
+	CommitAuthor    string `json:"commit_author,omitempty"`
+	ReviewAuthor    string `json:"review_author,omitempty"`
 	// Detail is a rich, self-contained body (thread/comment excerpts + hints) so
 	// a consumer can act without extra API calls (new-*-threads/comments only).
 	Detail string `json:"detail,omitempty"`
@@ -308,7 +318,11 @@ func saveIssueSnapshot(opts RunOptions, curr *IssueStatus) {
 // renderNotificationPR builds the interpolation vars, renders the template for
 // typ, and populates the structured fields relevant to the event.
 func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Event) Notification {
+	if status != nil {
+		ev = withGreenEvidence(ev, status.SuccessfulChecks, status.LastCommit)
+	}
 	vars := buildVarsPR(opts.Identity, status, ev, opts.Interval)
+	vars["checksReadAt"] = opts.now().UTC().Format(time.RFC3339)
 	msg := prefs.Interpolate(opts.Prefs.Templates[typ], vars)
 
 	// Append awaiting-checks info when present — this is not in the template
@@ -322,6 +336,7 @@ func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Even
 	if status != nil && status.TruncatedSuites {
 		msg = msg + " | ⚠ check suite list was truncated — snapshot may be incomplete"
 	}
+	msg += unverifiedGreenSuffix(ev)
 
 	n := Notification{
 		Type:      typ,
@@ -347,6 +362,8 @@ func renderNotificationPR(opts RunOptions, status *PRStatus, typ string, ev Even
 		if status != nil && status.Conflict {
 			n.Detail = "The PR has merge conflicts — they may be causing these CI failures. Resolve the conflict first."
 		}
+	case EventCIAllGreen:
+		greenFields(&n, vars, ev)
 	case EventNewUnresolvedThreads:
 		n.Detail = threadsDetail(ev.Threads)
 	case EventNewGeneralComments:
@@ -394,6 +411,7 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 	if ev.Type == EventNewFailingChecks && len(ev.Checks) > 0 {
 		vars["failingChecks"] = strings.Join(ev.Checks, ", ")
 	}
+	setGreenVars(vars, ev)
 	if ev.ReviewAuthor != "" {
 		vars["reviewAuthor"] = ev.ReviewAuthor
 	}
@@ -429,11 +447,20 @@ func buildVarsPR(id resolver.Identity, status *PRStatus, ev Event, interval time
 // ---------------------------------------------------------------------------
 
 func renderNotificationRef(opts RunOptions, status *RefStatus, typ string, ev Event) Notification {
+	if status != nil {
+		ev = withGreenEvidence(ev, status.SuccessfulChecks, CommitSummary{
+			Oid:             status.Oid,
+			ShortOid:        status.ShortOid,
+			Author:          status.Author,
+			MessageHeadline: status.MessageHeadline,
+		})
+	}
 	vars := buildVarsRef(opts.Identity, status, ev, opts.Interval)
+	vars["checksReadAt"] = opts.now().UTC().Format(time.RFC3339)
 	n := Notification{
 		Type:      typ,
 		PRLabel:   vars["prLabel"],
-		Message:   prefs.Interpolate(opts.Prefs.Templates[typ], vars),
+		Message:   prefs.Interpolate(opts.Prefs.Templates[typ], vars) + unverifiedGreenSuffix(ev),
 		Timestamp: opts.now(),
 	}
 	n.PRUrl = vars["prUrl"]
@@ -444,6 +471,8 @@ func renderNotificationRef(opts RunOptions, status *RefStatus, typ string, ev Ev
 		} else if status != nil {
 			n.FailingChecks = status.FailingChecks
 		}
+	case EventCIAllGreen:
+		greenFields(&n, vars, ev)
 	case EventNewCommit:
 		if ev.Commit != nil {
 			n.CommitShortOid = ev.Commit.ShortOid
@@ -495,6 +524,7 @@ func buildVarsRef(id resolver.Identity, status *RefStatus, ev Event, interval ti
 	if ev.Type == EventNewFailingChecks && len(ev.Checks) > 0 {
 		vars["failingChecks"] = strings.Join(ev.Checks, ", ")
 	}
+	setGreenVars(vars, ev)
 	if ev.Commit != nil {
 		setCommitVars(vars, host, id, *ev.Commit)
 	}
@@ -561,6 +591,51 @@ func issueCommentsDetail(comments []IssueCommentSummary) string {
 // ---------------------------------------------------------------------------
 // Shared commit vars
 // ---------------------------------------------------------------------------
+
+// withGreenEvidence gives a ci-all-green that names no passed check the
+// evidence of the status it was observed with. Events from this package's
+// diff always carry it; one from a sub-daemon built before issue #239 does
+// not, and its status is then the only record of what passed.
+func withGreenEvidence(ev Event, passed []string, head CommitSummary) Event {
+	if ev.Type != EventCIAllGreen || len(ev.PassedChecks) > 0 || len(passed) == 0 {
+		return ev
+	}
+	ev.PassedChecks = append([]string(nil), passed...)
+	if ev.Commit == nil && head.Oid != "" {
+		ev.Commit = &head
+	}
+	return ev
+}
+
+// unverifiedGreenSuffix flags a ci-all-green that names no passed check: it
+// says nothing failed among the checks its sender could read, which is not
+// the same as every check passing.
+func unverifiedGreenSuffix(ev Event) string {
+	if ev.Type != EventCIAllGreen || len(ev.PassedChecks) > 0 {
+		return ""
+	}
+	return " | ⚠ unverified: the sender named no passed check, so a check may be missing rather than passed"
+}
+
+// setGreenVars fills the tokens of a ci-all-green message from its evidence.
+func setGreenVars(vars map[string]string, ev Event) {
+	if ev.Type != EventCIAllGreen {
+		return
+	}
+	vars["passedChecks"] = strings.Join(ev.PassedChecks, ", ")
+	vars["passedCount"] = strconv.Itoa(len(ev.PassedChecks))
+}
+
+// greenFields copies a ci-all-green's evidence onto its notification.
+func greenFields(n *Notification, vars map[string]string, ev Event) {
+	n.PassedChecks = ev.PassedChecks
+	n.GreenUnverified = len(ev.PassedChecks) == 0
+	if ev.Commit != nil {
+		n.HeadSHA = ev.Commit.Oid
+		n.CommitShortOid = ev.Commit.ShortOid
+		n.CommitUrl = vars["commitUrl"]
+	}
+}
 
 func setCommitVars(vars map[string]string, host string, id resolver.Identity, c CommitSummary) {
 	vars["commitOid"] = c.Oid

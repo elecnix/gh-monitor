@@ -39,6 +39,9 @@ func CarryForwardShed(prev, curr *PRStatus) {
 
 // Diff returns the genuinely-new changes between prev and curr.
 //
+// It records its CI judgement on curr (MissingChecks, GreenWithheld), so curr
+// must be the caller's own snapshot and becomes the next call's prev.
+//
 // First-poll semantics (documented decision): when prev is nil the call is a
 // baseline — it establishes state and emits NO events. This mirrors pi's "first
 // poll learns state silently" for the commit oid and review decision, and
@@ -124,11 +127,14 @@ func diffImpl(prev *PRStatus, curr *PRStatus, retrigger bool) []Event {
 		events = append(events, Event{Type: EventNewFailingChecks, Checks: newFailing})
 	}
 
-	// CI went fully green: prev had work in flight or failing, curr has none.
-	prevHadWork := len(prev.FailingChecks) > 0 || len(prev.PendingChecks) > 0 || len(prev.AwaitingChecks) > 0 || prev.RulesetError != "" || prev.TruncatedSuites
-	currClean := len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0 && len(curr.AwaitingChecks) == 0 && curr.RulesetError == "" && !curr.TruncatedSuites
-	if prevHadWork && currClean {
-		events = append(events, Event{Type: EventCIAllGreen})
+	// CI went green: prev had work in flight, or owed a green it withheld, and
+	// curr shows passed checks on a head an earlier read already saw, with no
+	// check missing (issue #239). The judgement is recorded on curr, so the
+	// next diff knows what this one withheld.
+	j := judgeGreen(prCIView(prev), prCIView(curr))
+	curr.MissingChecks, curr.GreenWithheld = j.missing, j.withheld
+	if j.green {
+		events = append(events, greenEvent(curr.SuccessfulChecks, curr.LastCommit))
 	}
 
 	// New or updated unresolved threads.
@@ -260,7 +266,8 @@ func isThreadNew(thread ThreadSummary, prevIDs map[string]bool, prevCommentIDs m
 // ---------------------------------------------------------------------------
 
 // DiffRef returns genuinely-new CI events between two ref snapshots.
-// First-poll (prev == nil) is silent.
+// First-poll (prev == nil) is silent. Like Diff, it records its CI judgement
+// on curr.
 func DiffRef(prev *RefStatus, curr *RefStatus) []Event {
 	if prev == nil || curr == nil {
 		return nil
@@ -273,11 +280,16 @@ func DiffRef(prev *RefStatus, curr *RefStatus) []Event {
 		events = append(events, Event{Type: EventNewFailingChecks, Checks: newFailing})
 	}
 
-	// CI all green.
-	prevHadWork := len(prev.FailingChecks) > 0 || len(prev.PendingChecks) > 0
-	currClean := len(curr.FailingChecks) == 0 && len(curr.PendingChecks) == 0
-	if prevHadWork && currClean {
-		events = append(events, Event{Type: EventCIAllGreen})
+	// CI all green, by the same rule as a pull request (issue #239).
+	j := judgeGreen(refCIView(prev), refCIView(curr))
+	curr.MissingChecks, curr.GreenWithheld = j.missing, j.withheld
+	if j.green {
+		events = append(events, greenEvent(curr.SuccessfulChecks, CommitSummary{
+			Oid:             curr.Oid,
+			ShortOid:        curr.ShortOid,
+			Author:          curr.Author,
+			MessageHeadline: curr.MessageHeadline,
+		}))
 	}
 
 	// New commit (OID changed).

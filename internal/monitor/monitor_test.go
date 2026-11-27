@@ -1400,7 +1400,7 @@ func TestDiff_AwaitingChecksPreventsCIAllGreen(t *testing.T) {
 
 	t.Run("clearing awaiting checks enables green transition", func(t *testing.T) {
 		prev := &PRStatus{AwaitingChecks: []string{"security-scan"}}
-		curr := &PRStatus{}
+		curr := &PRStatus{SuccessfulChecks: []string{"security-scan"}}
 		events := Diff(prev, curr)
 		assert.NotNil(t, findEvent(events, EventCIAllGreen),
 			"ci-all-green must fire when awaiting checks clear")

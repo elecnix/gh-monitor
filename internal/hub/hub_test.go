@@ -51,6 +51,20 @@ func prFixture(failing []string) *monitor.PullRequest {
 	}
 }
 
+// prPassingFixture builds an open PR whose named check runs all finished
+// SUCCESS. It is the green that follows prFixture(failing) for the same
+// names: the failing run passed. prFixture(nil) is not that green, because
+// the run it had reported is absent, and an absent check is not a passed one
+// (issue #239).
+func prPassingFixture(passed ...string) *monitor.PullRequest {
+	pr := prFixture(nil)
+	suite := &pr.Commits.Nodes[0].Commit.CheckSuites.Nodes[0]
+	for _, name := range passed {
+		suite.CheckRuns.Nodes = append(suite.CheckRuns.Nodes, monitor.CheckRun{Name: name, Status: "COMPLETED", Conclusion: "SUCCESS"})
+	}
+	return pr
+}
+
 func testHubTarget() backend.Target {
 	return backend.Target{Kind: backend.KindPR, Owner: "o", Repo: "r", Number: 7, Host: "github.com"}
 }
@@ -215,7 +229,7 @@ func TestHub_ConsumptionByOneDoesNotSuppressAnother(t *testing.T) {
 	// Now flip CI to green and trigger one shared refresh. Each consumer
 	// diffs against its own baseline (the failing state), so both must see
 	// ci-all-green — independently.
-	current = prFixture(nil)
+	current = prPassingFixture("ci-build")
 	require.NoError(t, h.RefreshPR(monitor.IdentityOf(testHubTarget())))
 
 	gotA2 := collect(chA, 200*time.Millisecond)
