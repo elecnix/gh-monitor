@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/elecnix/gh-monitor/backend"
+	"github.com/elecnix/gh-monitor/internal/fsclock"
 	"github.com/elecnix/gh-monitor/internal/reexec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,7 +45,9 @@ func installedForTest(t *testing.T, content string) string {
 // stat fingerprint alone misses: the same file rewritten in place with the
 // same size, and its mtime set back. Device, inode, size and mtime all match
 // the baseline. The inode change time still moves, and the content check then
-// confirms the bytes differ.
+// confirms the bytes differ. The rewrite waits for the filesystem's timestamp
+// clock to tick, because a rewrite within the baseline's tick keeps its ctime
+// on a kernel with a coarse clock (issue #237).
 func TestWatchClientReplacesOnContentChangeWithSameStat(t *testing.T) {
 	installed := installedForTest(t, "v1-body")
 	runningImageForTest(t, "v1-body")
@@ -58,6 +61,7 @@ func TestWatchClientReplacesOnContentChangeWithSameStat(t *testing.T) {
 	require.NotNil(t, up)
 
 	// Same inode, same length, same mtime, different content.
+	fsclock.WaitForTimestampTick(t, installed)
 	f, err := os.OpenFile(installed, os.O_WRONLY, 0)
 	require.NoError(t, err)
 	_, err = f.WriteAt([]byte("v2-body"), 0)
