@@ -256,8 +256,8 @@ func NewRepoConsumer(opts RunOptions) *RepoConsumer {
 // ---------------------------------------------------------------------------
 
 // FingerprintRef returns a stable string covering every field DiffRef can
-// fire an event on: the head commit identity and the failing/pending check
-// lists. Two snapshots with equal fingerprints cannot produce a DiffRef
+// fire an event on: the head commit identity and the failing, pending and
+// passed check lists. Two snapshots with equal fingerprints cannot produce a DiffRef
 // event between them.
 func FingerprintRef(s *RefStatus) string {
 	if s == nil {
@@ -272,6 +272,11 @@ func FingerprintRef(s *RefStatus) string {
 	}
 	b = append(b, '|')
 	for _, p := range s.PendingChecks {
+		b = append(b, p...)
+		b = append(b, ',')
+	}
+	b = append(b, '|')
+	for _, p := range s.SuccessfulChecks {
 		b = append(b, p...)
 		b = append(b, ',')
 	}

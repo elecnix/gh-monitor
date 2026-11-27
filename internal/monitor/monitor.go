@@ -787,6 +787,15 @@ type PRStatus struct {
 	// CI-green. Empty when nothing is shed. It is the loud part of
 	// degradation: consumers can see exactly what is no longer being watched.
 	ShedSurfaces Surfaces `json:"shed_surfaces,omitempty"`
+	// MissingChecks names the checks an earlier read of this head commit
+	// listed and this read does not: a rerun or a push removed the check run
+	// and its successor does not exist yet. A missing check is not a passed
+	// one (issue #239). Diff records it.
+	MissingChecks []string `json:"missing_checks,omitempty"`
+	// GreenWithheld is the GreenWithheld* reason this read, with nothing
+	// failing or pending, was still not green. Diff records it, and the next
+	// diff reads it to know a green is owed.
+	GreenWithheld string `json:"green_withheld,omitempty"`
 }
 
 // SnapshotOptions configures snapshot building.
@@ -1017,6 +1026,12 @@ type RefStatus struct {
 	MessageHeadline string   `json:"message_headline"`
 	FailingChecks   []string `json:"failing_checks"`
 	PendingChecks   []string `json:"pending_checks"`
+	// SuccessfulChecks, ObservedChecks, MissingChecks and GreenWithheld mean
+	// what they mean on PRStatus: the evidence the green verdict rests on.
+	SuccessfulChecks []string `json:"successful_checks,omitempty"`
+	ObservedChecks   []string `json:"observed_checks,omitempty"`
+	MissingChecks    []string `json:"missing_checks,omitempty"`
+	GreenWithheld    string   `json:"green_withheld,omitempty"`
 }
 
 // SnapshotRef distills a RefTarget into a RefStatus for CI-only monitoring.
@@ -1043,6 +1058,8 @@ func SnapshotRef(ref *RefTarget) *RefStatus {
 	ci := JudgeCI(HeadCommitViewOfSuites(ref.Target.CheckSuites, ref.Target.Status), CIVerdictOptions{})
 	status.FailingChecks = ci.Failing
 	status.PendingChecks = ci.Pending
+	status.SuccessfulChecks = ci.Successful
+	status.ObservedChecks = ci.ObservedChecks
 	return status
 }
 

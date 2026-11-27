@@ -49,14 +49,20 @@ func TestRefConsumer(t *testing.T) {
 		assert.Equal(t, 1, c.NoChange())
 	})
 
-	t.Run("new commit and all-green emit after work", func(t *testing.T) {
+	t.Run("new commit, then all-green on the next read of that head", func(t *testing.T) {
 		emit, got := collectUpdates()
 		c := NewRefConsumer(RunOptions{})
 		c.Consume(mkRefStatus("aaa", []string{"lint"}, []string{"build"}), emit)
-		c.Consume(mkRefStatus("bbb", nil, nil), emit)
+		green := mkRefStatus("bbb", nil, nil)
+		green.SuccessfulChecks = []string{"lint", "build"}
+		c.Consume(green, emit)
 		types := updateTypes((*got)[2:]) // skip first-poll + initial failing
-		assert.Contains(t, types, backend.EventCIAllGreen)
 		assert.Contains(t, types, backend.EventNewCommit)
+		assert.NotContains(t, types, backend.EventCIAllGreen, "no green in the same read as a push (issue #239)")
+		again := mkRefStatus("bbb", nil, nil)
+		again.SuccessfulChecks = []string{"lint", "build"}
+		c.Consume(again, emit)
+		assert.Equal(t, backend.EventCIAllGreen, (*got)[len(*got)-1].Event.Type)
 	})
 
 	t.Run("never terminal", func(t *testing.T) {

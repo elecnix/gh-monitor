@@ -82,7 +82,7 @@ func (c *PRConsumer) Consume(curr *PRStatus, emit func(backend.Update)) (termina
 	// because prevHadWork is always false. Emit it explicitly when CI has
 	// already finished green.
 	if firstPoll && ciAllGreen(curr) {
-		emit(c.opts.update(curr, Event{Type: EventCIAllGreen}))
+		emit(c.opts.update(curr, greenEvent(curr.SuccessfulChecks, curr.LastCommit)))
 	}
 	if len(events) == 0 {
 		c.noChange++

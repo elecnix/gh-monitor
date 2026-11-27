@@ -61,12 +61,12 @@ func TestDiff_NoEventWhenSameFailing(t *testing.T) {
 func TestDiff_CIAllGreen(t *testing.T) {
 	t.Run("from failing to clean", func(t *testing.T) {
 		prev := &PRStatus{FailingChecks: []string{"CI"}}
-		curr := &PRStatus{}
+		curr := &PRStatus{SuccessfulChecks: []string{"CI"}}
 		assert.NotNil(t, findEvent(Diff(prev, curr), EventCIAllGreen))
 	})
 	t.Run("from pending to clean", func(t *testing.T) {
 		prev := &PRStatus{PendingChecks: []string{"Deploy"}}
-		curr := &PRStatus{}
+		curr := &PRStatus{SuccessfulChecks: []string{"Deploy"}}
 		assert.NotNil(t, findEvent(Diff(prev, curr), EventCIAllGreen))
 	})
 	t.Run("no transition when already clean", func(t *testing.T) {
@@ -515,7 +515,7 @@ func TestDiffRef_NewFailingChecks(t *testing.T) {
 
 func TestDiffRef_CIAllGreen(t *testing.T) {
 	prev := &RefStatus{FailingChecks: []string{"CI"}}
-	curr := &RefStatus{}
+	curr := &RefStatus{SuccessfulChecks: []string{"CI"}}
 	assert.NotNil(t, findEvent(DiffRef(prev, curr), EventCIAllGreen))
 }
 

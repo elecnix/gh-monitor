@@ -397,9 +397,18 @@ Emitted by `monitor` as one NDJSON object per line (one event per genuinely-new 
       "items": { "type": "string" },
       "description": "Newly-failing check names (new-failing-checks)"
     },
+    "passed_checks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Names of the checks the read saw pass (ci-all-green)"
+    },
+    "head_sha": {
+      "type": "string",
+      "description": "Full SHA of the head commit the green verdict belongs to (ci-all-green); `timestamp` is when its checks were read"
+    },
     "commit_short_oid": {
       "type": "string",
-      "description": "Short SHA of the new head commit (new-commit)"
+      "description": "Short SHA of the new head commit (new-commit), or of the commit a green verdict belongs to (ci-all-green)"
     },
     "commit_author": {
       "type": "string",
