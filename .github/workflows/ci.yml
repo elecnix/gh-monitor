@@ -30,25 +30,28 @@ jobs:
           version: latest
           args: --timeout=5m
 
-  # Cross-compile check: every target script/build.sh publishes.
-  # Keep this list in sync with script/build.sh (source of truth).
+  # Build every published target the way the release does: through
+  # script/build.sh, on the release's runner image, with no CGO_ENABLED in the
+  # environment. The script sets its own build settings and reads them back
+  # from each binary, so a build that would link cgo fails here (#235).
   cross-compile:
     runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - name: Cross-compile every published target
+      - name: Report the C compiler's effective target
+        # The release binary died with SIGILL because this image's gcc emitted
+        # AVX in runtime/cgo. Record what it targets by default.
         run: |
           set -euo pipefail
-          # Keep in sync with script/build.sh (source of truth).
-          for pair in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64 windows/amd64; do
-            echo "==> $pair"
-            GOOS="${pair%%/*}" GOARCH="${pair##*/}" go build ./...
-          done
+          gcc --version | head -1
+          gcc -Q --help=target | grep -E '^ +-m(arch|tune)=|^ +-mavx2? '
+          echo "AVX macros gcc defines by default:"
+          gcc -dM -E - </dev/null | grep -E '__AVX' || echo "(none)"
+      - name: Build every published target
+        run: script/build.sh
 
   # Delta-aware duplicate-code detection (https://deepwiki.com/elecnix/dupdelta):
   # scans the branch and its merge-base, and reports only the duplication this
