@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -133,6 +134,45 @@ func (d *daemonRuntime) adoptActivated(ctx context.Context, cmd *cobra.Command) 
 	return nil
 }
 
+// subdaemonSocketGrace bounds how long a child started for a sub-daemon socket
+// waits for the outgoing child to release it.
+const subdaemonSocketGrace = 30 * time.Second
+
+// subdaemonSocketPoll is the re-probe interval inside that grace.
+const subdaemonSocketPoll = 200 * time.Millisecond
+
+// isSubdaemonSocket reports whether path belongs to a supervised child rather
+// than to a resident daemon (internal/mux names them subdaemon-<name>.sock).
+func isSubdaemonSocket(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), "subdaemon-")
+}
+
+// waitForFreeSocket re-probes ipc.Listen until it binds, the grace expires, or
+// ctx is cancelled. A predecessor that is still alive is the expected case; any
+// other error is returned so the caller keeps its ordinary handling.
+func waitForFreeSocket(ctx context.Context, path string, grace, poll time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(grace)
+	var last error
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(poll):
+		}
+		l, err := ipc.Listen(path)
+		if err == nil {
+			return l, nil
+		}
+		last = err
+		if !errors.Is(err, ipc.ErrLiveDaemon) {
+			return nil, err
+		}
+		if time.Now().After(deadline) {
+			return nil, last
+		}
+	}
+}
+
 // runningVersion reports this binary's version, for the daemon's Info.
 func runningVersion() string {
 	v := version
@@ -155,6 +195,18 @@ func (d *daemonRuntime) listenOrAdopt(ctx context.Context) (net.Listener, *hub.S
 	}
 	if !errors.Is(err, ipc.ErrLiveDaemon) || ctx == nil {
 		return nil, nil, err
+	}
+	// A sub-daemon's socket outlives its parent by a moment during a restart or
+	// upgrade: the supervisor interrupts the outgoing child, which releases the
+	// socket a beat later. Handing that collision to the parent's rapid-failure
+	// budget leaves the parent with no broker child until the retry reaches the
+	// cap, so a child started for a subdaemon-* socket waits the beat out
+	// instead. The handoff protocol below stays the answer for the daemon's own
+	// socket, where both ends speak it.
+	if isSubdaemonSocket(d.socket) {
+		if waited, werr := waitForFreeSocket(ctx, d.socket, subdaemonSocketGrace, subdaemonSocketPoll); werr == nil {
+			return waited, nil, nil
+		}
 	}
 	adopted, state, aerr := handoff.Adopt(ctx, d.socket, handoff.Options{
 		BeforeFD: func(pre handoff.DaemonInfo) error {
