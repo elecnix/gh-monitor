@@ -59,8 +59,10 @@ var execIntoFn = reexec.ExecInto
 
 // binaryFingerprintFn reads the installed binary's cheap stat fingerprint.
 // It includes the inode change time, so an in-place rewrite that keeps size
-// and mtime still makes a candidate. Package variable so tests can drive ticks
-// without touching the filesystem.
+// and mtime still makes a candidate, unless the rewrite lands in the same
+// filesystem timestamp tick as the change the baseline already saw (issue
+// #237). Package variable so tests can drive ticks without touching the
+// filesystem.
 var binaryFingerprintFn = reexec.ChangeFingerprint
 
 // binarySumFn hashes a binary's content. It runs only for a candidate that

@@ -429,12 +429,16 @@ func Fingerprint(path string) (string, error) {
 	return fingerprint(path, false)
 }
 
-// ChangeFingerprint is Fingerprint plus the inode change time (ctime). Any
-// write to the file moves ctime, and so does setting its mtime back, so an
-// in-place rewrite that keeps size and mtime still shows up here. Chmod,
-// chown and touch move it too, so a change it reports is only a candidate:
-// the caller confirms it with ContentSum (issue #216). It is not a copy key,
-// because a chmod must not produce a new runtime copy.
+// ChangeFingerprint is Fingerprint plus the inode change time (ctime). A
+// write sets ctime to the filesystem's current time, and so does setting
+// mtime back, so an in-place rewrite that keeps size and mtime shows up here
+// once the filesystem's timestamp clock has ticked since the last stamp.
+// That clock is coarse: Linux before 6.13 moves it once per jiffy, 1 ms to
+// 4 ms, so a rewrite within the same tick as the previous change keeps ctime,
+// and this fingerprint misses it (issue #237). Chmod, chown and touch move
+// ctime too, so a change it reports is only a candidate: the caller confirms
+// it with ContentSum (issue #216). It is not a copy key, because a chmod must
+// not produce a new runtime copy.
 func ChangeFingerprint(path string) (string, error) {
 	return fingerprint(path, true)
 }
