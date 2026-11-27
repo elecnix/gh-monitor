@@ -1,5 +1,7 @@
 package monitor
 
+import "sort"
+
 // The green verdict (issue #239).
 //
 // "Nothing failing or pending among the checks this read could see" is not
@@ -139,9 +141,15 @@ func refCIView(s *RefStatus) *ciView {
 // read saw pass, by name, and the head commit the verdict belongs to.
 func greenEvent(passed []string, head CommitSummary) Event {
 	commit := head
+	// The rollup read can hand the names back in any order, and a map
+	// iteration upstream can vary between runs. Sort a copy so one read
+	// always renders one sentence: a message that reorders itself is a test
+	// that fails once and passes on rerun.
+	names := append([]string(nil), passed...)
+	sort.Strings(names)
 	return Event{
 		Type:         EventCIAllGreen,
-		PassedChecks: append([]string(nil), passed...),
+		PassedChecks: names,
 		Commit:       &commit,
 	}
 }
