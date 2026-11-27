@@ -196,11 +196,13 @@ func TestGreenVerdict_RenderAnEventWithoutEvidence(t *testing.T) {
 		assert.Equal(t, []string{"build"}, n.PassedChecks)
 		assert.Equal(t, "2b0aa6e1c0ffee", n.HeadSHA)
 		assert.Contains(t, n.Message, "1 checks passed (build)")
+		assert.False(t, n.GreenUnverified)
 	})
 	t.Run("says so when nothing names a passed check", func(t *testing.T) {
 		u := backend.Update{Target: target, At: greenReadAt, Event: Event{Type: EventCIAllGreen}}
 		n := Render(u, prefs.DefaultPreferences(), 0)
 		assert.Empty(t, n.PassedChecks)
+		assert.True(t, n.GreenUnverified)
 		assert.Contains(t, n.Message, "unverified")
 	})
 }

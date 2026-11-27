@@ -363,6 +363,12 @@ Whatever a backend learned, it says it in these terms. They are the same kinds
 | `degraded`                                                             | A surface could not be read — emitted per episode (entering degraded, error change, recovery), not per failed poll. Names what the failed read stopped delivering (`degraded_surfaces`) |
 | `all-clear`                                                            | Everything previously raised is resolved                                                                                                                                                |
 
+### What a `ci-all-green` must carry
+
+A backend that sends `ci-all-green` must name its evidence on the event: `passed_checks` with the checks it saw pass, and `commit` with the head commit they passed on ([#239](https://github.com/elecnix/gh-monitor/issues/239)). It sends the event only when all of these hold: nothing is failing or pending, at least one check passed, no check is missing that an earlier read of the same head listed, and the read is not the first read of a new head. The built-in rule is `judgeGreen` in `internal/monitor/greenverdict.go`. That package is internal, so a backend in another module cannot import it and has to implement the rule itself.
+
+A `ci-all-green` that arrives without `passed_checks` is still delivered. If the update's status lists passed checks, the renderer copies them onto the notification. Otherwise the notification has `green_unverified: true` and its message ends with `⚠ unverified`. To tell whether a backend predates the rule, look for `ci-all-green` notifications from it that have `green_unverified: true`, or no `passed_checks`. The daemon's event log records which backend sent each update in `source`.
+
 ## The reaction vocabulary
 
 A reaction crosses the wire as a **name**, not as an API token: `thumbs_up`, not

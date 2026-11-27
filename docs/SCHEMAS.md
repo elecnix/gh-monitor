@@ -406,6 +406,10 @@ Emitted by `monitor` as one NDJSON object per line (one event per genuinely-new 
       "type": "string",
       "description": "Full SHA of the head commit the green verdict belongs to (ci-all-green); `timestamp` is when its checks were read"
     },
+    "green_unverified": {
+      "type": "boolean",
+      "description": "True on a ci-all-green that names no passed check, so nothing shows the checks were present to pass. The event is still delivered, and its message ends with a warning (omitted when false)"
+    },
     "commit_short_oid": {
       "type": "string",
       "description": "Short SHA of the new head commit (new-commit), or of the commit a green verdict belongs to (ci-all-green)"

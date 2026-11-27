@@ -152,11 +152,16 @@ type Notification struct {
 	// PassedChecks and HeadSHA are the evidence of a ci-all-green: the checks
 	// the read saw pass, by name, and the head commit they passed on.
 	// Timestamp is when that read was made.
-	PassedChecks   []string `json:"passed_checks,omitempty"`
-	HeadSHA        string   `json:"head_sha,omitempty"`
-	CommitShortOid string   `json:"commit_short_oid,omitempty"`
-	CommitAuthor   string   `json:"commit_author,omitempty"`
-	ReviewAuthor   string   `json:"review_author,omitempty"`
+	PassedChecks []string `json:"passed_checks,omitempty"`
+	HeadSHA      string   `json:"head_sha,omitempty"`
+	// GreenUnverified marks a ci-all-green that names no passed check, so
+	// nothing shows the checks were there to pass. The event is still
+	// delivered; the field and the message's "⚠ unverified" suffix say what
+	// it is worth.
+	GreenUnverified bool   `json:"green_unverified,omitempty"`
+	CommitShortOid  string `json:"commit_short_oid,omitempty"`
+	CommitAuthor    string `json:"commit_author,omitempty"`
+	ReviewAuthor    string `json:"review_author,omitempty"`
 	// Detail is a rich, self-contained body (thread/comment excerpts + hints) so
 	// a consumer can act without extra API calls (new-*-threads/comments only).
 	Detail string `json:"detail,omitempty"`
@@ -624,6 +629,7 @@ func setGreenVars(vars map[string]string, ev Event) {
 // greenFields copies a ci-all-green's evidence onto its notification.
 func greenFields(n *Notification, vars map[string]string, ev Event) {
 	n.PassedChecks = ev.PassedChecks
+	n.GreenUnverified = len(ev.PassedChecks) == 0
 	if ev.Commit != nil {
 		n.HeadSHA = ev.Commit.Oid
 		n.CommitShortOid = ev.Commit.ShortOid
